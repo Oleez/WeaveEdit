@@ -1,57 +1,45 @@
-# Welcome to your project
+# Sora Genie Premiere Panel
 
-## Project info
+This project now builds as an Adobe CEP panel for Premiere Pro instead of only as a standalone Vite app.
 
-## How can I edit this code?
-
-You can edit your application using any workflow you prefer.
-
-### **Use your preferred IDE**
-
-Clone the repository locally and push changes normally.
+## Local development
 
 ```sh
-# Clone the repository
-git clone <YOUR_GIT_URL>
-
-# Move into the project directory
-cd <YOUR_PROJECT_NAME>
-
-# Install dependencies
-npm i
-
-# Start the development server
+npm install
 npm run dev
 ```
 
-### **Edit directly on GitHub**
+## Build the Premiere extension
 
-* Open the file you want to edit.
-* Click the pencil icon (Edit).
-* Make changes and commit.
+```sh
+npm run build
+```
 
-### **Use GitHub Codespaces**
+That produces:
 
-* Go to your repository page.
-* Click the **Code** button.
-* Open the **Codespaces** tab.
-* Create a new Codespace.
-* Edit, commit, and push changes.
+- `dist/web` - the normal Vite production build
+- `dist/cep/com.soragenie.panel` - a Premiere-ready CEP extension bundle
 
-## Technologies used
+## Install into Premiere Pro on Windows
 
-This project includes:
+```sh
+npm run install:premiere
+```
 
-* Vite
-* TypeScript
-* React
-* shadcn-ui
-* Tailwind CSS
+The installer:
 
-## Deployment
+- builds the web app
+- wraps it in a CEP extension bundle
+- copies it into `%APPDATA%\Adobe\CEP\extensions\com.soragenie.panel`
+- enables `PlayerDebugMode` for common `CSXS` versions so unsigned local builds can load
 
-You can publish and share the project directly from the platform’s publish/share feature.
+After install, restart Premiere Pro and open:
 
-## Custom domain
+`Window > Extensions > Sora Genie`
 
-You can attach your own domain to the project.
+## Key files
+
+- `cep/com.soragenie.panel/CSXS/manifest.xml`
+- `scripts/prepare-cep.mjs`
+- `scripts/install-premiere-extension.mjs`
+- `vite.config.ts`
