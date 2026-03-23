@@ -1,6 +1,6 @@
-# Sora Genie Premiere Panel
+# Weave Edit Premiere Panel
 
-This project now builds as an Adobe CEP panel for Premiere Pro instead of only as a standalone Vite app.
+This project builds as an Adobe CEP panel for Premiere Pro so you can place still-image coverage against a timestamped script directly inside an edit.
 
 ## Local development
 
@@ -35,7 +35,7 @@ The installer:
 
 After install, restart Premiere Pro and open:
 
-`Window > Extensions > Sora Genie`
+`Window > Extensions > Weave Edit`
 
 ## Key files
 

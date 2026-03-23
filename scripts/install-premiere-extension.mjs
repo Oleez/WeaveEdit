@@ -59,4 +59,4 @@ await rm(targetDir, { recursive: true, force: true });
 await cp(bundleDir, targetDir, { recursive: true, force: true });
 
 console.log(`Installed ${extensionId} to ${targetDir}`);
-console.log("Restart Premiere Pro, then open Window > Extensions > Sora Genie.");
+console.log("Restart Premiere Pro, then open Window > Extensions > Weave Edit.");
