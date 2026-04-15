@@ -1,6 +1,6 @@
 # Weave Edit Premiere Panel
 
-This project builds as an Adobe CEP panel for Premiere Pro so you can place still-image coverage against a timestamped script directly inside an edit.
+This project builds as an Adobe CEP panel for Premiere Pro so you can place image or video coverage against a timestamped script directly inside an edit.
 
 ## Local development
 
@@ -51,6 +51,26 @@ After install, restart Premiere Pro and open:
 
 `Window > Extensions > Weave Edit`
 
+## Timestamp formats
+
+Weave Edit accepts:
+
+- SRT timecode like `00:00:05,000 --> 00:00:10,000`
+- Millisecond timecode like `00:00:05.250`
+- Frame timecode like `00:00:45:02`
+
+For `HH:MM:SS:FF`, the last field is parsed against the active Premiere sequence FPS.
+
+## Media library scanning
+
+The library can scan:
+
+- images only
+- videos only
+- mixed images and videos
+
+If a subfolder cannot be read, Weave Edit now skips that folder and shows a scan warning instead of failing the entire scan.
+
 ## AI setup (Ollama E4B primary)
 
 Weave Edit can run deterministic timeline placement without AI. AI is optional and used only to rank asset relevance.
@@ -65,16 +85,24 @@ Install Ollama and confirm the local server is running.
 ollama pull gemma4:e4b
 ```
 
-### 3) Configure Weave Edit panel
+### 3) Optional: install local video tools
+
+For video analysis, install both `ffmpeg` and `ffprobe` and make sure they are available on your `PATH`.
+
+Without them, Weave Edit can still rank videos by filename and duration hints, but extracted frame analysis will be limited.
+
+### 4) Configure Weave Edit panel
 
 In the panel:
 
 - set AI mode to `Local (Ollama)` or `Hybrid (Ollama + Gemini fallback)`
 - set Ollama endpoint (default): `http://127.0.0.1:11434`
 - set model: `gemma4:e4b`
+- choose library type: `Images only`, `Videos only`, or `Mixed images and videos`
 - click `Check providers`, then `Analyze with AI`
 
 If Ollama is unavailable, Weave Edit automatically falls back to deterministic matching.
+If `ffmpeg`/`ffprobe` are available, Weave Edit extracts representative video frames and uses those samples for timestamp-aware local scoring.
 
 ## Gemini fallback (optional)
 
@@ -95,6 +123,8 @@ Notes:
 ## Validation checklist
 
 - With Ollama running: provider check passes and AI-assisted matches appear.
+- With frame-style script timecode like `00:00:45:02`, the parser succeeds when a Premiere sequence is active.
+- With a mixed media folder, scan warnings are shown only for unreadable folders and the rest of the media still loads.
 - With Ollama down and no Gemini key: panel shows provider warning and deterministic matching still works.
 - With Ollama down and Gemini key set: Hybrid mode can still return AI rankings.
 - In/Out range, append mode, blank handling, and placement execution all remain deterministic.

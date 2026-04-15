@@ -80,6 +80,19 @@ var weaveEdit = (function () {
     return Number(track.clips[track.clips.numItems - 1].end.seconds || 0);
   }
 
+  function getSequenceFrameRate(sequence) {
+    try {
+      var timebase = Number(sequence && sequence.timebase);
+      if (timebase > 0) {
+        return Math.round((TICKS_PER_SECOND / timebase) * 100) / 100;
+      }
+    } catch (error) {
+      // Fall back below.
+    }
+
+    return 30;
+  }
+
   function getRangeStatus(sequence) {
     var inTime = sequence && sequence.getInPointAsTime ? sequence.getInPointAsTime() : null;
     var outTime = sequence && sequence.getOutPointAsTime ? sequence.getOutPointAsTime() : null;
@@ -104,6 +117,7 @@ var weaveEdit = (function () {
         projectName: "",
         sequenceName: "",
         videoTracks: [],
+      frameRate: 30,
         range: {
           inSec: 0,
           outSec: 0,
@@ -122,6 +136,7 @@ var weaveEdit = (function () {
         projectName: app.project.name || "",
         sequenceName: "",
         videoTracks: [],
+        frameRate: 30,
         range: {
           inSec: 0,
           outSec: 0,
@@ -148,7 +163,8 @@ var weaveEdit = (function () {
       projectName: app.project.name || "",
       sequenceName: sequence.name || "",
       videoTracks: videoTracks,
-      range: range
+      range: range,
+      frameRate: getSequenceFrameRate(sequence)
     });
   }
 
@@ -180,15 +196,15 @@ var weaveEdit = (function () {
     return null;
   }
 
-  function getOrImportProjectItems(imagePaths, details) {
+  function getOrImportProjectItems(mediaPaths, details) {
     var root = app.project.rootItem;
     var insertionBin = app.project.getInsertionBin ? app.project.getInsertionBin() : root;
     var itemsByPath = {};
     var missingPaths = [];
     var importedCount = 0;
 
-    for (var index = 0; index < imagePaths.length; index += 1) {
-      var normalizedPath = normalizePath(imagePaths[index]);
+    for (var index = 0; index < mediaPaths.length; index += 1) {
+      var normalizedPath = normalizePath(mediaPaths[index]);
       var existingItem = findProjectItemByPath(root, normalizedPath);
 
       if (existingItem) {
@@ -207,8 +223,8 @@ var weaveEdit = (function () {
       importedCount = missingPaths.length;
     }
 
-    for (var verifyIndex = 0; verifyIndex < imagePaths.length; verifyIndex += 1) {
-      var verifyPath = normalizePath(imagePaths[verifyIndex]);
+    for (var verifyIndex = 0; verifyIndex < mediaPaths.length; verifyIndex += 1) {
+      var verifyPath = normalizePath(mediaPaths[verifyIndex]);
       if (!itemsByPath[verifyPath]) {
         var importedItem = findProjectItemByPath(root, verifyPath);
         if (importedItem) {
@@ -265,17 +281,17 @@ var weaveEdit = (function () {
 
     var targetTrack = sequence.videoTracks[targetTrackIndex];
     var details = [];
-    var imagePaths = [];
+    var mediaPaths = [];
     var placementIndex;
 
     for (placementIndex = 0; placementIndex < job.placements.length; placementIndex += 1) {
       var placement = job.placements[placementIndex];
-      if (placement.imagePath) {
-        imagePaths.push(normalizePath(placement.imagePath));
+      if (placement.mediaPath) {
+        mediaPaths.push(normalizePath(placement.mediaPath));
       }
     }
 
-    var importState = getOrImportProjectItems(imagePaths, details);
+    var importState = getOrImportProjectItems(mediaPaths, details);
     var itemsByPath = importState.itemsByPath;
     var range = getRangeStatus(sequence);
     var appendOffsetSec = job.appendAtTrackEnd ? getTrackEndSec(targetTrack) : 0;
@@ -315,15 +331,15 @@ var weaveEdit = (function () {
         }
       }
 
-      if (!currentPlacement.imagePath || currentPlacement.strategy === "blank") {
+      if (!currentPlacement.mediaPath || currentPlacement.strategy === "blank") {
         blankCount += 1;
         continue;
       }
 
-      var projectItem = itemsByPath[normalizePath(currentPlacement.imagePath)];
+      var projectItem = itemsByPath[normalizePath(currentPlacement.mediaPath)];
       if (!projectItem) {
         blankCount += 1;
-        details.push("Missing image for placement " + currentPlacement.id);
+        details.push("Missing media for placement " + currentPlacement.id);
         continue;
       }
 
@@ -352,7 +368,7 @@ var weaveEdit = (function () {
 
     return stringify({
       ok: true,
-      message: "Placed " + placedCount + " stills on V" + (targetTrackIndex + 1) + ".",
+      message: "Placed " + placedCount + " media clips on V" + (targetTrackIndex + 1) + ".",
       placedCount: placedCount,
       blankCount: blankCount,
       importedCount: importState.importedCount,

@@ -1,5 +1,6 @@
 import { ScriptSegment } from "./script-parser";
 import { AiSegmentRanking } from "./ai/types";
+import { MediaLibraryItem, normalizePath } from "./media";
 
 export interface TimelinePlannerSettings {
   minDurationSec: number;
@@ -17,8 +18,9 @@ export interface TimelinePlacement {
   endSec: number;
   durationSec: number;
   strategy: "ai" | "keyword" | "sequential" | "blank";
-  imagePath: string | null;
-  imageName: string | null;
+  mediaPath: string | null;
+  mediaName: string | null;
+  mediaType: MediaLibraryItem["type"] | null;
   text: string;
   keywordScore: number;
   aiConfidence: number;
@@ -68,30 +70,27 @@ const STOP_WORDS = new Set([
   "your",
 ]);
 
-interface ImageCandidate {
-  path: string;
-  name: string;
+interface MediaCandidate extends MediaLibraryItem {
   tokens: Set<string>;
 }
 
 export function buildTimelinePlan(
   segments: ScriptSegment[],
-  imagePaths: string[],
+  mediaItems: MediaLibraryItem[],
   settings: TimelinePlannerSettings,
 ): TimelinePlan {
-  const images = imagePaths
+  const assets = mediaItems
     .slice()
-    .sort((left, right) => left.localeCompare(right))
-    .map<ImageCandidate>((imagePath) => ({
-      path: imagePath,
-      name: getFileName(imagePath),
-      tokens: tokenize(getFileName(imagePath)),
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .map<MediaCandidate>((mediaItem) => ({
+      ...mediaItem,
+      tokens: tokenize(mediaItem.name),
     }));
 
-  const usedImageIndexes = new Set<number>();
-  const imageIndexByPath = new Map<string, number>();
-  images.forEach((image, index) => {
-    imageIndexByPath.set(normalizePath(image.path), index);
+  const usedAssetIndexes = new Set<number>();
+  const assetIndexByPath = new Map<string, number>();
+  assets.forEach((asset, index) => {
+    assetIndexByPath.set(normalizePath(asset.path), index);
   });
   const placements: TimelinePlacement[] = [];
   let matchedByAi = 0;
@@ -120,17 +119,18 @@ export function buildTimelinePlan(
     const aiRanking = settings.aiRankingsBySegmentId?.[segment.id];
     const aiMatch = findAiMatch(
       aiRanking,
-      images,
-      imageIndexByPath,
-      usedImageIndexes,
+      assets,
+      assetIndexByPath,
+      usedAssetIndexes,
       aiConfidenceThreshold,
       override,
     );
-    const keywordMatch = findKeywordMatch(segment.text, images, usedImageIndexes);
+    const keywordMatch = findKeywordMatch(segment.text, assets, usedAssetIndexes);
 
     let strategy: TimelinePlacement["strategy"] = "blank";
-    let imagePath: string | null = null;
-    let imageName: string | null = null;
+    let mediaPath: string | null = null;
+    let mediaName: string | null = null;
+    let mediaType: MediaLibraryItem["type"] | null = null;
     let keywordScore = 0;
     let aiConfidence = 0;
     let aiRationale: string | null = null;
@@ -145,8 +145,9 @@ export function buildTimelinePlan(
         endSec: segment.startSec + durationSec,
         durationSec,
         strategy,
-        imagePath,
-        imageName,
+        mediaPath,
+        mediaName,
+        mediaType,
         text: segment.text,
         keywordScore,
         aiConfidence,
@@ -157,13 +158,14 @@ export function buildTimelinePlan(
     }
 
     if (override !== "auto" && override) {
-      const overrideIndex = imageIndexByPath.get(normalizePath(override));
-      if (overrideIndex !== undefined && !usedImageIndexes.has(overrideIndex)) {
-        usedImageIndexes.add(overrideIndex);
+      const overrideIndex = assetIndexByPath.get(normalizePath(override));
+      if (overrideIndex !== undefined && !usedAssetIndexes.has(overrideIndex)) {
+        usedAssetIndexes.add(overrideIndex);
         sequentialCursor = Math.max(sequentialCursor, overrideIndex + 1);
         strategy = "ai";
-        imagePath = images[overrideIndex].path;
-        imageName = images[overrideIndex].name;
+        mediaPath = assets[overrideIndex].path;
+        mediaName = assets[overrideIndex].name;
+        mediaType = assets[overrideIndex].type;
         aiConfidence = 1;
         aiRationale = "Manually overridden in review.";
         aiProvider = "manual";
@@ -171,32 +173,35 @@ export function buildTimelinePlan(
       }
     }
 
-    if (!imagePath && aiMatch) {
-      usedImageIndexes.add(aiMatch.index);
+    if (!mediaPath && aiMatch) {
+      usedAssetIndexes.add(aiMatch.index);
       sequentialCursor = Math.max(sequentialCursor, aiMatch.index + 1);
       strategy = "ai";
-      imagePath = aiMatch.image.path;
-      imageName = aiMatch.image.name;
+      mediaPath = aiMatch.asset.path;
+      mediaName = aiMatch.asset.name;
+      mediaType = aiMatch.asset.type;
       aiConfidence = aiMatch.confidence;
       aiRationale = aiMatch.rationale;
       aiProvider = aiMatch.provider;
       matchedByAi += 1;
-    } else if (!imagePath && keywordMatch) {
-      usedImageIndexes.add(keywordMatch.index);
+    } else if (!mediaPath && keywordMatch) {
+      usedAssetIndexes.add(keywordMatch.index);
       sequentialCursor = Math.max(sequentialCursor, keywordMatch.index + 1);
       strategy = "keyword";
-      imagePath = keywordMatch.image.path;
-      imageName = keywordMatch.image.name;
+      mediaPath = keywordMatch.asset.path;
+      mediaName = keywordMatch.asset.name;
+      mediaType = keywordMatch.asset.type;
       keywordScore = keywordMatch.score;
       matchedByKeyword += 1;
-    } else if (!imagePath) {
-      sequentialCursor = advanceToUnusedIndex(sequentialCursor, images.length, usedImageIndexes);
+    } else if (!mediaPath) {
+      sequentialCursor = advanceToUnusedIndex(sequentialCursor, assets.length, usedAssetIndexes);
 
-      if (sequentialCursor < images.length) {
-        usedImageIndexes.add(sequentialCursor);
+      if (sequentialCursor < assets.length) {
+        usedAssetIndexes.add(sequentialCursor);
         strategy = "sequential";
-        imagePath = images[sequentialCursor].path;
-        imageName = images[sequentialCursor].name;
+        mediaPath = assets[sequentialCursor].path;
+        mediaName = assets[sequentialCursor].name;
+        mediaType = assets[sequentialCursor].type;
         matchedSequentially += 1;
         sequentialCursor += 1;
       } else if (settings.blankWhenNoImage) {
@@ -211,8 +216,9 @@ export function buildTimelinePlan(
       endSec: segment.startSec + durationSec,
       durationSec,
       strategy,
-      imagePath,
-      imageName,
+      mediaPath,
+      mediaName,
+      mediaType,
       text: segment.text,
       keywordScore,
       aiConfidence,
@@ -232,12 +238,12 @@ export function buildTimelinePlan(
 
 function findAiMatch(
   aiRanking: AiSegmentRanking | undefined,
-  images: ImageCandidate[],
-  imageIndexByPath: Map<string, number>,
-  usedImageIndexes: Set<number>,
+  assets: MediaCandidate[],
+  assetIndexByPath: Map<string, number>,
+  usedAssetIndexes: Set<number>,
   confidenceThreshold: number,
   override: string | "blank" | "auto",
-): { image: ImageCandidate; index: number; confidence: number; rationale: string; provider: string } | null {
+): { asset: MediaCandidate; index: number; confidence: number; rationale: string; provider: string } | null {
   if (!aiRanking || override === "blank") {
     return null;
   }
@@ -247,14 +253,14 @@ function findAiMatch(
   }
 
   for (const ranked of aiRanking.rankedAssets) {
-    const index = imageIndexByPath.get(normalizePath(ranked.candidateId));
-    if (index === undefined || usedImageIndexes.has(index)) {
+    const index = assetIndexByPath.get(normalizePath(ranked.candidateId));
+    if (index === undefined || usedAssetIndexes.has(index)) {
       continue;
     }
 
-    const image = images[index];
+    const asset = assets[index];
     return {
-      image,
+      asset,
       index,
       confidence: ranked.score || aiRanking.confidence,
       rationale: ranked.rationale || aiRanking.rationale,
@@ -267,24 +273,24 @@ function findAiMatch(
 
 function findKeywordMatch(
   text: string,
-  images: ImageCandidate[],
-  usedImageIndexes: Set<number>,
-): { image: ImageCandidate; index: number; score: number } | null {
+  assets: MediaCandidate[],
+  usedAssetIndexes: Set<number>,
+): { asset: MediaCandidate; index: number; score: number } | null {
   const textTokens = tokenize(text);
-  let bestMatch: { image: ImageCandidate; index: number; score: number } | null = null;
+  let bestMatch: { asset: MediaCandidate; index: number; score: number } | null = null;
 
   if (textTokens.size === 0) {
     return null;
   }
 
-  images.forEach((image, index) => {
-    if (usedImageIndexes.has(index)) {
+  assets.forEach((asset, index) => {
+    if (usedAssetIndexes.has(index)) {
       return;
     }
 
     let score = 0;
     textTokens.forEach((token) => {
-      if (image.tokens.has(token)) {
+      if (asset.tokens.has(token)) {
         score += 1;
       }
     });
@@ -294,7 +300,7 @@ function findKeywordMatch(
     }
 
     if (!bestMatch || score > bestMatch.score) {
-      bestMatch = { image, index, score };
+      bestMatch = { asset, index, score };
     }
   });
 
@@ -352,12 +358,3 @@ function roundDuration(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
-function getFileName(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, "/");
-  const parts = normalized.split("/");
-  return parts[parts.length - 1] ?? filePath;
-}
-
-function normalizePath(filePath: string): string {
-  return filePath.replace(/\\/g, "/");
-}

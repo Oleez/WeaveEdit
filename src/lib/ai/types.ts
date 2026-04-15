@@ -1,9 +1,16 @@
+import { MediaType } from "../media";
+
 export type AiMode = "off" | "local" | "hybrid";
 
 export interface AiAssetCandidate {
   id: string;
   path: string;
   name: string;
+  mediaType: MediaType;
+  descriptor?: string;
+  durationSec?: number;
+  sampleTimestampsSec?: number[];
+  visualPaths?: string[];
 }
 
 export interface AiSegmentRequest {
@@ -43,6 +50,8 @@ export interface AiScoringContext {
   geminiModel: string;
   geminiApiKey?: string;
   timeoutMs?: number;
+  ffmpegAvailable?: boolean;
+  ffprobeAvailable?: boolean;
 }
 
 export interface AiBatchResult {

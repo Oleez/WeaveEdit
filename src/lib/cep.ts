@@ -1,4 +1,10 @@
 import { TimelinePlacement } from "./timeline-plan";
+import {
+  MediaLibraryItem,
+  MediaLibraryMode,
+  createMediaLibraryItem,
+  normalizePath,
+} from "./media";
 
 export interface PremiereTrackStatus {
   index: number;
@@ -20,6 +26,7 @@ export interface PremiereStatus {
   sequenceName: string;
   videoTracks: PremiereTrackStatus[];
   range: PremiereRangeStatus;
+  frameRate: number;
   message?: string;
 }
 
@@ -48,10 +55,15 @@ export interface ExecuteTimelineJobInput {
     startSec: number;
     endSec: number;
     durationSec: number;
-    imagePath: string | null;
+    mediaPath: string | null;
     strategy: TimelinePlacement["strategy"];
     text: string;
   }>;
+}
+
+export interface MediaScanResult {
+  items: MediaLibraryItem[];
+  warnings: string[];
 }
 
 type NodeRequire = (moduleName: string) => unknown;
@@ -78,17 +90,6 @@ interface NodeModules {
   };
 }
 
-const IMAGE_EXTENSIONS = new Set([
-  ".bmp",
-  ".gif",
-  ".jpeg",
-  ".jpg",
-  ".png",
-  ".tif",
-  ".tiff",
-  ".webp",
-]);
-
 let hostLoaded = false;
 
 export function isCepEnvironment(): boolean {
@@ -103,7 +104,7 @@ export async function pickFolder(): Promise<string | null> {
   const result = window.cep?.fs?.showOpenDialogEx?.(
     false,
     true,
-    "Choose image folder",
+    "Choose media folder",
     "",
     [],
     [],
@@ -116,12 +117,23 @@ export async function pickFolder(): Promise<string | null> {
   return normalizePath(result.data[0]);
 }
 
-export function listImageFiles(folderPath: string): string[] {
+export function listMediaFiles(
+  folderPath: string,
+  mode: MediaLibraryMode = "images",
+): MediaScanResult {
   const { fs, path } = getNodeModules();
-  const collected: string[] = [];
+  const collected = new Map<string, MediaLibraryItem>();
+  const warnings: string[] = [];
 
   function walk(currentPath: string) {
-    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    let entries: ReturnType<NodeModules["fs"]["readdirSync"]>;
+
+    try {
+      entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    } catch (error) {
+      warnings.push(`Skipped ${normalizePath(currentPath)}: ${String(error)}`);
+      return;
+    }
 
     entries.forEach((entry) => {
       const fullPath = path.join(currentPath, entry.name);
@@ -131,15 +143,22 @@ export function listImageFiles(folderPath: string): string[] {
         return;
       }
 
-      const extension = path.extname(entry.name).toLowerCase();
-      if (IMAGE_EXTENSIONS.has(extension)) {
-        collected.push(normalizePath(fullPath));
+      const item = createMediaLibraryItem(fullPath);
+      if (!item) {
+        return;
+      }
+
+      if (mode === "mixed" || item.type === (mode === "images" ? "image" : "video")) {
+        collected.set(item.path, item);
       }
     });
   }
 
   walk(folderPath);
-  return collected.sort((left, right) => left.localeCompare(right));
+  return {
+    items: Array.from(collected.values()).sort((left, right) => left.path.localeCompare(right.path)),
+    warnings,
+  };
 }
 
 export function getEnvironmentVariable(name: string): string | undefined {
@@ -160,6 +179,7 @@ export async function getPremiereStatus(): Promise<PremiereStatus> {
       projectName: "",
       sequenceName: "",
       videoTracks: [],
+      frameRate: 30,
       range: {
         inSec: 0,
         outSec: 0,
@@ -251,10 +271,6 @@ async function evaluateJson<T>(script: string): Promise<T> {
   } catch (error) {
     throw new Error(`Failed to parse Premiere response: ${String(error)}\n${rawResult}`);
   }
-}
-
-function normalizePath(filePath: string): string {
-  return filePath.replace(/\\/g, "/");
 }
 
 function escapeForJsx(filePath: string): string {

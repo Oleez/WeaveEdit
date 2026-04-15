@@ -1,6 +1,7 @@
-import { ChangeEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import {
   ExecuteTimelineJobInput,
+  MediaScanResult,
   PremiereRunResult,
   PremiereStatus,
   executeTimelineJob,
@@ -8,13 +9,15 @@ import {
   getPremiereStatus,
   isCepEnvironment,
   isNodeEnabled,
-  listImageFiles,
+  listMediaFiles,
   pickFolder,
 } from "@/lib/cep";
+import { detectVideoTooling, hydrateAiCandidates } from "@/lib/ai/video-preprocessing";
 import { checkAiProviders, rankSegmentsWithAi } from "@/lib/ai/router";
 import { AiHealthStatus, AiMode, AiScoringContext, AiSegmentRanking } from "@/lib/ai/types";
 import { formatSeconds, parseTimestampScript } from "@/lib/script-parser";
 import { TimelinePlacement, buildTimelinePlan } from "@/lib/timeline-plan";
+import { MediaLibraryItem, MediaLibraryMode, getFileName, normalizePath } from "@/lib/media";
 
 const STORAGE_KEY = "weave-edit-settings";
 const LEGACY_STORAGE_KEY = "sora-genie-settings";
@@ -24,6 +27,7 @@ const statusPillBase =
 interface StoredSettings {
   scriptText: string;
   imageFolderPath: string;
+  libraryMode: MediaLibraryMode;
   minDurationSec: number;
   maxDurationSec: number;
   targetVideoTrack: number;
@@ -48,6 +52,7 @@ interface WorkingPlan {
 const defaultSettings: StoredSettings = {
   scriptText: "",
   imageFolderPath: "",
+  libraryMode: "images",
   minDurationSec: 2,
   maxDurationSec: 8,
   targetVideoTrack: 2,
@@ -64,7 +69,9 @@ const Index = () => {
   const [scriptText, setScriptText] = useState(defaultSettings.scriptText);
   const [scriptSourceName, setScriptSourceName] = useState("Paste script or load a file");
   const [imageFolderPath, setImageFolderPath] = useState(defaultSettings.imageFolderPath);
-  const [imagePaths, setImagePaths] = useState<string[]>([]);
+  const [libraryMode, setLibraryMode] = useState<MediaLibraryMode>(defaultSettings.libraryMode);
+  const [mediaItems, setMediaItems] = useState<MediaLibraryItem[]>([]);
+  const [scanWarnings, setScanWarnings] = useState<string[]>([]);
   const [minDurationSec, setMinDurationSec] = useState(defaultSettings.minDurationSec);
   const [maxDurationSec, setMaxDurationSec] = useState(defaultSettings.maxDurationSec);
   const [targetVideoTrack, setTargetVideoTrack] = useState(defaultSettings.targetVideoTrack);
@@ -101,6 +108,7 @@ const Index = () => {
 
     setScriptText(stored.scriptText ?? defaultSettings.scriptText);
     setImageFolderPath(stored.imageFolderPath ?? defaultSettings.imageFolderPath);
+    setLibraryMode(stored.libraryMode ?? defaultSettings.libraryMode);
     setMinDurationSec(stored.minDurationSec ?? defaultSettings.minDurationSec);
     setMaxDurationSec(stored.maxDurationSec ?? defaultSettings.maxDurationSec);
     setTargetVideoTrack(stored.targetVideoTrack ?? defaultSettings.targetVideoTrack);
@@ -123,6 +131,7 @@ const Index = () => {
       JSON.stringify({
         scriptText,
         imageFolderPath,
+        libraryMode,
         minDurationSec,
         maxDurationSec,
         targetVideoTrack,
@@ -138,6 +147,7 @@ const Index = () => {
   }, [
     appendAtTrackEnd,
     imageFolderPath,
+    libraryMode,
     maxDurationSec,
     minDurationSec,
     scriptText,
@@ -163,16 +173,8 @@ const Index = () => {
       return;
     }
 
-    try {
-      const discoveredImages = listImageFiles(imageFolderPath);
-      setImagePaths(discoveredImages);
-      setFolderError(
-        discoveredImages.length > 0 ? null : "The selected folder does not contain supported image files.",
-      );
-    } catch (error) {
-      setFolderError(String(error));
-    }
-  }, [imageFolderPath]);
+    applyScanResult(scanLibraryFolder(imageFolderPath, libraryMode));
+  }, [imageFolderPath, libraryMode]);
 
   useEffect(() => {
     setAiRankingsBySegmentId({});
@@ -186,18 +188,21 @@ const Index = () => {
     }
 
     try {
-      return { error: null, result: parseTimestampScript(scriptText) };
+      return {
+        error: null,
+        result: parseTimestampScript(scriptText, { fps: hostStatus?.frameRate }),
+      };
     } catch (error) {
       return { error: String(error), result: null };
     }
-  }, [scriptText]);
+  }, [hostStatus?.frameRate, scriptText]);
 
   const basePlan = useMemo(() => {
-    if (!parsedScriptState.result || imagePaths.length === 0) {
+    if (!parsedScriptState.result || mediaItems.length === 0) {
       return null;
     }
 
-    return buildTimelinePlan(parsedScriptState.result.segments, imagePaths, {
+    return buildTimelinePlan(parsedScriptState.result.segments, mediaItems, {
       minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
       maxDurationSec: Math.max(minDurationSec, maxDurationSec),
       blankWhenNoImage: true,
@@ -208,7 +213,7 @@ const Index = () => {
   }, [
     aiConfidenceThreshold,
     aiRankingsBySegmentId,
-    imagePaths,
+    mediaItems,
     manualOverridesBySegmentId,
     maxDurationSec,
     minDurationSec,
@@ -286,13 +291,21 @@ const Index = () => {
     );
   }, [effectivePlan]);
 
+  const libraryStats = useMemo(
+    () => ({
+      images: mediaItems.filter((item) => item.type === "image").length,
+      videos: mediaItems.filter((item) => item.type === "video").length,
+    }),
+    [mediaItems],
+  );
+
   const executeReason = useMemo(() => {
     if (!hostStatus?.ok) {
       return "Open a Premiere project and activate a sequence first.";
     }
 
     if (!basePlan || basePlan.placements.length === 0) {
-      return "Add a valid timestamped script and image folder first.";
+      return "Add a valid timestamped script and media folder first.";
     }
 
     if (!effectivePlan || effectivePlan.placements.length === 0) {
@@ -309,6 +322,7 @@ const Index = () => {
   const canExecute = !busyMessage && !executeReason;
   const hasMeaningfulInOut = Boolean(hostStatus?.range.hasMeaningfulInOut);
   const geminiApiKey = getEnvironmentVariable("GEMINI_API_KEY");
+  const videoTooling = useMemo(() => detectVideoTooling(), []);
   const aiContext = useMemo<AiScoringContext>(
     () => ({
       ollamaBaseUrl,
@@ -316,8 +330,10 @@ const Index = () => {
       geminiModel,
       geminiApiKey,
       timeoutMs: 15000,
+      ffmpegAvailable: videoTooling.ffmpegAvailable,
+      ffprobeAvailable: videoTooling.ffprobeAvailable,
     }),
-    [geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel],
+    [geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel, videoTooling],
   );
 
   async function runAiHealthCheck() {
@@ -338,7 +354,7 @@ const Index = () => {
   }
 
   async function runAiRanking() {
-    if (aiMode === "off" || !parsedScriptState.result || imagePaths.length === 0) {
+    if (aiMode === "off" || !parsedScriptState.result || mediaItems.length === 0) {
       return;
     }
 
@@ -346,22 +362,39 @@ const Index = () => {
     setAiErrors([]);
 
     try {
-      const requests = parsedScriptState.result.segments.map((segment) => ({
-        segmentId: segment.id,
-        text: segment.text,
-        startSec: segment.startSec,
-        endSec: segment.endSec,
-        maxRecommendations: 3,
-        candidates: shortlistCandidates(segment.text, imagePaths, 20).map((path) => ({
-          id: normalizePath(path),
-          path,
-          name: getFileName(path),
-        })),
-      }));
+      const preprocessingWarnings: string[] = [];
+      const requests = await Promise.all(
+        parsedScriptState.result.segments.map(async (segment) => {
+          const shortlisted = shortlistCandidates(segment.text, mediaItems, 20);
+          const hydrated = await hydrateAiCandidates(
+            shortlisted.map((item) => ({
+              id: normalizePath(item.path),
+              path: item.path,
+              name: getFileName(item.path),
+              mediaType: item.type,
+            })),
+          );
+          preprocessingWarnings.push(...hydrated.warnings);
+
+          return {
+            segmentId: segment.id,
+            text: segment.text,
+            startSec: segment.startSec,
+            endSec: segment.endSec,
+            maxRecommendations: 3,
+            candidates: hydrated.candidates,
+          };
+        }),
+      );
 
       const ranked = await rankSegmentsWithAi(requests, aiMode, aiContext);
       setAiRankingsBySegmentId(ranked.rankingsBySegmentId);
-      setAiErrors(ranked.errors);
+      const fallbackWarnings = requests.flatMap((request) =>
+        request.candidates
+          .filter((candidate) => candidate.mediaType === "video" && !candidate.visualPaths?.length)
+          .map((candidate) => `Limited video analysis for ${candidate.name}; extracted frames were unavailable.`),
+      );
+      setAiErrors([...preprocessingWarnings, ...fallbackWarnings, ...ranked.errors]);
     } catch (error) {
       setAiErrors([String(error)]);
     } finally {
@@ -369,7 +402,7 @@ const Index = () => {
     }
   }
 
-  async function refreshPremiereStatus() {
+  const refreshPremiereStatus = useCallback(async () => {
     setBusyMessage("Checking Premiere sequence");
 
     try {
@@ -386,6 +419,7 @@ const Index = () => {
         projectName: "",
         sequenceName: "",
         videoTracks: [],
+        frameRate: 30,
         range: {
           inSec: 0,
           outSec: 0,
@@ -397,7 +431,7 @@ const Index = () => {
     } finally {
       setBusyMessage(null);
     }
-  }
+  }, [targetVideoTrack]);
 
   async function chooseImageFolder() {
     try {
@@ -431,21 +465,27 @@ const Index = () => {
 
   function handleManualFolderLoad() {
     if (!imageFolderPath.trim()) {
-      setFolderError("Enter or choose an image folder path first.");
+      setFolderError("Enter or choose a media folder path first.");
       return;
     }
 
-    try {
-      const discoveredImages = listImageFiles(imageFolderPath);
-      setImagePaths(discoveredImages);
-      setFolderError(
-        discoveredImages.length > 0 ? null : "The selected folder does not contain supported image files.",
-      );
-      setResult(null);
-    } catch (error) {
-      setFolderError(String(error));
-    }
+    applyScanResult(scanLibraryFolder(imageFolderPath, libraryMode));
   }
+
+  const applyScanResult = useCallback((scanResult: MediaScanResult) => {
+    setMediaItems(scanResult.items);
+    setScanWarnings(scanResult.warnings);
+    setFolderError(
+      scanResult.items.length > 0
+        ? null
+        : libraryMode === "images"
+          ? "The selected folder does not contain supported image files."
+          : libraryMode === "videos"
+            ? "The selected folder does not contain supported video files."
+            : "The selected folder does not contain supported image or video files.",
+    );
+    setResult(null);
+  }, [libraryMode]);
 
   async function handlePlaceOnTimeline() {
     if (!effectivePlan) {
@@ -466,7 +506,7 @@ const Index = () => {
         startSec: placement.startSec,
         endSec: placement.endSec,
         durationSec: placement.durationSec,
-        imagePath: placement.imagePath,
+        mediaPath: placement.mediaPath,
         strategy: placement.strategy,
         text: placement.text,
       })),
@@ -507,8 +547,8 @@ const Index = () => {
               <h1 className="mt-4 text-3xl font-semibold tracking-tight">Weave Edit</h1>
               <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
                 Build visual coverage for a marked part of your edit. Weave Edit reads a manual
-                timestamped script, scans a still-image folder, and places images on the selected
-                track with sequence In/Out taking priority over whole-sequence timing.
+                timestamped script, scans an image or video folder, and places matching media on
+                the selected track with sequence In/Out taking priority over whole-sequence timing.
               </p>
             </div>
             <div className="grid min-w-[300px] gap-3 rounded-3xl border border-border/70 bg-background/70 p-4">
@@ -539,7 +579,7 @@ const Index = () => {
             <PanelSection
               step="1"
               title="Script"
-              description="Paste your script or load an SRT/timestamped text file. Auto transcription stays out of this pass so the workflow remains reliable and local."
+              description="Paste your script or load an SRT/timestamped text file. Frame timecode like HH:MM:SS:FF now follows the active Premiere sequence FPS."
               action={
                 <label className="cursor-pointer rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent">
                   Load script file
@@ -574,15 +614,15 @@ const Index = () => {
               ) : (
                 <InlineMessage
                   tone="neutral"
-                  message="Use SRT or timestamp-first lines such as 00:00:12 text."
+                  message="Use SRT, HH:MM:SS.mmm, or frame timecode such as 00:00:45:02."
                 />
               )}
             </PanelSection>
 
             <PanelSection
               step="2"
-              title="Image library"
-              description="Make the folder picker primary, keep raw paths as a backup, and scan the folder before placement so you know exactly what is available."
+              title="Media library"
+              description="Choose whether this pass should scan images, videos, or both. Folder scanning now skips unreadable subfolders instead of failing the whole library."
               action={
                 <div className="flex flex-wrap gap-2">
                   {isCepEnvironment() ? (
@@ -604,24 +644,53 @@ const Index = () => {
                 </div>
               }
             >
+              <div className="grid gap-4 md:grid-cols-[1fr_1fr]">
+                <label className="grid gap-2 text-sm">
+                  <span className="text-muted-foreground">Library type</span>
+                  <select
+                    value={libraryMode}
+                    onChange={(event) => setLibraryMode(event.target.value as MediaLibraryMode)}
+                    className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                  >
+                    <option value="images">Images only</option>
+                    <option value="videos">Videos only</option>
+                    <option value="mixed">Mixed images and videos</option>
+                  </select>
+                </label>
+                <div className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
+                  {libraryMode === "images"
+                    ? "Still image workflow."
+                    : libraryMode === "videos"
+                      ? "Video workflow with local frame extraction for AI."
+                      : "Mixed workflow with stills and videos in one library."}
+                </div>
+              </div>
               <input
                 value={imageFolderPath}
                 onChange={(event) => setImageFolderPath(event.target.value)}
-                placeholder="C:/path/to/image-folder"
+                placeholder="C:/path/to/media-folder"
                 className="w-full rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
               />
               <div className="grid gap-4 md:grid-cols-3">
-                <StatCard label="Images found" value={imagePaths.length.toString()} />
-                <StatCard label="Keyword match" value={previewStats.keyword.toString()} />
+                <StatCard label="Media found" value={mediaItems.length.toString()} />
+                <StatCard label="Images / videos" value={`${libraryStats.images} / ${libraryStats.videos}`} />
                 <StatCard label="Blank fallback" value={previewStats.blank.toString()} />
               </div>
               {folderError ? <InlineMessage tone="error" message={folderError} /> : null}
-              {imagePaths.length > 0 ? (
+              {scanWarnings.length > 0 ? (
+                <InlineMessage
+                  tone="warning"
+                  message={`Scan warnings: ${scanWarnings.slice(0, 2).join(" | ")}`}
+                />
+              ) : null}
+              {mediaItems.length > 0 ? (
                 <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
                   <p className="text-sm font-medium">First files</p>
                   <div className="mt-3 max-h-40 space-y-1 overflow-auto font-mono text-xs text-muted-foreground">
-                    {imagePaths.slice(0, 12).map((imagePath) => (
-                      <p key={imagePath}>{imagePath}</p>
+                    {mediaItems.slice(0, 12).map((item) => (
+                      <p key={item.path}>
+                        [{item.type}] {item.path}
+                      </p>
                     ))}
                   </div>
                 </div>
@@ -676,7 +745,9 @@ const Index = () => {
                       AI story matching
                     </p>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      AI proposes visual relevance, but deterministic timeline rules still control final placement.
+                      Gemma is the main local scorer. For videos, Weave Edit extracts local frame
+                      samples with `ffmpeg` and aligns them to the script timestamps before
+                      ranking.
                     </p>
                   </div>
                   <select
@@ -748,7 +819,7 @@ const Index = () => {
                   <button
                     type="button"
                     onClick={() => void runAiRanking()}
-                    disabled={aiMode === "off" || !parsedScriptState.result || imagePaths.length === 0}
+                    disabled={aiMode === "off" || !parsedScriptState.result || mediaItems.length === 0}
                     className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
                   >
                     {aiBusyMessage === "Ranking segment assets" ? "Ranking..." : "Analyze with AI"}
@@ -777,6 +848,10 @@ const Index = () => {
                       Gemini key status: {geminiApiKey ? "configured in environment" : "not set"}.
                     </p>
                   ) : null}
+                  <p className="text-xs text-muted-foreground">
+                    Local video tools: ffprobe {videoTooling.ffprobeAvailable ? "ready" : "missing"} /
+                    ffmpeg {videoTooling.ffmpegAvailable ? "ready" : "missing"}.
+                  </p>
                 </div>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
@@ -907,7 +982,11 @@ const Index = () => {
                     </div>
                     <p className="mt-3 text-sm leading-6 text-foreground">{placement.text}</p>
                     <div className="mt-3 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-                      <span>{placement.imageName ?? "blank gap"}</span>
+                      <span>
+                        {placement.mediaName
+                          ? `[${placement.mediaType}] ${placement.mediaName}`
+                          : "blank gap"}
+                      </span>
                       <span>{placement.durationSec.toFixed(2)}s</span>
                     </div>
                     {placement.aiProvider ? (
@@ -961,7 +1040,7 @@ const Index = () => {
                 ))}
                 {!effectivePlan ? (
                   <div className="rounded-3xl border border-dashed border-border/70 p-6 text-sm text-muted-foreground">
-                    Add a valid script and image folder to build the preview.
+                    Add a valid script and media folder to build the preview.
                   </div>
                 ) : null}
               </div>
@@ -1030,27 +1109,31 @@ function loadStoredSettings(): Partial<StoredSettings> | null {
   }
 }
 
-function shortlistCandidates(text: string, imagePaths: string[], limit: number): string[] {
+function shortlistCandidates(
+  text: string,
+  mediaItems: MediaLibraryItem[],
+  limit: number,
+): MediaLibraryItem[] {
   const tokens = tokenize(text);
   if (tokens.length === 0) {
-    return imagePaths.slice(0, limit);
+    return mediaItems.slice(0, limit);
   }
 
-  const scored = imagePaths
-    .map((path) => {
-      const normalizedName = getFileName(path).toLowerCase();
+  const scored = mediaItems
+    .map((item) => {
+      const normalizedName = getFileName(item.path).toLowerCase();
       let score = 0;
       tokens.forEach((token) => {
         if (normalizedName.includes(token)) {
           score += 1;
         }
       });
-      return { path, score };
+      return { item, score };
     })
     .sort((left, right) => right.score - left.score);
 
-  const prioritized = scored.filter((entry) => entry.score > 0).map((entry) => entry.path);
-  const fallback = scored.filter((entry) => entry.score === 0).map((entry) => entry.path);
+  const prioritized = scored.filter((entry) => entry.score > 0).map((entry) => entry.item);
+  const fallback = scored.filter((entry) => entry.score === 0).map((entry) => entry.item);
   return [...prioritized, ...fallback].slice(0, limit);
 }
 
@@ -1062,14 +1145,15 @@ function tokenize(text: string): string[] {
     .filter((token) => token.length > 2);
 }
 
-function getFileName(filePath: string): string {
-  const normalized = normalizePath(filePath);
-  const parts = normalized.split("/");
-  return parts[parts.length - 1] ?? filePath;
-}
-
-function normalizePath(filePath: string): string {
-  return filePath.replace(/\\/g, "/");
+function scanLibraryFolder(folderPath: string, mode: MediaLibraryMode): MediaScanResult {
+  try {
+    return listMediaFiles(folderPath, mode);
+  } catch (error) {
+    return {
+      items: [],
+      warnings: [`Scan failed: ${String(error)}`],
+    };
+  }
 }
 
 function applyWorkingRange(

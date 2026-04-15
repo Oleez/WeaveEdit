@@ -1,5 +1,12 @@
 import { AiProvider, clampScore } from "./provider";
-import { AiHealthStatus, AiModelProfile, AiScoringContext, AiSegmentRanking, AiSegmentRequest } from "./types";
+import {
+  AiAssetCandidate,
+  AiHealthStatus,
+  AiModelProfile,
+  AiScoringContext,
+  AiSegmentRanking,
+  AiSegmentRequest,
+} from "./types";
 
 interface OllamaTagResponse {
   models?: Array<{ name: string }>;
@@ -7,6 +14,10 @@ interface OllamaTagResponse {
 
 interface OllamaGenerateResponse {
   response?: string;
+}
+
+interface NodeRequire {
+  (moduleName: string): unknown;
 }
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -59,107 +70,123 @@ export class OllamaAiProvider implements AiProvider {
     request: AiSegmentRequest,
     context: AiScoringContext,
   ): Promise<AiSegmentRanking> {
-    const prompt = createRankingPrompt(request);
     const timeoutMs = context.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    let responseText = "";
+    const rankedAssets: AiSegmentRanking["rankedAssets"] = [];
 
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        const response = await fetchWithTimeout(
-          `${normalizeBaseUrl(context.ollamaBaseUrl)}/api/generate`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: context.ollamaModel,
-              prompt,
-              stream: false,
-              options: {
-                temperature: 0.1,
-              },
-            }),
-          },
-          timeoutMs,
-        );
-
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const payload = (await response.json()) as OllamaGenerateResponse;
-        responseText = payload.response ?? "";
-        break;
-      } catch (error) {
-        if (attempt >= 2) {
-          throw error;
-        }
-      }
+    for (const candidate of request.candidates) {
+      const scored = await scoreCandidate(candidate, request, context, timeoutMs);
+      rankedAssets.push(scored);
     }
 
-    const parsed = parseRankingResponse(responseText, request);
+    rankedAssets.sort((left, right) => right.score - left.score);
+    const topScore = rankedAssets[0]?.score ?? 0;
 
     return {
       provider: this.providerName,
       segmentId: request.segmentId,
-      confidence: clampScore(parsed.confidence),
-      rationale: parsed.rationale,
-      rankedAssets: parsed.rankedAssets,
+      confidence: clampScore(topScore),
+      rationale:
+        rankedAssets[0]?.rationale ??
+        "Ranked by local Gemma analysis using filenames, timestamps, and extracted visual samples when available.",
+      rankedAssets: rankedAssets.slice(0, request.maxRecommendations ?? 3),
       fallbackUsed: false,
     };
   }
 }
 
-function createRankingPrompt(request: AiSegmentRequest): string {
-  const candidateLines = request.candidates
-    .map((candidate, index) => `${index + 1}. id=${candidate.id} | name=${candidate.name}`)
-    .join("\n");
+async function scoreCandidate(
+  candidate: AiAssetCandidate,
+  request: AiSegmentRequest,
+  context: AiScoringContext,
+  timeoutMs: number,
+): Promise<AiSegmentRanking["rankedAssets"][number]> {
+  const prompt = createCandidatePrompt(request, candidate);
+  const images = readVisualInputs(candidate.visualPaths);
+  let responseText = "";
 
-  return [
-    "You are ranking visual assets for a video edit segment.",
-    "Return strict JSON only with shape:",
-    '{"confidence":0.0,"rationale":"short sentence","ranked":[{"candidateId":"...","score":0.0,"rationale":"..."}]}',
-    `Choose up to ${request.maxRecommendations ?? 3} candidates.`,
-    "Scores must be 0..1 and sorted descending.",
-    `Segment text: "${request.text}"`,
-    "Candidates:",
-    candidateLines,
-  ].join("\n");
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(
+        `${normalizeBaseUrl(context.ollamaBaseUrl)}/api/generate`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: context.ollamaModel,
+            prompt,
+            images,
+            stream: false,
+            options: {
+              temperature: 0.1,
+            },
+          }),
+        },
+        timeoutMs,
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const payload = (await response.json()) as OllamaGenerateResponse;
+      responseText = payload.response ?? "";
+      break;
+    } catch (error) {
+      if (attempt >= 2) {
+        throw error;
+      }
+    }
+  }
+
+  const parsed = parseCandidateResponse(responseText);
+  return {
+    candidateId: candidate.id,
+    score: clampScore(parsed.score),
+    rationale: parsed.rationale,
+  };
 }
 
-function parseRankingResponse(
-  raw: string,
-  request: AiSegmentRequest,
-): Pick<AiSegmentRanking, "confidence" | "rationale" | "rankedAssets"> {
+function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCandidate): string {
+  return [
+    "You are scoring one visual asset for one script segment in a Premiere editing workflow.",
+    "Use the script meaning, timing, and any attached image frames.",
+    'Return strict JSON only with shape: {"score":0.0,"rationale":"short sentence"}',
+    `Segment text: "${request.text}"`,
+    `Segment timing: start=${request.startSec.toFixed(2)} end=${request.endSec ?? "unknown"}`,
+    `Candidate id: ${candidate.id}`,
+    `Candidate name: ${candidate.name}`,
+    `Candidate type: ${candidate.mediaType}`,
+    `Candidate descriptor: ${candidate.descriptor ?? candidate.name}`,
+    candidate.durationSec ? `Candidate duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
+    candidate.sampleTimestampsSec?.length
+      ? `Candidate sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
+      : "",
+    "Score guidelines:",
+    "1.0 = excellent semantic and visual fit, 0.0 = unrelated.",
+    "Prefer assets whose meaning and mood match the segment text.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseCandidateResponse(raw: string): { score: number; rationale: string } {
   const parsed = safeJsonParse(extractJsonObject(raw)) as
     | {
-        confidence?: number;
+        score?: number;
         rationale?: string;
-        ranked?: Array<{ candidateId?: string; score?: number; rationale?: string }>;
       }
     | null;
 
-  if (!parsed || !Array.isArray(parsed.ranked)) {
+  if (!parsed) {
     return {
-      confidence: 0,
+      score: 0,
       rationale: "Model response could not be parsed; deterministic fallback remains available.",
-      rankedAssets: [],
     };
   }
 
-  const validCandidateIds = new Set(request.candidates.map((candidate) => candidate.id));
-  const rankedAssets = parsed.ranked
-    .filter((item) => item.candidateId && validCandidateIds.has(item.candidateId))
-    .map((item) => ({
-      candidateId: String(item.candidateId),
-      score: clampScore(Number(item.score ?? 0)),
-      rationale: String(item.rationale ?? "Relevant to script context."),
-    }))
-    .sort((left, right) => right.score - left.score);
-
   return {
-    confidence: clampScore(Number(parsed.confidence ?? rankedAssets[0]?.score ?? 0)),
-    rationale: String(parsed.rationale ?? "Ranked by local semantic relevance."),
-    rankedAssets,
+    score: Number(parsed.score ?? 0),
+    rationale: String(parsed.rationale ?? "Relevant to script context."),
   };
 }
 
@@ -172,6 +199,17 @@ function extractJsonObject(raw: string): string {
   }
 
   return raw.slice(start, end + 1);
+}
+
+function readVisualInputs(paths: string[] | undefined): string[] {
+  if (!paths?.length || typeof window.require !== "function") {
+    return [];
+  }
+
+  const nodeRequire = window.require as NodeRequire;
+  const fs = nodeRequire("fs") as { readFileSync: (path: string, encoding: string) => string };
+
+  return paths.slice(0, 3).map((filePath) => fs.readFileSync(filePath, "base64"));
 }
 
 function safeJsonParse(raw: string): unknown {
