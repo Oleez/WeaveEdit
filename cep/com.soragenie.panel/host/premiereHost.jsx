@@ -72,6 +72,29 @@ var weaveEdit = (function () {
     return contents;
   }
 
+  function selectFolderPath() {
+    try {
+      var folder = Folder.selectDialog("Choose media folder");
+      if (!folder) {
+        return stringify({
+          status: "cancelled",
+          path: null
+        });
+      }
+
+      return stringify({
+        status: "selected",
+        path: normalizePath(folder.fsName)
+      });
+    } catch (error) {
+      return stringify({
+        status: "dialog_error",
+        path: null,
+        message: error.message || String(error)
+      });
+    }
+  }
+
   function getTrackEndSec(track) {
     if (!track || !track.clips || track.clips.numItems < 1) {
       return 0;
@@ -168,6 +191,54 @@ var weaveEdit = (function () {
     });
   }
 
+  function getTranscriptSegments() {
+    if (!app || !app.project || !app.project.activeSequence) {
+      return stringify([]);
+    }
+
+    var sequence = app.project.activeSequence;
+    var markers = sequence.markers;
+    var segments = [];
+
+    if (!markers || !markers.getFirstMarker) {
+      return stringify(segments);
+    }
+
+    var marker = markers.getFirstMarker();
+    var index = 0;
+
+    while (marker) {
+      var text = String(marker.comments || marker.name || "").replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
+      if (text) {
+        var startSec = marker.start ? Number(marker.start.seconds || 0) : 0;
+        var endSec = null;
+
+        try {
+          if (marker.end) {
+            endSec = Number(marker.end.seconds || 0);
+            if (!isFinite(endSec) || endSec <= startSec) {
+              endSec = null;
+            }
+          }
+        } catch (error) {
+          endSec = null;
+        }
+
+        segments.push({
+          id: "marker-" + (index + 1),
+          startSec: startSec,
+          endSec: endSec,
+          text: text
+        });
+        index += 1;
+      }
+
+      marker = markers.getNextMarker(marker);
+    }
+
+    return stringify(segments);
+  }
+
   function findProjectItemByPath(projectItem, normalizedTargetPath) {
     if (!projectItem) {
       return null;
@@ -254,6 +325,23 @@ var weaveEdit = (function () {
     return null;
   }
 
+  function hasTrackCollision(track, startSec, endSec) {
+    if (!track || !track.clips) {
+      return false;
+    }
+
+    for (var index = 0; index < track.clips.numItems; index += 1) {
+      var clip = track.clips[index];
+      var clipStart = Number(clip.start.seconds || 0);
+      var clipEnd = Number(clip.end.seconds || 0);
+      if (clipEnd > startSec && clipStart < endSec) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   function runJobFromFile(filePath) {
     try {
       var rawJob = readTextFile(filePath);
@@ -309,6 +397,14 @@ var weaveEdit = (function () {
 
     for (placementIndex = 0; placementIndex < job.placements.length; placementIndex += 1) {
       var currentPlacement = job.placements[placementIndex];
+      var trackOffset = Number(currentPlacement.trackOffset || 0);
+      var resolvedTrackIndex = targetTrackIndex + trackOffset;
+      if (resolvedTrackIndex < 0 || resolvedTrackIndex >= sequence.videoTracks.numTracks) {
+        details.push("Skipped " + currentPlacement.id + " because V" + (resolvedTrackIndex + 1) + " does not exist.");
+        continue;
+      }
+
+      var resolvedTrack = sequence.videoTracks[resolvedTrackIndex];
       var durationSec = Math.max(0.3, Number(currentPlacement.durationSec || 0));
       var requestedStartSec = appendOffsetSec + Number(currentPlacement.startSec || 0);
       var requestedEndSec = appendOffsetSec + Number(currentPlacement.endSec || (currentPlacement.startSec + durationSec));
@@ -329,6 +425,11 @@ var weaveEdit = (function () {
         if (startSec !== requestedStartSec || endSec !== requestedEndSec) {
           clippedCount += 1;
         }
+      }
+
+      if (trackOffset > 0 && hasTrackCollision(resolvedTrack, startSec, endSec)) {
+        details.push("Skipped " + currentPlacement.id + " because overlap track V" + (resolvedTrackIndex + 1) + " already has media in that range.");
+        continue;
       }
 
       if (!currentPlacement.mediaPath || currentPlacement.strategy === "blank") {
@@ -352,9 +453,9 @@ var weaveEdit = (function () {
           projectItem.setOutPoint(durationSec, 4);
         }
 
-        targetTrack.overwriteClip(projectItem, secondsToTicks(startSec));
+        resolvedTrack.overwriteClip(projectItem, secondsToTicks(startSec));
 
-        var trackItem = findPlacedTrackItem(targetTrack, projectItem, startSec);
+        var trackItem = findPlacedTrackItem(resolvedTrack, projectItem, startSec);
         if (trackItem) {
           trackItem.end = makeTime(startSec + durationSec);
         }
@@ -383,6 +484,8 @@ var weaveEdit = (function () {
 
   return {
     getStatus: getStatus,
+    getTranscriptSegments: getTranscriptSegments,
+    pickFolder: selectFolderPath,
     runJob: function (rawJob) {
       try {
         return runJob(parse(rawJob));

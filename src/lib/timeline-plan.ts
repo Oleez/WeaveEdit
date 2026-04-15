@@ -9,15 +9,20 @@ export interface TimelinePlannerSettings {
   aiRankingsBySegmentId?: Record<string, AiSegmentRanking>;
   manualOverridesBySegmentId?: Record<string, string | "blank" | "auto">;
   aiConfidenceThreshold?: number;
+  allowLowConfidenceFallback?: boolean;
+  maxOverlapLayers?: number;
 }
 
 export interface TimelinePlacement {
   id: string;
+  groupId: string;
   segmentId: string;
+  layerIndex: number;
+  trackOffset: number;
   startSec: number;
   endSec: number;
   durationSec: number;
-  strategy: "ai" | "keyword" | "sequential" | "blank";
+  strategy: "ai" | "manual" | "fallback" | "blank";
   mediaPath: string | null;
   mediaName: string | null;
   mediaType: MediaLibraryItem["type"] | null;
@@ -26,13 +31,18 @@ export interface TimelinePlacement {
   aiConfidence: number;
   aiRationale: string | null;
   aiProvider: string | null;
+  lowConfidence: boolean;
+  fallbackReason: string | null;
+  timingSource: "ai" | "segment" | "heuristic";
+  timingRationale: string | null;
+  overlapStyle: "single" | "parallel" | "staggered";
 }
 
 export interface TimelinePlan {
   placements: TimelinePlacement[];
   matchedByAi: number;
-  matchedByKeyword: number;
-  matchedSequentially: number;
+  matchedByFallback: number;
+  overlapPlacements: number;
   blanks: number;
 }
 
@@ -94,11 +104,12 @@ export function buildTimelinePlan(
   });
   const placements: TimelinePlacement[] = [];
   let matchedByAi = 0;
-  let sequentialCursor = 0;
-  let matchedByKeyword = 0;
-  let matchedSequentially = 0;
+  let matchedByFallback = 0;
+  let overlapPlacements = 0;
   let blanks = 0;
   const aiConfidenceThreshold = settings.aiConfidenceThreshold ?? 0.42;
+  const allowLowConfidenceFallback = settings.allowLowConfidenceFallback ?? true;
+  const maxOverlapLayers = Math.max(1, settings.maxOverlapLayers ?? 2);
 
   segments.forEach((segment, index) => {
     const nextSegment = segments[index + 1];
@@ -114,9 +125,9 @@ export function buildTimelinePlan(
         ? nextSegment.startSec - segment.startSec
         : Number.POSITIVE_INFINITY;
 
-    const durationSec = clampDuration(rawWindow, maxAvailableWindow, settings);
-    const override = settings.manualOverridesBySegmentId?.[segment.id] ?? "auto";
     const aiRanking = settings.aiRankingsBySegmentId?.[segment.id];
+    const durationDecision = resolveDuration(segment, rawWindow, maxAvailableWindow, settings, aiRanking);
+    const override = settings.manualOverridesBySegmentId?.[segment.id] ?? "auto";
     const aiMatch = findAiMatch(
       aiRanking,
       assets,
@@ -124,6 +135,7 @@ export function buildTimelinePlan(
       usedAssetIndexes,
       aiConfidenceThreshold,
       override,
+      allowLowConfidenceFallback,
     );
     const keywordMatch = findKeywordMatch(segment.text, assets, usedAssetIndexes);
 
@@ -135,15 +147,22 @@ export function buildTimelinePlan(
     let aiConfidence = 0;
     let aiRationale: string | null = null;
     let aiProvider: string | null = null;
+    let lowConfidence = false;
+    let fallbackReason: string | null = null;
+    const overlapStyle: TimelinePlacement["overlapStyle"] = aiRanking?.overlapStyle ?? "single";
+    const groupId = `segment-group-${index + 1}`;
 
     if (override === "blank") {
       blanks += 1;
       placements.push({
         id: `placement-${index + 1}`,
+        groupId,
         segmentId: segment.id,
+        layerIndex: 0,
+        trackOffset: 0,
         startSec: segment.startSec,
-        endSec: segment.startSec + durationSec,
-        durationSec,
+        endSec: segment.startSec + durationDecision.durationSec,
+        durationSec: durationDecision.durationSec,
         strategy,
         mediaPath,
         mediaName,
@@ -153,6 +172,11 @@ export function buildTimelinePlan(
         aiConfidence,
         aiRationale: "Manually overridden to blank.",
         aiProvider,
+        lowConfidence,
+        fallbackReason,
+        timingSource: durationDecision.source,
+        timingRationale: durationDecision.rationale,
+        overlapStyle,
       });
       return;
     }
@@ -161,8 +185,7 @@ export function buildTimelinePlan(
       const overrideIndex = assetIndexByPath.get(normalizePath(override));
       if (overrideIndex !== undefined && !usedAssetIndexes.has(overrideIndex)) {
         usedAssetIndexes.add(overrideIndex);
-        sequentialCursor = Math.max(sequentialCursor, overrideIndex + 1);
-        strategy = "ai";
+        strategy = "manual";
         mediaPath = assets[overrideIndex].path;
         mediaName = assets[overrideIndex].name;
         mediaType = assets[overrideIndex].type;
@@ -175,46 +198,46 @@ export function buildTimelinePlan(
 
     if (!mediaPath && aiMatch) {
       usedAssetIndexes.add(aiMatch.index);
-      sequentialCursor = Math.max(sequentialCursor, aiMatch.index + 1);
-      strategy = "ai";
+      strategy = aiMatch.lowConfidence ? "fallback" : "ai";
       mediaPath = aiMatch.asset.path;
       mediaName = aiMatch.asset.name;
       mediaType = aiMatch.asset.type;
       aiConfidence = aiMatch.confidence;
       aiRationale = aiMatch.rationale;
       aiProvider = aiMatch.provider;
-      matchedByAi += 1;
+      lowConfidence = aiMatch.lowConfidence;
+      fallbackReason = aiMatch.fallbackReason;
+      if (aiMatch.lowConfidence) {
+        matchedByFallback += 1;
+      } else {
+        matchedByAi += 1;
+      }
     } else if (!mediaPath && keywordMatch) {
       usedAssetIndexes.add(keywordMatch.index);
-      sequentialCursor = Math.max(sequentialCursor, keywordMatch.index + 1);
-      strategy = "keyword";
+      strategy = "fallback";
       mediaPath = keywordMatch.asset.path;
       mediaName = keywordMatch.asset.name;
       mediaType = keywordMatch.asset.type;
       keywordScore = keywordMatch.score;
-      matchedByKeyword += 1;
-    } else if (!mediaPath) {
-      sequentialCursor = advanceToUnusedIndex(sequentialCursor, assets.length, usedAssetIndexes);
-
-      if (sequentialCursor < assets.length) {
-        usedAssetIndexes.add(sequentialCursor);
-        strategy = "sequential";
-        mediaPath = assets[sequentialCursor].path;
-        mediaName = assets[sequentialCursor].name;
-        mediaType = assets[sequentialCursor].type;
-        matchedSequentially += 1;
-        sequentialCursor += 1;
-      } else if (settings.blankWhenNoImage) {
-        blanks += 1;
-      }
+      aiConfidence = aiRanking?.confidence ?? 0;
+      aiRationale = aiRanking?.rationale ?? "No high-confidence semantic match was available, so a lexical hint was used.";
+      aiProvider = aiRanking?.provider ?? null;
+      lowConfidence = true;
+      fallbackReason = "Used lexical fallback because AI confidence was below threshold.";
+      matchedByFallback += 1;
+    } else if (!mediaPath && settings.blankWhenNoImage) {
+      blanks += 1;
     }
 
     placements.push({
       id: `placement-${index + 1}`,
+      groupId,
       segmentId: segment.id,
+      layerIndex: 0,
+      trackOffset: 0,
       startSec: segment.startSec,
-      endSec: segment.startSec + durationSec,
-      durationSec,
+      endSec: segment.startSec + durationDecision.durationSec,
+      durationSec: durationDecision.durationSec,
       strategy,
       mediaPath,
       mediaName,
@@ -224,14 +247,56 @@ export function buildTimelinePlan(
       aiConfidence,
       aiRationale,
       aiProvider,
+      lowConfidence,
+      fallbackReason,
+      timingSource: durationDecision.source,
+      timingRationale: durationDecision.rationale,
+      overlapStyle,
     });
+
+    if (
+      mediaPath &&
+      aiRanking &&
+      maxOverlapLayers > 1 &&
+      aiRanking.suggestedLayerCount &&
+      aiRanking.suggestedLayerCount > 1
+    ) {
+      const secondaryMatch = findSecondaryAiMatch(
+        aiRanking,
+        assets,
+        assetIndexByPath,
+        usedAssetIndexes,
+        mediaPath,
+      );
+
+      if (secondaryMatch) {
+        usedAssetIndexes.add(secondaryMatch.index);
+        const overlapPlacement = createOverlapPlacement({
+          placementId: `${index + 1}-overlay-1`,
+          groupId,
+          segment,
+          durationSec: durationDecision.durationSec,
+          overlapStyle,
+          baseConfidence: aiConfidence,
+          baseRationale: aiRationale,
+          provider: aiProvider,
+          lowConfidence,
+          fallbackReason,
+          timingSource: durationDecision.source,
+          timingRationale: durationDecision.rationale,
+          match: secondaryMatch,
+        });
+        placements.push(overlapPlacement);
+        overlapPlacements += 1;
+      }
+    }
   });
 
   return {
     placements,
     matchedByAi,
-    matchedByKeyword,
-    matchedSequentially,
+    matchedByFallback,
+    overlapPlacements,
     blanks,
   };
 }
@@ -243,12 +308,21 @@ function findAiMatch(
   usedAssetIndexes: Set<number>,
   confidenceThreshold: number,
   override: string | "blank" | "auto",
-): { asset: MediaCandidate; index: number; confidence: number; rationale: string; provider: string } | null {
+  allowLowConfidenceFallback: boolean,
+): {
+  asset: MediaCandidate;
+  index: number;
+  confidence: number;
+  rationale: string;
+  provider: string;
+  lowConfidence: boolean;
+  fallbackReason: string | null;
+} | null {
   if (!aiRanking || override === "blank") {
     return null;
   }
 
-  if (aiRanking.confidence < confidenceThreshold) {
+  if (aiRanking.confidence < confidenceThreshold && !allowLowConfidenceFallback) {
     return null;
   }
 
@@ -265,6 +339,11 @@ function findAiMatch(
       confidence: ranked.score || aiRanking.confidence,
       rationale: ranked.rationale || aiRanking.rationale,
       provider: aiRanking.provider,
+      lowConfidence: aiRanking.confidence < confidenceThreshold,
+      fallbackReason:
+        aiRanking.confidence < confidenceThreshold
+          ? aiRanking.lowConfidenceReason ?? "AI confidence fell below the review threshold."
+          : null,
     };
   }
 
@@ -307,20 +386,6 @@ function findKeywordMatch(
   return bestMatch;
 }
 
-function advanceToUnusedIndex(
-  startIndex: number,
-  total: number,
-  usedIndexes: Set<number>,
-): number {
-  let cursor = startIndex;
-
-  while (cursor < total && usedIndexes.has(cursor)) {
-    cursor += 1;
-  }
-
-  return cursor;
-}
-
 function tokenize(value: string): Set<string> {
   return new Set(
     value
@@ -335,6 +400,35 @@ function tokenize(value: string): Set<string> {
 function estimateDurationFromText(text: string): number {
   const wordCount = text.split(/\s+/).filter(Boolean).length;
   return Math.max(2, Math.min(8, wordCount / 2.2));
+}
+
+function resolveDuration(
+  segment: ScriptSegment,
+  rawWindow: number,
+  maxWindow: number,
+  settings: TimelinePlannerSettings,
+  aiRanking?: AiSegmentRanking,
+): {
+  durationSec: number;
+  source: TimelinePlacement["timingSource"];
+  rationale: string;
+} {
+  const hasAiSuggestion = Boolean(aiRanking?.suggestedDurationSec && aiRanking.suggestedDurationSec > 0);
+  const baseDuration = hasAiSuggestion
+    ? aiRanking?.suggestedDurationSec ?? rawWindow
+    : segment.endSec && segment.endSec > segment.startSec
+      ? rawWindow
+      : deriveSentenceAwareDuration(segment);
+
+  return {
+    durationSec: clampDuration(baseDuration, maxWindow, settings),
+    source: hasAiSuggestion ? "ai" : segment.endSec ? "segment" : "heuristic",
+    rationale: hasAiSuggestion
+      ? aiRanking?.timingRationale ?? "Timing proposed by AI transcript analysis."
+      : segment.endSec
+        ? "Used transcript timing from the segment window."
+        : "Derived timing from sentence cadence and completion.",
+  };
 }
 
 function clampDuration(
@@ -356,5 +450,93 @@ function clampDuration(
 
 function roundDuration(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+function deriveSentenceAwareDuration(segment: ScriptSegment): number {
+  const cadenceDuration = Math.max(1.25, segment.wordCount / 2.8);
+  const punctuationBonus = segment.sentenceComplete ? 0.75 : 0;
+  const sentenceBonus = Math.min(1.25, Math.max(0, segment.sentenceCount - 1) * 0.35);
+  return cadenceDuration + punctuationBonus + sentenceBonus;
+}
+
+function findSecondaryAiMatch(
+  aiRanking: AiSegmentRanking,
+  assets: MediaCandidate[],
+  assetIndexByPath: Map<string, number>,
+  usedAssetIndexes: Set<number>,
+  excludedPath: string,
+): { asset: MediaCandidate; index: number; confidence: number; rationale: string } | null {
+  for (const ranked of aiRanking.rankedAssets.slice(1)) {
+    const index = assetIndexByPath.get(normalizePath(ranked.candidateId));
+    if (index === undefined || usedAssetIndexes.has(index)) {
+      continue;
+    }
+
+    const asset = assets[index];
+    if (normalizePath(asset.path) === normalizePath(excludedPath)) {
+      continue;
+    }
+
+    if ((ranked.score ?? 0) < 0.28) {
+      continue;
+    }
+
+    return {
+      asset,
+      index,
+      confidence: ranked.score,
+      rationale: ranked.rationale,
+    };
+  }
+
+  return null;
+}
+
+function createOverlapPlacement(input: {
+  placementId: string;
+  groupId: string;
+  segment: ScriptSegment;
+  durationSec: number;
+  overlapStyle: TimelinePlacement["overlapStyle"];
+  baseConfidence: number;
+  baseRationale: string | null;
+  provider: string | null;
+  lowConfidence: boolean;
+  fallbackReason: string | null;
+  timingSource: TimelinePlacement["timingSource"];
+  timingRationale: string | null;
+  match: { asset: MediaCandidate; index: number; confidence: number; rationale: string };
+}): TimelinePlacement {
+  const overlapStart =
+    input.overlapStyle === "staggered"
+      ? input.segment.startSec + Math.min(input.durationSec * 0.18, Math.max(0.2, input.durationSec - 0.6))
+      : input.segment.startSec;
+  const overlapDuration =
+    input.overlapStyle === "staggered" ? Math.max(0.6, input.durationSec * 0.72) : input.durationSec;
+
+  return {
+    id: `placement-${input.placementId}`,
+    groupId: input.groupId,
+    segmentId: input.segment.id,
+    layerIndex: 1,
+    trackOffset: 1,
+    startSec: roundDuration(overlapStart),
+    endSec: roundDuration(overlapStart + overlapDuration),
+    durationSec: roundDuration(overlapDuration),
+    strategy: input.lowConfidence ? "fallback" : "ai",
+    mediaPath: input.match.asset.path,
+    mediaName: input.match.asset.name,
+    mediaType: input.match.asset.type,
+    text: input.segment.text,
+    keywordScore: 0,
+    aiConfidence: input.match.confidence,
+    aiRationale: input.match.rationale || input.baseRationale,
+    aiProvider: input.provider,
+    lowConfidence: input.lowConfidence,
+    fallbackReason: input.fallbackReason,
+    timingSource: input.timingSource,
+    timingRationale: input.timingRationale,
+    overlapStyle: input.overlapStyle,
+  };
 }
 

@@ -18,8 +18,17 @@ export interface AiSegmentRequest {
   text: string;
   startSec: number;
   endSec: number | null;
+  wordCount?: number;
+  sentenceCount?: number;
+  sentenceComplete?: boolean;
   candidates: AiAssetCandidate[];
   maxRecommendations?: number;
+  minDurationSec?: number;
+  maxDurationSec?: number;
+  customInstructions?: string;
+  allowOverlap?: boolean;
+  maxOverlapLayers?: number;
+  transcriptSource?: "upload" | "premiere-markers";
 }
 
 export interface AiRankedAsset {
@@ -35,6 +44,11 @@ export interface AiSegmentRanking {
   rationale: string;
   rankedAssets: AiRankedAsset[];
   fallbackUsed: boolean;
+  suggestedDurationSec?: number;
+  suggestedLayerCount?: number;
+  overlapStyle?: "single" | "parallel" | "staggered";
+  timingRationale?: string;
+  lowConfidenceReason?: string;
 }
 
 export interface AiHealthStatus {
@@ -52,6 +66,7 @@ export interface AiScoringContext {
   timeoutMs?: number;
   ffmpegAvailable?: boolean;
   ffprobeAvailable?: boolean;
+  customInstructions?: string;
 }
 
 export interface AiBatchResult {

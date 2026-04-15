@@ -10,6 +10,11 @@ const rootDir = path.resolve(__dirname, "..");
 
 const extensionId = "com.soragenie.panel";
 const bundleDir = path.join(rootDir, "dist", "cep", extensionId);
+const requiredBundleFiles = [
+  path.join(bundleDir, "CSXS", "manifest.xml"),
+  path.join(bundleDir, "index.html"),
+  path.join(bundleDir, "host", "premiereHost.jsx"),
+];
 
 async function pathExists(targetPath) {
   try {
@@ -42,6 +47,12 @@ function enableCepDebugMode() {
 
 if (!(await pathExists(bundleDir))) {
   throw new Error(`CEP bundle not found at ${bundleDir}. Run "npm run build:cep" first.`);
+}
+
+for (const requiredFile of requiredBundleFiles) {
+  if (!(await pathExists(requiredFile))) {
+    throw new Error(`CEP bundle is missing required file: ${requiredFile}`);
+  }
 }
 
 if (process.platform !== "win32") {

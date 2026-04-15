@@ -52,6 +52,9 @@ export interface ExecuteTimelineJobInput {
   rangeEndSec: number | null;
   placements: Array<{
     id: string;
+    groupId?: string;
+    layerIndex?: number;
+    trackOffset?: number;
     startSec: number;
     endSec: number;
     durationSec: number;
@@ -64,6 +67,19 @@ export interface ExecuteTimelineJobInput {
 export interface MediaScanResult {
   items: MediaLibraryItem[];
   warnings: string[];
+}
+
+export interface FolderPickResult {
+  status: "selected" | "cancelled" | "api_unavailable" | "dialog_error";
+  path: string | null;
+  message?: string;
+}
+
+export interface PremiereTranscriptSegment {
+  id: string;
+  startSec: number;
+  endSec: number | null;
+  text: string;
 }
 
 type NodeRequire = (moduleName: string) => unknown;
@@ -100,21 +116,52 @@ export function isNodeEnabled(): boolean {
   return typeof window.require === "function";
 }
 
-export async function pickFolder(): Promise<string | null> {
-  const result = window.cep?.fs?.showOpenDialogEx?.(
-    false,
-    true,
-    "Choose media folder",
-    "",
-    [],
-    [],
-  );
+export function hasNativeFolderPicker(): boolean {
+  return Boolean(window.cep?.fs?.showOpenDialogEx || window.__adobe_cep__?.evalScript);
+}
 
-  if (!result || result.err || !Array.isArray(result.data) || result.data.length === 0) {
-    return null;
+export async function pickFolder(initialPath = ""): Promise<FolderPickResult> {
+  const dialogApi = window.cep?.fs?.showOpenDialogEx;
+
+  if (dialogApi) {
+    const result = dialogApi(false, true, "Choose media folder", initialPath, [], []);
+
+    if (!result) {
+      return {
+        status: "dialog_error",
+        path: null,
+        message: "Folder dialog returned no result.",
+      };
+    }
+
+    if (result.err) {
+      return {
+        status: "dialog_error",
+        path: null,
+        message: `Folder dialog failed with CEP error ${result.err}.`,
+      };
+    }
+
+    if (!Array.isArray(result.data) || result.data.length === 0) {
+      return { status: "cancelled", path: null };
+    }
+
+    return {
+      status: "selected",
+      path: normalizePath(result.data[0]),
+    };
   }
 
-  return normalizePath(result.data[0]);
+  if (!isCepEnvironment()) {
+    return {
+      status: "api_unavailable",
+      path: null,
+      message: "Folder picker is only available inside Premiere Pro.",
+    };
+  }
+
+  await ensureHostLoaded();
+  return evaluateJson<FolderPickResult>("weaveEdit.pickFolder()");
 }
 
 export function listMediaFiles(
@@ -192,6 +239,15 @@ export async function getPremiereStatus(): Promise<PremiereStatus> {
 
   await ensureHostLoaded();
   return evaluateJson<PremiereStatus>("weaveEdit.getStatus()");
+}
+
+export async function getPremiereTranscriptSegments(): Promise<PremiereTranscriptSegment[]> {
+  if (!isCepEnvironment()) {
+    throw new Error("Open Weave Edit inside Premiere Pro to read sequence markers.");
+  }
+
+  await ensureHostLoaded();
+  return evaluateJson<PremiereTranscriptSegment[]>("weaveEdit.getTranscriptSegments()");
 }
 
 export async function executeTimelineJob(

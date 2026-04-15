@@ -2,11 +2,14 @@ import { ChangeEvent, ReactNode, useCallback, useEffect, useMemo, useState } fro
 import {
   ExecuteTimelineJobInput,
   MediaScanResult,
+  PremiereTranscriptSegment,
   PremiereRunResult,
   PremiereStatus,
   executeTimelineJob,
   getEnvironmentVariable,
   getPremiereStatus,
+  getPremiereTranscriptSegments,
+  hasNativeFolderPicker,
   isCepEnvironment,
   isNodeEnabled,
   listMediaFiles,
@@ -28,6 +31,8 @@ interface StoredSettings {
   scriptText: string;
   imageFolderPath: string;
   libraryMode: MediaLibraryMode;
+  transcriptSourceMode: "upload" | "premiere-markers";
+  customInstructions: string;
   minDurationSec: number;
   maxDurationSec: number;
   targetVideoTrack: number;
@@ -53,6 +58,8 @@ const defaultSettings: StoredSettings = {
   scriptText: "",
   imageFolderPath: "",
   libraryMode: "images",
+  transcriptSourceMode: "premiere-markers",
+  customInstructions: "",
   minDurationSec: 2,
   maxDurationSec: 8,
   targetVideoTrack: 2,
@@ -70,6 +77,10 @@ const Index = () => {
   const [scriptSourceName, setScriptSourceName] = useState("Paste script or load a file");
   const [imageFolderPath, setImageFolderPath] = useState(defaultSettings.imageFolderPath);
   const [libraryMode, setLibraryMode] = useState<MediaLibraryMode>(defaultSettings.libraryMode);
+  const [transcriptSourceMode, setTranscriptSourceMode] = useState<"upload" | "premiere-markers">(
+    defaultSettings.transcriptSourceMode,
+  );
+  const [customInstructions, setCustomInstructions] = useState(defaultSettings.customInstructions);
   const [mediaItems, setMediaItems] = useState<MediaLibraryItem[]>([]);
   const [scanWarnings, setScanWarnings] = useState<string[]>([]);
   const [minDurationSec, setMinDurationSec] = useState(defaultSettings.minDurationSec);
@@ -90,6 +101,7 @@ const Index = () => {
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [folderError, setFolderError] = useState<string | null>(null);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [aiBusyMessage, setAiBusyMessage] = useState<string | null>(null);
   const [aiHealth, setAiHealth] = useState<AiHealthStatus[]>([]);
   const [aiErrors, setAiErrors] = useState<string[]>([]);
@@ -109,8 +121,10 @@ const Index = () => {
     setScriptText(stored.scriptText ?? defaultSettings.scriptText);
     setImageFolderPath(stored.imageFolderPath ?? defaultSettings.imageFolderPath);
     setLibraryMode(stored.libraryMode ?? defaultSettings.libraryMode);
-    setMinDurationSec(stored.minDurationSec ?? defaultSettings.minDurationSec);
-    setMaxDurationSec(stored.maxDurationSec ?? defaultSettings.maxDurationSec);
+    setTranscriptSourceMode(stored.transcriptSourceMode ?? defaultSettings.transcriptSourceMode);
+    setCustomInstructions(stored.customInstructions ?? defaultSettings.customInstructions);
+    setMinDurationSec(clampDurationInput(stored.minDurationSec ?? defaultSettings.minDurationSec, 0.5));
+    setMaxDurationSec(clampDurationInput(stored.maxDurationSec ?? defaultSettings.maxDurationSec, 0.5));
     setTargetVideoTrack(stored.targetVideoTrack ?? defaultSettings.targetVideoTrack);
     setAppendAtTrackEnd(stored.appendAtTrackEnd ?? defaultSettings.appendAtTrackEnd);
     setUseWholeSequenceFallback(
@@ -132,6 +146,8 @@ const Index = () => {
         scriptText,
         imageFolderPath,
         libraryMode,
+        transcriptSourceMode,
+        customInstructions,
         minDurationSec,
         maxDurationSec,
         targetVideoTrack,
@@ -148,6 +164,8 @@ const Index = () => {
     appendAtTrackEnd,
     imageFolderPath,
     libraryMode,
+    transcriptSourceMode,
+    customInstructions,
     maxDurationSec,
     minDurationSec,
     scriptText,
@@ -166,7 +184,7 @@ const Index = () => {
     }
 
     void refreshPremiereStatus();
-  }, []);
+  }, [refreshPremiereStatus]);
 
   useEffect(() => {
     if (!imageFolderPath || !isNodeEnabled()) {
@@ -174,13 +192,13 @@ const Index = () => {
     }
 
     applyScanResult(scanLibraryFolder(imageFolderPath, libraryMode));
-  }, [imageFolderPath, libraryMode]);
+  }, [applyScanResult, imageFolderPath, libraryMode]);
 
   useEffect(() => {
     setAiRankingsBySegmentId({});
     setManualOverridesBySegmentId({});
     setAiErrors([]);
-  }, [scriptText, imageFolderPath]);
+  }, [scriptText, imageFolderPath, customInstructions]);
 
   const parsedScriptState = useMemo(() => {
     if (!scriptText.trim()) {
@@ -209,6 +227,8 @@ const Index = () => {
       aiRankingsBySegmentId,
       manualOverridesBySegmentId,
       aiConfidenceThreshold,
+      allowLowConfidenceFallback: true,
+      maxOverlapLayers: 2,
     });
   }, [
     aiConfidenceThreshold,
@@ -277,17 +297,21 @@ const Index = () => {
       (summary, placement) => {
         if (placement.strategy === "ai") {
           summary.ai += 1;
-        } else if (placement.strategy === "keyword") {
-          summary.keyword += 1;
-        } else if (placement.strategy === "sequential") {
-          summary.sequential += 1;
+        } else if (placement.strategy === "fallback") {
+          summary.fallback += 1;
+        } else if (placement.strategy === "manual") {
+          summary.manual += 1;
         } else {
           summary.blank += 1;
         }
 
+        if (placement.layerIndex > 0) {
+          summary.overlap += 1;
+        }
+
         return summary;
       },
-      { ai: 0, keyword: 0, sequential: 0, blank: 0 },
+      { ai: 0, fallback: 0, manual: 0, overlap: 0, blank: 0 },
     );
   }, [effectivePlan]);
 
@@ -323,6 +347,7 @@ const Index = () => {
   const hasMeaningfulInOut = Boolean(hostStatus?.range.hasMeaningfulInOut);
   const geminiApiKey = getEnvironmentVariable("GEMINI_API_KEY");
   const videoTooling = useMemo(() => detectVideoTooling(), []);
+  const canChooseFolder = hasNativeFolderPicker();
   const aiContext = useMemo<AiScoringContext>(
     () => ({
       ollamaBaseUrl,
@@ -332,8 +357,9 @@ const Index = () => {
       timeoutMs: 15000,
       ffmpegAvailable: videoTooling.ffmpegAvailable,
       ffprobeAvailable: videoTooling.ffprobeAvailable,
+      customInstructions,
     }),
-    [geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel, videoTooling],
+    [customInstructions, geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel, videoTooling],
   );
 
   async function runAiHealthCheck() {
@@ -381,7 +407,16 @@ const Index = () => {
             text: segment.text,
             startSec: segment.startSec,
             endSec: segment.endSec,
+            wordCount: segment.wordCount,
+            sentenceCount: segment.sentenceCount,
+            sentenceComplete: segment.sentenceComplete,
             maxRecommendations: 3,
+            minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
+            maxDurationSec: Math.max(minDurationSec, maxDurationSec),
+            customInstructions,
+            allowOverlap: true,
+            maxOverlapLayers: 2,
+            transcriptSource: transcriptSourceMode,
             candidates: hydrated.candidates,
           };
         }),
@@ -435,16 +470,40 @@ const Index = () => {
 
   async function chooseImageFolder() {
     try {
-      const folderPath = await pickFolder();
-      if (!folderPath) {
+      const folderResult = await pickFolder(imageFolderPath);
+      if (folderResult.status === "cancelled") {
         return;
       }
 
-      setImageFolderPath(folderPath);
+      if (folderResult.status !== "selected" || !folderResult.path) {
+        setFolderError(folderResult.message ?? "Folder picker is unavailable in this Premiere runtime.");
+        return;
+      }
+
+      setImageFolderPath(folderResult.path);
       setFolderError(null);
       setResult(null);
     } catch (error) {
       setFolderError(String(error));
+    }
+  }
+
+  async function loadPremiereMarkers() {
+    setTranscriptError(null);
+
+    try {
+      const segments = await getPremiereTranscriptSegments();
+      if (segments.length === 0) {
+        setTranscriptError("No sequence markers with comments/names were found in the active Premiere sequence.");
+        return;
+      }
+
+      setScriptText(formatMarkerTranscript(segments));
+      setScriptSourceName(`Premiere markers (${segments.length})`);
+      setTranscriptSourceMode("premiere-markers");
+      setResult(null);
+    } catch (error) {
+      setTranscriptError(String(error));
     }
   }
 
@@ -458,6 +517,8 @@ const Index = () => {
     reader.onload = () => {
       setScriptText(String(reader.result ?? ""));
       setScriptSourceName(file.name);
+      setTranscriptSourceMode("upload");
+      setTranscriptError(null);
       setResult(null);
     };
     reader.readAsText(file);
@@ -503,6 +564,9 @@ const Index = () => {
       rangeEndSec: effectivePlan.mode === "sequence_in_out" ? effectivePlan.rangeEndSec : null,
       placements: effectivePlan.placements.map((placement) => ({
         id: placement.id,
+        groupId: placement.groupId,
+        layerIndex: placement.layerIndex,
+        trackOffset: placement.trackOffset,
         startSec: placement.startSec,
         endSec: placement.endSec,
         durationSec: placement.durationSec,
@@ -579,19 +643,50 @@ const Index = () => {
             <PanelSection
               step="1"
               title="Script"
-              description="Paste your script or load an SRT/timestamped text file. Frame timecode like HH:MM:SS:FF now follows the active Premiere sequence FPS."
+              description="Use Premiere markers when available, or upload a timestamped script. Sentence boundaries drive timing, and incomplete thoughts stay shorter unless AI has a stronger editorial reason."
               action={
-                <label className="cursor-pointer rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent">
-                  Load script file
-                  <input
-                    type="file"
-                    accept=".srt,.txt,.csv"
-                    className="hidden"
-                    onChange={handleScriptUpload}
-                  />
-                </label>
+                <div className="flex flex-wrap gap-2">
+                  {isCepEnvironment() ? (
+                    <button
+                      type="button"
+                      onClick={() => void loadPremiereMarkers()}
+                      className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                    >
+                      Load Premiere markers
+                    </button>
+                  ) : null}
+                  <label className="cursor-pointer rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent">
+                    Load script file
+                    <input
+                      type="file"
+                      accept=".srt,.txt,.csv"
+                      className="hidden"
+                      onChange={handleScriptUpload}
+                    />
+                  </label>
+                </div>
               }
             >
+              <div className="grid gap-4 md:grid-cols-[0.8fr_1.2fr]">
+                <label className="grid gap-2 text-sm">
+                  <span className="text-muted-foreground">Transcript source</span>
+                  <select
+                    value={transcriptSourceMode}
+                    onChange={(event) =>
+                      setTranscriptSourceMode(event.target.value as "upload" | "premiere-markers")
+                    }
+                    className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                  >
+                    <option value="premiere-markers">Premiere markers first</option>
+                    <option value="upload">Uploaded script only</option>
+                  </select>
+                </label>
+                <div className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
+                  {transcriptSourceMode === "premiere-markers"
+                    ? "Preferred source: active sequence markers/comments in Premiere. Upload stays available as fallback."
+                    : "Preferred source: uploaded timestamped script. Premiere markers are optional reference only."}
+                </div>
+              </div>
               <div className="rounded-2xl border border-border/70 bg-background/60 px-4 py-3 text-xs uppercase tracking-[0.18em] text-muted-foreground">
                 Source: {scriptSourceName}
               </div>
@@ -606,10 +701,12 @@ const Index = () => {
               />
               {parsedScriptState.error ? (
                 <InlineMessage tone="error" message={parsedScriptState.error} />
+              ) : transcriptError ? (
+                <InlineMessage tone="warning" message={transcriptError} />
               ) : parsedScriptState.result ? (
                 <InlineMessage
                   tone="neutral"
-                  message={`Parsed ${parsedScriptState.result.segments.length} timestamped segments from ${parsedScriptState.result.format}.`}
+                  message={`Parsed ${parsedScriptState.result.segments.length} transcript segments from ${parsedScriptState.result.format}. Sentence boundaries now steer duration.`}
                 />
               ) : (
                 <InlineMessage
@@ -622,13 +719,14 @@ const Index = () => {
             <PanelSection
               step="2"
               title="Media library"
-              description="Choose whether this pass should scan images, videos, or both. Folder scanning now skips unreadable subfolders instead of failing the whole library."
+              description="Choose whether this pass should scan images, videos, or both. Folder selection should return the picked path directly into the source field, and scan warnings should stay explicit."
               action={
                 <div className="flex flex-wrap gap-2">
                   {isCepEnvironment() ? (
                     <button
                       type="button"
                       onClick={() => void chooseImageFolder()}
+                      disabled={!canChooseFolder}
                       className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
                     >
                       Choose folder
@@ -658,11 +756,9 @@ const Index = () => {
                   </select>
                 </label>
                 <div className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
-                  {libraryMode === "images"
-                    ? "Still image workflow."
-                    : libraryMode === "videos"
-                      ? "Video workflow with local frame extraction for AI."
-                      : "Mixed workflow with stills and videos in one library."}
+                  {imageFolderPath
+                    ? `Current source folder: ${imageFolderPath}`
+                    : "Choose a folder and Weave Edit will write it here, then scan the source library."}
                 </div>
               </div>
               <input
@@ -677,6 +773,12 @@ const Index = () => {
                 <StatCard label="Blank fallback" value={previewStats.blank.toString()} />
               </div>
               {folderError ? <InlineMessage tone="error" message={folderError} /> : null}
+              {!canChooseFolder && isCepEnvironment() ? (
+                <InlineMessage
+                  tone="warning"
+                  message="Native folder picker bridge is unavailable. Reinstall the extension and restart Premiere, or paste the folder path manually and use Scan folder."
+                />
+              ) : null}
               {scanWarnings.length > 0 ? (
                 <InlineMessage
                   tone="warning"
@@ -700,18 +802,18 @@ const Index = () => {
             <PanelSection
               step="3"
               title="Range and placement"
-              description="Sequence In/Out is the primary working window. Append mode stays available for building the next batch after the current end of the target track."
+              description="Sequence In/Out is the primary working window. AI now proposes duration and overlap by sentence, while the duration fields below act only as safety rails."
             >
               <div className="grid gap-4 md:grid-cols-3">
                 <NumberField
-                  label="Min duration"
+                  label="Min safety duration"
                   value={minDurationSec}
                   min={0.5}
                   step={0.5}
                   onChange={setMinDurationSec}
                 />
                 <NumberField
-                  label="Max duration"
+                  label="Max safety duration"
                   value={maxDurationSec}
                   min={0.5}
                   step={0.5}
@@ -808,6 +910,17 @@ const Index = () => {
                     />
                   </label>
                 </div>
+                <label className="mt-4 block text-sm">
+                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                    Custom instructions
+                  </span>
+                  <textarea
+                    value={customInstructions}
+                    onChange={(event) => setCustomInstructions(event.target.value)}
+                    placeholder="Example: Prefer symbolic visuals, avoid repeated assets, allow 2-layer overlap only on emotional peaks, keep pacing restrained."
+                    className="mt-2 min-h-[110px] w-full rounded-2xl border border-border/70 bg-card px-3 py-3 outline-none transition focus:border-primary"
+                  />
+                </label>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     type="button"
@@ -877,6 +990,14 @@ const Index = () => {
                           : "Blocked until range is chosen"
                   }
                 />
+                <StatusCard
+                  label="Timing engine"
+                  value="AI proposes sentence-aware duration; min/max only clamp outliers."
+                />
+                <StatusCard
+                  label="Overlap policy"
+                  value="AI may place up to 2 visual layers when the sentence benefits from simultaneous coverage."
+                />
               </div>
               {!appendAtTrackEnd && !hasMeaningfulInOut && !useWholeSequenceFallback ? (
                 <InlineMessage
@@ -944,7 +1065,9 @@ const Index = () => {
               <div className="grid gap-4 md:grid-cols-2">
                 <StatCard label="Preview placements" value={(effectivePlan?.placements.length ?? 0).toString()} />
                 <StatCard label="AI-assisted" value={(previewStats.ai ?? 0).toString()} />
-                <StatCard label="Sequential fallback" value={previewStats.sequential.toString()} />
+                <StatCard label="Low-confidence fallback" value={previewStats.fallback.toString()} />
+                <StatCard label="Manual overrides" value={previewStats.manual.toString()} />
+                <StatCard label="Overlap layers" value={previewStats.overlap.toString()} />
                 <StatCard label="Skipped by range" value={(effectivePlan?.skippedCount ?? 0).toString()} />
                 <StatCard label="Clipped by range" value={(effectivePlan?.clippedCount ?? 0).toString()} />
               </div>
@@ -968,13 +1091,19 @@ const Index = () => {
                         tone={
                           placement.strategy === "ai"
                             ? "info"
-                            : placement.strategy === "keyword"
-                            ? "success"
-                            : placement.strategy === "sequential"
-                              ? "info"
+                            : placement.strategy === "manual"
+                              ? "success"
+                              : placement.strategy === "fallback"
+                                ? "warning"
                               : "warning"
                         }
-                        label={placement.strategy}
+                        label={
+                          placement.lowConfidence
+                            ? "low-confidence fallback"
+                            : placement.strategy === "manual"
+                              ? "manual"
+                              : placement.strategy
+                        }
                       />
                       <span className="font-mono text-xs text-muted-foreground">
                         {formatSeconds(placement.startSec)} - {formatSeconds(placement.endSec)}
@@ -987,13 +1116,24 @@ const Index = () => {
                           ? `[${placement.mediaType}] ${placement.mediaName}`
                           : "blank gap"}
                       </span>
-                      <span>{placement.durationSec.toFixed(2)}s</span>
+                      <span>
+                        {placement.durationSec.toFixed(2)}s
+                        {placement.layerIndex > 0 ? ` • overlap layer ${placement.layerIndex + 1}` : ""}
+                      </span>
                     </div>
                     {placement.aiProvider ? (
                       <p className="mt-2 text-xs text-muted-foreground">
                         AI {placement.aiProvider} {(placement.aiConfidence * 100).toFixed(0)}%{" "}
                         {placement.aiRationale ? `- ${placement.aiRationale}` : ""}
                       </p>
+                    ) : null}
+                    {placement.timingRationale ? (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        Timing {placement.timingSource}: {placement.timingRationale}
+                      </p>
+                    ) : null}
+                    {placement.fallbackReason ? (
+                      <p className="mt-2 text-xs text-amber-300">{placement.fallbackReason}</p>
                     ) : null}
                     <div className="mt-3 flex flex-wrap gap-2">
                       <button
@@ -1114,9 +1254,13 @@ function shortlistCandidates(
   mediaItems: MediaLibraryItem[],
   limit: number,
 ): MediaLibraryItem[] {
+  if (mediaItems.length <= Math.max(limit, 48)) {
+    return mediaItems;
+  }
+
   const tokens = tokenize(text);
   if (tokens.length === 0) {
-    return mediaItems.slice(0, limit);
+    return sampleCandidatePool(mediaItems, limit);
   }
 
   const scored = mediaItems
@@ -1130,11 +1274,22 @@ function shortlistCandidates(
       });
       return { item, score };
     })
-    .sort((left, right) => right.score - left.score);
+    .sort((left, right) => right.score - left.score || left.item.path.localeCompare(right.item.path));
 
   const prioritized = scored.filter((entry) => entry.score > 0).map((entry) => entry.item);
   const fallback = scored.filter((entry) => entry.score === 0).map((entry) => entry.item);
-  return [...prioritized, ...fallback].slice(0, limit);
+  const sampledFallback = sampleCandidatePool(fallback, Math.max(0, limit - prioritized.length));
+  return dedupeMediaItems([...prioritized.slice(0, limit), ...sampledFallback]).slice(0, limit);
+}
+
+function formatMarkerTranscript(segments: PremiereTranscriptSegment[]): string {
+  return segments
+    .map((segment) =>
+      segment.endSec && segment.endSec > segment.startSec
+        ? `${formatSeconds(segment.startSec)} --> ${formatSeconds(segment.endSec)} ${segment.text}`
+        : `${formatSeconds(segment.startSec)} ${segment.text}`,
+    )
+    .join("\n\n");
 }
 
 function tokenize(text: string): string[] {
@@ -1143,6 +1298,33 @@ function tokenize(text: string): string[] {
     .split(/[^a-z0-9]+/)
     .map((token) => token.trim())
     .filter((token) => token.length > 2);
+}
+
+function sampleCandidatePool(mediaItems: MediaLibraryItem[], limit: number): MediaLibraryItem[] {
+  if (mediaItems.length <= limit) {
+    return mediaItems;
+  }
+
+  const stride = Math.max(1, Math.floor(mediaItems.length / limit));
+  const sampled: MediaLibraryItem[] = [];
+
+  for (let index = 0; index < mediaItems.length && sampled.length < limit; index += stride) {
+    sampled.push(mediaItems[index]);
+  }
+
+  return sampled.slice(0, limit);
+}
+
+function dedupeMediaItems(items: MediaLibraryItem[]): MediaLibraryItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.path)) {
+      return false;
+    }
+
+    seen.add(item.path);
+    return true;
+  });
 }
 
 function scanLibraryFolder(folderPath: string, mode: MediaLibraryMode): MediaScanResult {
@@ -1154,6 +1336,14 @@ function scanLibraryFolder(folderPath: string, mode: MediaLibraryMode): MediaSca
       warnings: [`Scan failed: ${String(error)}`],
     };
   }
+}
+
+function clampDurationInput(value: number, min: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
+  return Math.max(min, Math.round(value * 100) / 100);
 }
 
 function applyWorkingRange(
@@ -1294,7 +1484,7 @@ function NumberField({
         min={min}
         step={step}
         value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
+        onChange={(event) => onChange(clampDurationInput(Number(event.target.value), min))}
         className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
       />
     </label>

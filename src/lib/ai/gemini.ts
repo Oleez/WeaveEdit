@@ -1,5 +1,12 @@
 import { AiProvider, clampScore } from "./provider";
-import { AiHealthStatus, AiModelProfile, AiScoringContext, AiSegmentRanking, AiSegmentRequest } from "./types";
+import {
+  AiAssetCandidate,
+  AiHealthStatus,
+  AiModelProfile,
+  AiScoringContext,
+  AiSegmentRanking,
+  AiSegmentRequest,
+} from "./types";
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
@@ -38,7 +45,7 @@ export class GeminiAiProvider implements AiProvider {
     }
 
     try {
-      await this.generate(context, "Respond with the word OK.");
+      await this.generate(context, [{ text: "Respond with the word OK." }]);
       return {
         provider: this.providerName,
         ok: true,
@@ -63,21 +70,66 @@ export class GeminiAiProvider implements AiProvider {
       throw new Error("Missing GEMINI_API_KEY in environment.");
     }
 
-    const prompt = createPrompt(request);
-    const text = await this.generate(context, prompt);
-    const parsed = parseResponse(text, request);
+    const rankedAssets: AiSegmentRanking["rankedAssets"] = [];
+    for (const candidate of request.candidates) {
+      const scored = await this.scoreCandidate(candidate, request, context);
+      rankedAssets.push(scored);
+    }
+
+    rankedAssets.sort((left, right) => right.score - left.score);
+    const editPlan = await this.suggestEditPlan(request, rankedAssets, context);
 
     return {
       provider: this.providerName,
       segmentId: request.segmentId,
-      confidence: clampScore(parsed.confidence),
-      rationale: parsed.rationale,
-      rankedAssets: parsed.rankedAssets,
+      confidence: clampScore(rankedAssets[0]?.score ?? 0),
+      rationale:
+        rankedAssets[0]?.rationale ??
+        "Ranked by Gemini multimodal fallback using transcript and visual samples.",
+      rankedAssets: rankedAssets.slice(0, request.maxRecommendations ?? 3),
       fallbackUsed: false,
+      suggestedDurationSec: editPlan.suggestedDurationSec,
+      suggestedLayerCount: editPlan.suggestedLayerCount,
+      overlapStyle: editPlan.overlapStyle,
+      timingRationale: editPlan.rationale,
+      lowConfidenceReason:
+        (rankedAssets[0]?.score ?? 0) < 0.55
+          ? "AI confidence is below the editorial threshold, so placement should be reviewed."
+          : undefined,
     };
   }
 
-  private async generate(context: AiScoringContext, prompt: string): Promise<string> {
+  private async scoreCandidate(
+    candidate: AiAssetCandidate,
+    request: AiSegmentRequest,
+    context: AiScoringContext,
+  ): Promise<AiSegmentRanking["rankedAssets"][number]> {
+    const parts: GeminiPart[] = [{ text: createCandidatePrompt(request, candidate) }, ...createInlineImageParts(candidate)];
+    const text = await this.generate(context, parts);
+    const parsed = parseCandidateResponse(text);
+
+    return {
+      candidateId: candidate.id,
+      score: clampScore(parsed.score),
+      rationale: parsed.rationale,
+    };
+  }
+
+  private async suggestEditPlan(
+    request: AiSegmentRequest,
+    rankedAssets: AiSegmentRanking["rankedAssets"],
+    context: AiScoringContext,
+  ) {
+    const text = await this.generate(context, [
+      {
+        text: createEditPlanPrompt(request, rankedAssets),
+      },
+    ]);
+    const parsed = parseEditPlanResponse(text, request);
+    return parsed;
+  }
+
+  private async generate(context: AiScoringContext, parts: GeminiPart[]): Promise<string> {
     const timeoutMs = context.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${context.geminiModel}:generateContent?key=${context.geminiApiKey}`;
     const response = await fetchWithTimeout(
@@ -86,7 +138,7 @@ export class GeminiAiProvider implements AiProvider {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          contents: [{ role: "user", parts }],
           generationConfig: {
             temperature: 0.2,
             responseMimeType: "application/json",
@@ -111,66 +163,160 @@ export class GeminiAiProvider implements AiProvider {
   }
 }
 
-function createPrompt(request: AiSegmentRequest): string {
-  return JSON.stringify({
-    task: "Rank visual assets for one script segment.",
-    output: {
-      confidence: "0..1",
-      rationale: "one sentence",
-      ranked: [
-        {
-          candidateId: "string",
-          score: "0..1",
-          rationale: "short",
-        },
-      ],
-    },
-    maxRecommendations: request.maxRecommendations ?? 3,
-    segment: {
-      id: request.segmentId,
-      text: request.text,
-      startSec: request.startSec,
-      endSec: request.endSec,
-    },
-    candidates: request.candidates,
-  });
+interface GeminiPart {
+  text?: string;
+  inline_data?: {
+    mime_type: string;
+    data: string;
+  };
 }
 
-function parseResponse(
-  raw: string,
+function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCandidate): string {
+  return [
+    "You are scoring one visual asset for one script segment in a Premiere editing workflow.",
+    'Return strict JSON only with shape: {"score":0.0,"rationale":"short sentence"}',
+    `Segment text: "${request.text}"`,
+    `Segment timing: start=${request.startSec.toFixed(2)} end=${request.endSec ?? "unknown"}`,
+    `Candidate id: ${candidate.id}`,
+    `Candidate name: ${candidate.name}`,
+    `Candidate type: ${candidate.mediaType}`,
+    `Candidate descriptor: ${candidate.descriptor ?? candidate.name}`,
+    request.customInstructions ? `Custom instructions: ${request.customInstructions}` : "",
+    candidate.durationSec ? `Candidate duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
+    candidate.sampleTimestampsSec?.length
+      ? `Candidate sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function createEditPlanPrompt(
   request: AiSegmentRequest,
-): Pick<AiSegmentRanking, "confidence" | "rationale" | "rankedAssets"> {
-  const parsed = safeJsonParse(raw) as
+  rankedAssets: AiSegmentRanking["rankedAssets"],
+): string {
+  return [
+    "You are deciding editorial timing for one transcript segment.",
+    'Return strict JSON only with shape: {"suggestedDurationSec":0.0,"suggestedLayerCount":1,"overlapStyle":"single","rationale":"short sentence"}',
+    `Segment text: "${request.text}"`,
+    `Sentence complete: ${request.sentenceComplete ? "yes" : "no"}`,
+    `Word count: ${request.wordCount ?? 0}`,
+    `Sentence count: ${request.sentenceCount ?? 0}`,
+    `Safety min duration: ${request.minDurationSec ?? 0.5}`,
+    `Safety max duration: ${request.maxDurationSec ?? 8}`,
+    `Allow overlap: ${request.allowOverlap ? "yes" : "no"}`,
+    `Max overlap layers: ${request.maxOverlapLayers ?? 1}`,
+    request.customInstructions ? `Custom instructions: ${request.customInstructions}` : "",
+    `Top candidate scores: ${rankedAssets
+      .slice(0, 3)
+      .map((asset) => `${asset.candidateId}=${asset.score.toFixed(2)}`)
+      .join(", ")}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseCandidateResponse(
+  raw: string,
+): { score: number; rationale: string } {
+  const parsed = safeJsonParse(extractJsonObject(raw)) as
     | {
-        confidence?: number;
+        score?: number;
         rationale?: string;
-        ranked?: Array<{ candidateId?: string; score?: number; rationale?: string }>;
       }
     | null;
 
-  if (!parsed || !Array.isArray(parsed.ranked)) {
+  if (!parsed) {
     return {
-      confidence: 0,
+      score: 0,
       rationale: "Gemini response could not be parsed; deterministic fallback remains available.",
-      rankedAssets: [],
     };
   }
 
-  const validCandidateIds = new Set(request.candidates.map((candidate) => candidate.id));
-  const rankedAssets = parsed.ranked
-    .filter((item) => item.candidateId && validCandidateIds.has(item.candidateId))
-    .map((item) => ({
-      candidateId: String(item.candidateId),
-      score: clampScore(Number(item.score ?? 0)),
-      rationale: String(item.rationale ?? "Relevant to script context."),
-    }))
-    .sort((left, right) => right.score - left.score);
+  return {
+    score: Number(parsed.score ?? 0),
+    rationale: String(parsed.rationale ?? "Ranked by Gemini fallback."),
+  };
+}
+
+function parseEditPlanResponse(
+  raw: string,
+  request: AiSegmentRequest,
+): {
+  suggestedDurationSec: number;
+  suggestedLayerCount: number;
+  overlapStyle: "single" | "parallel" | "staggered";
+  rationale: string;
+} {
+  const parsed = safeJsonParse(extractJsonObject(raw)) as
+    | {
+        suggestedDurationSec?: number;
+        suggestedLayerCount?: number;
+        overlapStyle?: "single" | "parallel" | "staggered";
+        rationale?: string;
+      }
+    | null;
+
+  const min = request.minDurationSec ?? 0.5;
+  const max = request.maxDurationSec ?? 8;
+  const defaultDuration = Math.max(min, Math.min(max, Math.max(1.25, (request.wordCount ?? 8) / 2.6)));
+  const requestedLayers = request.allowOverlap ? Math.max(1, request.maxOverlapLayers ?? 2) : 1;
 
   return {
-    confidence: clampScore(Number(parsed.confidence ?? rankedAssets[0]?.score ?? 0)),
-    rationale: String(parsed.rationale ?? "Ranked by Gemini fallback."),
-    rankedAssets,
+    suggestedDurationSec: parsed?.suggestedDurationSec
+      ? Math.max(min, Math.min(max, parsed.suggestedDurationSec))
+      : defaultDuration,
+    suggestedLayerCount: request.allowOverlap
+      ? Math.max(1, Math.min(requestedLayers, Math.round(parsed?.suggestedLayerCount ?? 1)))
+      : 1,
+    overlapStyle:
+      request.allowOverlap && (parsed?.overlapStyle === "parallel" || parsed?.overlapStyle === "staggered")
+        ? parsed.overlapStyle
+        : "single",
+    rationale: String(parsed?.rationale ?? "Timing aligned to transcript cadence."),
   };
+}
+
+function extractJsonObject(raw: string): string {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end <= start) {
+    return "{}";
+  }
+
+  return raw.slice(start, end + 1);
+}
+
+function createInlineImageParts(candidate: AiAssetCandidate): GeminiPart[] {
+  if (!candidate.visualPaths?.length || typeof window.require !== "function") {
+    return [];
+  }
+
+  const nodeRequire = window.require as (moduleName: string) => unknown;
+  const fs = nodeRequire("fs") as { readFileSync: (path: string, encoding: string) => string };
+
+  return candidate.visualPaths.slice(0, 3).map((filePath) => ({
+    inline_data: {
+      mime_type: inferImageMimeType(filePath),
+      data: fs.readFileSync(filePath, "base64"),
+    },
+  }));
+}
+
+function inferImageMimeType(filePath: string): string {
+  const normalized = filePath.toLowerCase();
+  if (normalized.endsWith(".png")) {
+    return "image/png";
+  }
+  if (normalized.endsWith(".webp")) {
+    return "image/webp";
+  }
+  if (normalized.endsWith(".gif")) {
+    return "image/gif";
+  }
+
+  return "image/jpeg";
 }
 
 function safeJsonParse(raw: string): unknown {

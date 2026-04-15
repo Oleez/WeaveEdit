@@ -80,6 +80,7 @@ export class OllamaAiProvider implements AiProvider {
 
     rankedAssets.sort((left, right) => right.score - left.score);
     const topScore = rankedAssets[0]?.score ?? 0;
+    const editPlan = await suggestEditPlan(request, rankedAssets, context, timeoutMs);
 
     return {
       provider: this.providerName,
@@ -90,6 +91,14 @@ export class OllamaAiProvider implements AiProvider {
         "Ranked by local Gemma analysis using filenames, timestamps, and extracted visual samples when available.",
       rankedAssets: rankedAssets.slice(0, request.maxRecommendations ?? 3),
       fallbackUsed: false,
+      suggestedDurationSec: editPlan.suggestedDurationSec,
+      suggestedLayerCount: editPlan.suggestedLayerCount,
+      overlapStyle: editPlan.overlapStyle,
+      timingRationale: editPlan.rationale,
+      lowConfidenceReason:
+        topScore < 0.55
+          ? "AI confidence is below the editorial threshold, so placement should be reviewed."
+          : undefined,
     };
   }
 }
@@ -157,6 +166,7 @@ function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCand
     `Candidate name: ${candidate.name}`,
     `Candidate type: ${candidate.mediaType}`,
     `Candidate descriptor: ${candidate.descriptor ?? candidate.name}`,
+    request.customInstructions ? `Custom instructions: ${request.customInstructions}` : "",
     candidate.durationSec ? `Candidate duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
     candidate.sampleTimestampsSec?.length
       ? `Candidate sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
@@ -188,6 +198,133 @@ function parseCandidateResponse(raw: string): { score: number; rationale: string
     score: Number(parsed.score ?? 0),
     rationale: String(parsed.rationale ?? "Relevant to script context."),
   };
+}
+
+async function suggestEditPlan(
+  request: AiSegmentRequest,
+  rankedAssets: AiSegmentRanking["rankedAssets"],
+  context: AiScoringContext,
+  timeoutMs: number,
+): Promise<{
+  suggestedDurationSec: number;
+  suggestedLayerCount: number;
+  overlapStyle: "single" | "parallel" | "staggered";
+  rationale: string;
+}> {
+  const prompt = [
+    "You are deciding editorial timing for one transcript segment.",
+    'Return strict JSON only with shape: {"suggestedDurationSec":0.0,"suggestedLayerCount":1,"overlapStyle":"single","rationale":"short sentence"}',
+    `Segment text: "${request.text}"`,
+    `Segment start: ${request.startSec.toFixed(2)}`,
+    `Segment end: ${request.endSec ?? "unknown"}`,
+    `Sentence complete: ${request.sentenceComplete ? "yes" : "no"}`,
+    `Word count: ${request.wordCount ?? 0}`,
+    `Sentence count: ${request.sentenceCount ?? 0}`,
+    `Safety min duration: ${request.minDurationSec ?? 0.5}`,
+    `Safety max duration: ${request.maxDurationSec ?? 8}`,
+    `Allow overlap: ${request.allowOverlap ? "yes" : "no"}`,
+    `Max overlap layers: ${request.maxOverlapLayers ?? 1}`,
+    request.customInstructions ? `Custom instructions: ${request.customInstructions}` : "",
+    `Top candidate scores: ${rankedAssets
+      .slice(0, 3)
+      .map((asset) => `${asset.candidateId}=${asset.score.toFixed(2)}`)
+      .join(", ")}`,
+    "Use longer durations for complete thoughts and shorter durations for partial thoughts.",
+    "Only suggest 2 layers when the segment likely benefits from simultaneous visual reinforcement.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const response = await fetchWithTimeout(
+    `${normalizeBaseUrl(context.ollamaBaseUrl)}/api/generate`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: context.ollamaModel,
+        prompt,
+        stream: false,
+        options: { temperature: 0.1 },
+      }),
+    },
+    timeoutMs,
+  );
+
+  if (!response.ok) {
+    return defaultEditPlan(request);
+  }
+
+  const payload = (await response.json()) as OllamaGenerateResponse;
+  const parsed = safeJsonParse(extractJsonObject(payload.response ?? "")) as
+    | {
+        suggestedDurationSec?: number;
+        suggestedLayerCount?: number;
+        overlapStyle?: "single" | "parallel" | "staggered";
+        rationale?: string;
+      }
+    | null;
+
+  if (!parsed) {
+    return defaultEditPlan(request);
+  }
+
+  return {
+    suggestedDurationSec: clampDurationSuggestion(parsed.suggestedDurationSec, request),
+    suggestedLayerCount: clampLayerCount(parsed.suggestedLayerCount, request),
+    overlapStyle: normalizeOverlapStyle(parsed.overlapStyle, request),
+    rationale: String(parsed.rationale ?? "Timing aligned to transcript cadence."),
+  };
+}
+
+function defaultEditPlan(request: AiSegmentRequest) {
+  const heuristic = Math.max(
+    request.minDurationSec ?? 0.5,
+    Math.min(request.maxDurationSec ?? 8, Math.max(1.25, (request.wordCount ?? 8) / 2.6)),
+  );
+
+  return {
+    suggestedDurationSec: heuristic,
+    suggestedLayerCount:
+      request.allowOverlap && (request.wordCount ?? 0) > 18 ? Math.min(request.maxOverlapLayers ?? 2, 2) : 1,
+    overlapStyle:
+      request.allowOverlap && (request.wordCount ?? 0) > 18 ? ("staggered" as const) : ("single" as const),
+    rationale: "Timing derived from transcript cadence and sentence completion.",
+  };
+}
+
+function clampDurationSuggestion(value: number | undefined, request: AiSegmentRequest): number {
+  const min = request.minDurationSec ?? 0.5;
+  const max = request.maxDurationSec ?? 8;
+  if (!value || !Number.isFinite(value)) {
+    return defaultEditPlan(request).suggestedDurationSec;
+  }
+
+  return Math.max(min, Math.min(max, value));
+}
+
+function clampLayerCount(value: number | undefined, request: AiSegmentRequest): number {
+  if (!request.allowOverlap) {
+    return 1;
+  }
+
+  const maxLayers = Math.max(1, request.maxOverlapLayers ?? 2);
+  const parsed = Number(value ?? 1);
+  if (!Number.isFinite(parsed)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.min(maxLayers, Math.round(parsed)));
+}
+
+function normalizeOverlapStyle(
+  value: string | undefined,
+  request: AiSegmentRequest,
+): "single" | "parallel" | "staggered" {
+  if (!request.allowOverlap) {
+    return "single";
+  }
+
+  return value === "parallel" || value === "staggered" ? value : "single";
 }
 
 function extractJsonObject(raw: string): string {

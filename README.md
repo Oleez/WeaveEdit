@@ -1,6 +1,6 @@
 # Weave Edit Premiere Panel
 
-This project builds as an Adobe CEP panel for Premiere Pro so you can place image or video coverage against a timestamped script directly inside an edit.
+This project builds as an Adobe CEP panel for Premiere Pro so you can place image or video coverage against a transcript directly inside an edit.
 
 ## Local development
 
@@ -51,6 +51,16 @@ After install, restart Premiere Pro and open:
 
 `Window > Extensions > Weave Edit`
 
+## Transcript sources
+
+Weave Edit can build placements from:
+
+- Premiere sequence markers/comments
+- uploaded SRT files
+- uploaded timestamped text files
+
+If Premiere markers are available, they can be loaded directly into the panel and used as the transcript source before falling back to a manual upload.
+
 ## Timestamp formats
 
 Weave Edit accepts:
@@ -61,7 +71,7 @@ Weave Edit accepts:
 
 For `HH:MM:SS:FF`, the last field is parsed against the active Premiere sequence FPS.
 
-## Media library scanning
+## Media library scanning and picker behavior
 
 The library can scan:
 
@@ -71,9 +81,11 @@ The library can scan:
 
 If a subfolder cannot be read, Weave Edit now skips that folder and shows a scan warning instead of failing the entire scan.
 
+Inside Premiere, `Choose folder` should open a native folder picker and write the selected path back into the source field. If the native bridge is unavailable, paste the path manually and use `Scan folder`.
+
 ## AI setup (Ollama E4B primary)
 
-Weave Edit can run deterministic timeline placement without AI. AI is optional and used only to rank asset relevance.
+Weave Edit can run deterministic timeline placement without AI. AI is optional but intended to drive visual choice, duration suggestion, and overlap suggestions.
 
 ### 1) Install Ollama
 
@@ -99,10 +111,18 @@ In the panel:
 - set Ollama endpoint (default): `http://127.0.0.1:11434`
 - set model: `gemma4:e4b`
 - choose library type: `Images only`, `Videos only`, or `Mixed images and videos`
+- add any `Custom instructions` to steer tone, repetition rules, overlap behavior, and pacing
 - click `Check providers`, then `Analyze with AI`
 
-If Ollama is unavailable, Weave Edit automatically falls back to deterministic matching.
-If `ffmpeg`/`ffprobe` are available, Weave Edit extracts representative video frames and uses those samples for timestamp-aware local scoring.
+If Ollama is unavailable, Weave Edit can fall back to Gemini when Hybrid mode is enabled.
+If `ffmpeg`/`ffprobe` are available, Weave Edit extracts representative video frames and uses those samples for timestamp-aware scoring.
+
+## Editorial behavior
+
+- AI chooses the best matching visual candidates first.
+- Low-confidence segments can still place media, but they are explicitly flagged in preview so you can review them.
+- AI proposes sentence-aware durations, while min/max duration fields act only as safety rails.
+- AI can suggest up to two overlapping visual layers on adjacent tracks when the transcript segment benefits from simultaneous coverage.
 
 ## Gemini fallback (optional)
 
@@ -124,9 +144,12 @@ Notes:
 
 - With Ollama running: provider check passes and AI-assisted matches appear.
 - With frame-style script timecode like `00:00:45:02`, the parser succeeds when a Premiere sequence is active.
+- With Premiere markers present: `Load Premiere markers` populates the transcript panel.
 - With a mixed media folder, scan warnings are shown only for unreadable folders and the rest of the media still loads.
 - With Ollama down and no Gemini key: panel shows provider warning and deterministic matching still works.
 - With Ollama down and Gemini key set: Hybrid mode can still return AI rankings.
+- Low-confidence placements are flagged instead of silently appearing as normal AI picks.
+- Overlap layers place on adjacent tracks and skip when the overlap track is already occupied.
 - In/Out range, append mode, blank handling, and placement execution all remain deterministic.
 
 ## Key files

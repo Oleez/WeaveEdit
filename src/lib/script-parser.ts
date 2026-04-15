@@ -3,6 +3,10 @@ export interface ScriptSegment {
   startSec: number;
   endSec: number | null;
   text: string;
+  wordCount: number;
+  sentenceCount: number;
+  sentenceComplete: boolean;
+  sentenceBoundaryConfidence: number;
 }
 
 export interface ParseScriptResult {
@@ -91,6 +95,10 @@ function parseSrt(input: string, options: ParseScriptOptions): ScriptSegment[] {
       startSec: parseTimecode(match[1], options),
       endSec: parseTimecode(match[2], options),
       text,
+      wordCount: 0,
+      sentenceCount: 0,
+      sentenceComplete: false,
+      sentenceBoundaryConfidence: 0,
     });
   }
 
@@ -104,37 +112,60 @@ function parseTimestampLines(input: string, options: ParseScriptOptions): Script
     .filter(Boolean);
 
   const segments: ScriptSegment[] = [];
+  let currentSegment: ScriptSegment | null = null;
+
+  function flushCurrentSegment() {
+    if (!currentSegment?.text.trim()) {
+      currentSegment = null;
+      return;
+    }
+
+    segments.push(currentSegment);
+    currentSegment = null;
+  }
 
   for (const line of lines) {
     const rangeMatch = line.match(RANGE_RE);
     if (rangeMatch) {
       const text = line.replace(rangeMatch[0], "").trim();
-      if (!text) {
-        continue;
-      }
+      flushCurrentSegment();
 
-      segments.push({
+      currentSegment = {
         id: `segment-${segments.length + 1}`,
         startSec: parseTimecode(rangeMatch[1], options),
         endSec: parseTimecode(rangeMatch[2], options),
         text,
-      });
+        wordCount: 0,
+        sentenceCount: 0,
+        sentenceComplete: false,
+        sentenceBoundaryConfidence: 0,
+      };
       continue;
     }
 
     const singleMatch = line.match(SINGLE_TIMESTAMP_RE);
-    if (!singleMatch) {
+    if (singleMatch) {
+      flushCurrentSegment();
+
+      currentSegment = {
+        id: `segment-${segments.length + 1}`,
+        startSec: parseTimecode(singleMatch[1], options),
+        endSec: null,
+        text: singleMatch[2].trim(),
+        wordCount: 0,
+        sentenceCount: 0,
+        sentenceComplete: false,
+        sentenceBoundaryConfidence: 0,
+      };
       continue;
     }
 
-    segments.push({
-      id: `segment-${segments.length + 1}`,
-      startSec: parseTimecode(singleMatch[1], options),
-      endSec: null,
-      text: singleMatch[2].trim(),
-    });
+    if (currentSegment) {
+      currentSegment.text = `${currentSegment.text} ${line}`.trim();
+    }
   }
 
+  flushCurrentSegment();
   return segments;
 }
 
@@ -150,12 +181,41 @@ function normalizeSegments(segments: ScriptSegment[]): ScriptSegment[] {
           ? nextSegment.startSec
           : null;
 
+    const analysis = analyzeSegmentText(segment.text, normalizedEnd !== null);
+
     return {
       ...segment,
       id: `segment-${index + 1}`,
       endSec: normalizedEnd,
+      wordCount: analysis.wordCount,
+      sentenceCount: analysis.sentenceCount,
+      sentenceComplete: analysis.sentenceComplete,
+      sentenceBoundaryConfidence: analysis.sentenceBoundaryConfidence,
     };
   });
+}
+
+function analyzeSegmentText(
+  text: string,
+  hasExplicitEnd: boolean,
+): Pick<ScriptSegment, "wordCount" | "sentenceCount" | "sentenceComplete" | "sentenceBoundaryConfidence"> {
+  const normalizedText = text.trim();
+  const wordCount = normalizedText.split(/\s+/).filter(Boolean).length;
+  const sentenceMatches = normalizedText.match(/[^.!?]+[.!?]+["')\]]*/g);
+  const sentenceCount = sentenceMatches?.length ?? (wordCount > 0 ? 1 : 0);
+  const sentenceComplete = /[.!?]["')\]]*$/.test(normalizedText);
+  let sentenceBoundaryConfidence = sentenceComplete ? 1 : hasExplicitEnd ? 0.7 : 0.45;
+
+  if (wordCount > 18 && !sentenceComplete) {
+    sentenceBoundaryConfidence = Math.max(sentenceBoundaryConfidence, 0.6);
+  }
+
+  return {
+    wordCount,
+    sentenceCount,
+    sentenceComplete,
+    sentenceBoundaryConfidence,
+  };
 }
 
 function parseTimecode(rawValue: string, options: ParseScriptOptions): number {
