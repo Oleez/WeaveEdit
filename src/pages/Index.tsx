@@ -4,12 +4,15 @@ import {
   PremiereRunResult,
   PremiereStatus,
   executeTimelineJob,
+  getEnvironmentVariable,
   getPremiereStatus,
   isCepEnvironment,
   isNodeEnabled,
   listImageFiles,
   pickFolder,
 } from "@/lib/cep";
+import { checkAiProviders, rankSegmentsWithAi } from "@/lib/ai/router";
+import { AiHealthStatus, AiMode, AiScoringContext, AiSegmentRanking } from "@/lib/ai/types";
 import { formatSeconds, parseTimestampScript } from "@/lib/script-parser";
 import { TimelinePlacement, buildTimelinePlan } from "@/lib/timeline-plan";
 
@@ -26,6 +29,11 @@ interface StoredSettings {
   targetVideoTrack: number;
   appendAtTrackEnd: boolean;
   useWholeSequenceFallback: boolean;
+  aiMode: AiMode;
+  ollamaBaseUrl: string;
+  ollamaModel: string;
+  geminiModel: string;
+  aiConfidenceThreshold: number;
 }
 
 interface WorkingPlan {
@@ -45,6 +53,11 @@ const defaultSettings: StoredSettings = {
   targetVideoTrack: 2,
   appendAtTrackEnd: false,
   useWholeSequenceFallback: false,
+  aiMode: "off",
+  ollamaBaseUrl: "http://127.0.0.1:11434",
+  ollamaModel: "gemma4:e4b",
+  geminiModel: "gemma-4-26b-a4b-it",
+  aiConfidenceThreshold: 0.42,
 };
 
 const Index = () => {
@@ -59,10 +72,26 @@ const Index = () => {
   const [useWholeSequenceFallback, setUseWholeSequenceFallback] = useState(
     defaultSettings.useWholeSequenceFallback,
   );
+  const [aiMode, setAiMode] = useState<AiMode>(defaultSettings.aiMode);
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState(defaultSettings.ollamaBaseUrl);
+  const [ollamaModel, setOllamaModel] = useState(defaultSettings.ollamaModel);
+  const [geminiModel, setGeminiModel] = useState(defaultSettings.geminiModel);
+  const [aiConfidenceThreshold, setAiConfidenceThreshold] = useState(
+    defaultSettings.aiConfidenceThreshold,
+  );
   const [hostStatus, setHostStatus] = useState<PremiereStatus | null>(null);
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [folderError, setFolderError] = useState<string | null>(null);
+  const [aiBusyMessage, setAiBusyMessage] = useState<string | null>(null);
+  const [aiHealth, setAiHealth] = useState<AiHealthStatus[]>([]);
+  const [aiErrors, setAiErrors] = useState<string[]>([]);
+  const [aiRankingsBySegmentId, setAiRankingsBySegmentId] = useState<
+    Record<string, AiSegmentRanking>
+  >({});
+  const [manualOverridesBySegmentId, setManualOverridesBySegmentId] = useState<
+    Record<string, string | "blank" | "auto">
+  >({});
 
   useEffect(() => {
     const stored = loadStoredSettings();
@@ -79,6 +108,13 @@ const Index = () => {
     setUseWholeSequenceFallback(
       stored.useWholeSequenceFallback ?? defaultSettings.useWholeSequenceFallback,
     );
+    setAiMode(stored.aiMode ?? defaultSettings.aiMode);
+    setOllamaBaseUrl(stored.ollamaBaseUrl ?? defaultSettings.ollamaBaseUrl);
+    setOllamaModel(stored.ollamaModel ?? defaultSettings.ollamaModel);
+    setGeminiModel(stored.geminiModel ?? defaultSettings.geminiModel);
+    setAiConfidenceThreshold(
+      stored.aiConfidenceThreshold ?? defaultSettings.aiConfidenceThreshold,
+    );
   }, []);
 
   useEffect(() => {
@@ -92,6 +128,11 @@ const Index = () => {
         targetVideoTrack,
         appendAtTrackEnd,
         useWholeSequenceFallback,
+        aiMode,
+        ollamaBaseUrl,
+        ollamaModel,
+        geminiModel,
+        aiConfidenceThreshold,
       } satisfies StoredSettings),
     );
   }, [
@@ -102,6 +143,11 @@ const Index = () => {
     scriptText,
     targetVideoTrack,
     useWholeSequenceFallback,
+    aiMode,
+    ollamaBaseUrl,
+    ollamaModel,
+    geminiModel,
+    aiConfidenceThreshold,
   ]);
 
   useEffect(() => {
@@ -128,6 +174,12 @@ const Index = () => {
     }
   }, [imageFolderPath]);
 
+  useEffect(() => {
+    setAiRankingsBySegmentId({});
+    setManualOverridesBySegmentId({});
+    setAiErrors([]);
+  }, [scriptText, imageFolderPath]);
+
   const parsedScriptState = useMemo(() => {
     if (!scriptText.trim()) {
       return { error: null, result: null };
@@ -149,8 +201,19 @@ const Index = () => {
       minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
       maxDurationSec: Math.max(minDurationSec, maxDurationSec),
       blankWhenNoImage: true,
+      aiRankingsBySegmentId,
+      manualOverridesBySegmentId,
+      aiConfidenceThreshold,
     });
-  }, [imagePaths, maxDurationSec, minDurationSec, parsedScriptState.result]);
+  }, [
+    aiConfidenceThreshold,
+    aiRankingsBySegmentId,
+    imagePaths,
+    manualOverridesBySegmentId,
+    maxDurationSec,
+    minDurationSec,
+    parsedScriptState.result,
+  ]);
 
   const effectivePlan = useMemo<WorkingPlan | null>(() => {
     if (!basePlan) {
@@ -207,7 +270,9 @@ const Index = () => {
 
     return placements.reduce(
       (summary, placement) => {
-        if (placement.strategy === "keyword") {
+        if (placement.strategy === "ai") {
+          summary.ai += 1;
+        } else if (placement.strategy === "keyword") {
           summary.keyword += 1;
         } else if (placement.strategy === "sequential") {
           summary.sequential += 1;
@@ -217,7 +282,7 @@ const Index = () => {
 
         return summary;
       },
-      { keyword: 0, sequential: 0, blank: 0 },
+      { ai: 0, keyword: 0, sequential: 0, blank: 0 },
     );
   }, [effectivePlan]);
 
@@ -243,6 +308,66 @@ const Index = () => {
 
   const canExecute = !busyMessage && !executeReason;
   const hasMeaningfulInOut = Boolean(hostStatus?.range.hasMeaningfulInOut);
+  const geminiApiKey = getEnvironmentVariable("GEMINI_API_KEY");
+  const aiContext = useMemo<AiScoringContext>(
+    () => ({
+      ollamaBaseUrl,
+      ollamaModel,
+      geminiModel,
+      geminiApiKey,
+      timeoutMs: 15000,
+    }),
+    [geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel],
+  );
+
+  async function runAiHealthCheck() {
+    if (aiMode === "off") {
+      setAiHealth([]);
+      return;
+    }
+
+    setAiBusyMessage("Checking AI providers");
+    try {
+      const statuses = await checkAiProviders(aiMode, aiContext);
+      setAiHealth(statuses);
+    } catch (error) {
+      setAiErrors([String(error)]);
+    } finally {
+      setAiBusyMessage(null);
+    }
+  }
+
+  async function runAiRanking() {
+    if (aiMode === "off" || !parsedScriptState.result || imagePaths.length === 0) {
+      return;
+    }
+
+    setAiBusyMessage("Ranking segment assets");
+    setAiErrors([]);
+
+    try {
+      const requests = parsedScriptState.result.segments.map((segment) => ({
+        segmentId: segment.id,
+        text: segment.text,
+        startSec: segment.startSec,
+        endSec: segment.endSec,
+        maxRecommendations: 3,
+        candidates: shortlistCandidates(segment.text, imagePaths, 20).map((path) => ({
+          id: normalizePath(path),
+          path,
+          name: getFileName(path),
+        })),
+      }));
+
+      const ranked = await rankSegmentsWithAi(requests, aiMode, aiContext);
+      setAiRankingsBySegmentId(ranked.rankingsBySegmentId);
+      setAiErrors(ranked.errors);
+    } catch (error) {
+      setAiErrors([String(error)]);
+    } finally {
+      setAiBusyMessage(null);
+    }
+  }
 
   async function refreshPremiereStatus() {
     setBusyMessage("Checking Premiere sequence");
@@ -544,6 +669,116 @@ const Index = () => {
                   description="Keep this off if you want Weave Edit to require real editorial marks before placing anything."
                 />
               </div>
+              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      AI story matching
+                    </p>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      AI proposes visual relevance, but deterministic timeline rules still control final placement.
+                    </p>
+                  </div>
+                  <select
+                    value={aiMode}
+                    onChange={(event) => setAiMode(event.target.value as AiMode)}
+                    className="rounded-2xl border border-border/70 bg-card px-3 py-2 text-sm"
+                  >
+                    <option value="off">Off</option>
+                    <option value="local">Local (Ollama)</option>
+                    <option value="hybrid">Hybrid (Ollama + Gemini fallback)</option>
+                  </select>
+                </div>
+                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Ollama endpoint
+                    </span>
+                    <input
+                      value={ollamaBaseUrl}
+                      onChange={(event) => setOllamaBaseUrl(event.target.value)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Ollama model
+                    </span>
+                    <input
+                      value={ollamaModel}
+                      onChange={(event) => setOllamaModel(event.target.value)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Gemini fallback model
+                    </span>
+                    <input
+                      value={geminiModel}
+                      onChange={(event) => setGeminiModel(event.target.value)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      AI confidence threshold
+                    </span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={aiConfidenceThreshold}
+                      onChange={(event) =>
+                        setAiConfidenceThreshold(Math.max(0, Math.min(1, Number(event.target.value))))
+                      }
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void runAiHealthCheck()}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                  >
+                    {aiBusyMessage === "Checking AI providers" ? "Checking..." : "Check providers"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void runAiRanking()}
+                    disabled={aiMode === "off" || !parsedScriptState.result || imagePaths.length === 0}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
+                  >
+                    {aiBusyMessage === "Ranking segment assets" ? "Ranking..." : "Analyze with AI"}
+                  </button>
+                </div>
+                <div className="mt-4 space-y-2">
+                  {aiHealth.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      Provider status will appear after running checks.
+                    </p>
+                  ) : (
+                    aiHealth.map((status) => (
+                      <div
+                        key={status.provider}
+                        className="flex items-center justify-between rounded-2xl border border-border/70 px-3 py-2 text-sm"
+                      >
+                        <span>{status.provider}</span>
+                        <span className={status.ok ? "text-emerald-300" : "text-amber-300"}>
+                          {status.message}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                  {aiMode === "hybrid" ? (
+                    <p className="text-xs text-muted-foreground">
+                      Gemini key status: {geminiApiKey ? "configured in environment" : "not set"}.
+                    </p>
+                  ) : null}
+                </div>
+              </div>
               <div className="grid gap-4 md:grid-cols-2">
                 <StatusCard
                   label="Range status"
@@ -633,6 +868,7 @@ const Index = () => {
             >
               <div className="grid gap-4 md:grid-cols-2">
                 <StatCard label="Preview placements" value={(effectivePlan?.placements.length ?? 0).toString()} />
+                <StatCard label="AI-assisted" value={(previewStats.ai ?? 0).toString()} />
                 <StatCard label="Sequential fallback" value={previewStats.sequential.toString()} />
                 <StatCard label="Skipped by range" value={(effectivePlan?.skippedCount ?? 0).toString()} />
                 <StatCard label="Clipped by range" value={(effectivePlan?.clippedCount ?? 0).toString()} />
@@ -655,7 +891,9 @@ const Index = () => {
                     <div className="flex items-center justify-between gap-4">
                       <StatusPill
                         tone={
-                          placement.strategy === "keyword"
+                          placement.strategy === "ai"
+                            ? "info"
+                            : placement.strategy === "keyword"
                             ? "success"
                             : placement.strategy === "sequential"
                               ? "info"
@@ -671,6 +909,53 @@ const Index = () => {
                     <div className="mt-3 flex items-center justify-between gap-4 text-xs text-muted-foreground">
                       <span>{placement.imageName ?? "blank gap"}</span>
                       <span>{placement.durationSec.toFixed(2)}s</span>
+                    </div>
+                    {placement.aiProvider ? (
+                      <p className="mt-2 text-xs text-muted-foreground">
+                        AI {placement.aiProvider} {(placement.aiConfidence * 100).toFixed(0)}%{" "}
+                        {placement.aiRationale ? `- ${placement.aiRationale}` : ""}
+                      </p>
+                    ) : null}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setManualOverridesBySegmentId((previous) => ({
+                            ...previous,
+                            [placement.segmentId]: "auto",
+                          }))
+                        }
+                        className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                      >
+                        Auto
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setManualOverridesBySegmentId((previous) => ({
+                            ...previous,
+                            [placement.segmentId]: "blank",
+                          }))
+                        }
+                        className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                      >
+                        Blank
+                      </button>
+                      {aiRankingsBySegmentId[placement.segmentId]?.rankedAssets?.[0] ? (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setManualOverridesBySegmentId((previous) => ({
+                              ...previous,
+                              [placement.segmentId]:
+                                aiRankingsBySegmentId[placement.segmentId].rankedAssets[0].candidateId,
+                            }))
+                          }
+                          className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                        >
+                          Use AI top
+                        </button>
+                      ) : null}
                     </div>
                   </article>
                 ))}
@@ -690,6 +975,9 @@ const Index = () => {
                   {busyMessage ?? "Place on timeline"}
                 </button>
                 {executeReason ? <InlineMessage tone="warning" message={executeReason} /> : null}
+                {aiErrors.length > 0 ? (
+                  <InlineMessage tone="warning" message={`AI errors: ${aiErrors.slice(0, 2).join(" | ")}`} />
+                ) : null}
               </div>
               {result ? (
                 <div className="rounded-3xl border border-border/70 bg-background/60 p-4 text-sm">
@@ -740,6 +1028,48 @@ function loadStoredSettings(): Partial<StoredSettings> | null {
   } catch {
     return null;
   }
+}
+
+function shortlistCandidates(text: string, imagePaths: string[], limit: number): string[] {
+  const tokens = tokenize(text);
+  if (tokens.length === 0) {
+    return imagePaths.slice(0, limit);
+  }
+
+  const scored = imagePaths
+    .map((path) => {
+      const normalizedName = getFileName(path).toLowerCase();
+      let score = 0;
+      tokens.forEach((token) => {
+        if (normalizedName.includes(token)) {
+          score += 1;
+        }
+      });
+      return { path, score };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  const prioritized = scored.filter((entry) => entry.score > 0).map((entry) => entry.path);
+  const fallback = scored.filter((entry) => entry.score === 0).map((entry) => entry.path);
+  return [...prioritized, ...fallback].slice(0, limit);
+}
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 2);
+}
+
+function getFileName(filePath: string): string {
+  const normalized = normalizePath(filePath);
+  const parts = normalized.split("/");
+  return parts[parts.length - 1] ?? filePath;
+}
+
+function normalizePath(filePath: string): string {
+  return filePath.replace(/\\/g, "/");
 }
 
 function applyWorkingRange(

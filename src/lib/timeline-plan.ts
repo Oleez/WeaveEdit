@@ -1,9 +1,13 @@
 import { ScriptSegment } from "./script-parser";
+import { AiSegmentRanking } from "./ai/types";
 
 export interface TimelinePlannerSettings {
   minDurationSec: number;
   maxDurationSec: number;
   blankWhenNoImage: boolean;
+  aiRankingsBySegmentId?: Record<string, AiSegmentRanking>;
+  manualOverridesBySegmentId?: Record<string, string | "blank" | "auto">;
+  aiConfidenceThreshold?: number;
 }
 
 export interface TimelinePlacement {
@@ -12,15 +16,19 @@ export interface TimelinePlacement {
   startSec: number;
   endSec: number;
   durationSec: number;
-  strategy: "keyword" | "sequential" | "blank";
+  strategy: "ai" | "keyword" | "sequential" | "blank";
   imagePath: string | null;
   imageName: string | null;
   text: string;
   keywordScore: number;
+  aiConfidence: number;
+  aiRationale: string | null;
+  aiProvider: string | null;
 }
 
 export interface TimelinePlan {
   placements: TimelinePlacement[];
+  matchedByAi: number;
   matchedByKeyword: number;
   matchedSequentially: number;
   blanks: number;
@@ -81,11 +89,17 @@ export function buildTimelinePlan(
     }));
 
   const usedImageIndexes = new Set<number>();
+  const imageIndexByPath = new Map<string, number>();
+  images.forEach((image, index) => {
+    imageIndexByPath.set(normalizePath(image.path), index);
+  });
   const placements: TimelinePlacement[] = [];
+  let matchedByAi = 0;
   let sequentialCursor = 0;
   let matchedByKeyword = 0;
   let matchedSequentially = 0;
   let blanks = 0;
+  const aiConfidenceThreshold = settings.aiConfidenceThreshold ?? 0.42;
 
   segments.forEach((segment, index) => {
     const nextSegment = segments[index + 1];
@@ -102,14 +116,72 @@ export function buildTimelinePlan(
         : Number.POSITIVE_INFINITY;
 
     const durationSec = clampDuration(rawWindow, maxAvailableWindow, settings);
+    const override = settings.manualOverridesBySegmentId?.[segment.id] ?? "auto";
+    const aiRanking = settings.aiRankingsBySegmentId?.[segment.id];
+    const aiMatch = findAiMatch(
+      aiRanking,
+      images,
+      imageIndexByPath,
+      usedImageIndexes,
+      aiConfidenceThreshold,
+      override,
+    );
     const keywordMatch = findKeywordMatch(segment.text, images, usedImageIndexes);
 
     let strategy: TimelinePlacement["strategy"] = "blank";
     let imagePath: string | null = null;
     let imageName: string | null = null;
     let keywordScore = 0;
+    let aiConfidence = 0;
+    let aiRationale: string | null = null;
+    let aiProvider: string | null = null;
 
-    if (keywordMatch) {
+    if (override === "blank") {
+      blanks += 1;
+      placements.push({
+        id: `placement-${index + 1}`,
+        segmentId: segment.id,
+        startSec: segment.startSec,
+        endSec: segment.startSec + durationSec,
+        durationSec,
+        strategy,
+        imagePath,
+        imageName,
+        text: segment.text,
+        keywordScore,
+        aiConfidence,
+        aiRationale: "Manually overridden to blank.",
+        aiProvider,
+      });
+      return;
+    }
+
+    if (override !== "auto" && override) {
+      const overrideIndex = imageIndexByPath.get(normalizePath(override));
+      if (overrideIndex !== undefined && !usedImageIndexes.has(overrideIndex)) {
+        usedImageIndexes.add(overrideIndex);
+        sequentialCursor = Math.max(sequentialCursor, overrideIndex + 1);
+        strategy = "ai";
+        imagePath = images[overrideIndex].path;
+        imageName = images[overrideIndex].name;
+        aiConfidence = 1;
+        aiRationale = "Manually overridden in review.";
+        aiProvider = "manual";
+        matchedByAi += 1;
+      }
+    }
+
+    if (!imagePath && aiMatch) {
+      usedImageIndexes.add(aiMatch.index);
+      sequentialCursor = Math.max(sequentialCursor, aiMatch.index + 1);
+      strategy = "ai";
+      imagePath = aiMatch.image.path;
+      imageName = aiMatch.image.name;
+      aiConfidence = aiMatch.confidence;
+      aiRationale = aiMatch.rationale;
+      aiProvider = aiMatch.provider;
+      matchedByAi += 1;
+    } else if (!imagePath && keywordMatch) {
       usedImageIndexes.add(keywordMatch.index);
       sequentialCursor = Math.max(sequentialCursor, keywordMatch.index + 1);
       strategy = "keyword";
@@ -117,7 +189,7 @@ export function buildTimelinePlan(
       imageName = keywordMatch.image.name;
       keywordScore = keywordMatch.score;
       matchedByKeyword += 1;
-    } else {
+    } else if (!imagePath) {
       sequentialCursor = advanceToUnusedIndex(sequentialCursor, images.length, usedImageIndexes);
 
       if (sequentialCursor < images.length) {
@@ -143,15 +215,54 @@ export function buildTimelinePlan(
       imageName,
       text: segment.text,
       keywordScore,
+      aiConfidence,
+      aiRationale,
+      aiProvider,
     });
   });
 
   return {
     placements,
+    matchedByAi,
     matchedByKeyword,
     matchedSequentially,
     blanks,
   };
+}
+
+function findAiMatch(
+  aiRanking: AiSegmentRanking | undefined,
+  images: ImageCandidate[],
+  imageIndexByPath: Map<string, number>,
+  usedImageIndexes: Set<number>,
+  confidenceThreshold: number,
+  override: string | "blank" | "auto",
+): { image: ImageCandidate; index: number; confidence: number; rationale: string; provider: string } | null {
+  if (!aiRanking || override === "blank") {
+    return null;
+  }
+
+  if (aiRanking.confidence < confidenceThreshold) {
+    return null;
+  }
+
+  for (const ranked of aiRanking.rankedAssets) {
+    const index = imageIndexByPath.get(normalizePath(ranked.candidateId));
+    if (index === undefined || usedImageIndexes.has(index)) {
+      continue;
+    }
+
+    const image = images[index];
+    return {
+      image,
+      index,
+      confidence: ranked.score || aiRanking.confidence,
+      rationale: ranked.rationale || aiRanking.rationale,
+      provider: aiRanking.provider,
+    };
+  }
+
+  return null;
 }
 
 function findKeywordMatch(
@@ -245,4 +356,8 @@ function getFileName(filePath: string): string {
   const normalized = filePath.replace(/\\/g, "/");
   const parts = normalized.split("/");
   return parts[parts.length - 1] ?? filePath;
+}
+
+function normalizePath(filePath: string): string {
+  return filePath.replace(/\\/g, "/");
 }

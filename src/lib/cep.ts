@@ -73,6 +73,9 @@ interface NodeModules {
     extname: (path: string) => string;
     basename: (path: string) => string;
   };
+  process: {
+    env: Record<string, string | undefined>;
+  };
 }
 
 const IMAGE_EXTENSIONS = new Set([
@@ -139,6 +142,16 @@ export function listImageFiles(folderPath: string): string[] {
   return collected.sort((left, right) => left.localeCompare(right));
 }
 
+export function getEnvironmentVariable(name: string): string | undefined {
+  if (!isNodeEnabled()) {
+    return undefined;
+  }
+
+  const nodeRequire = window.require as NodeRequire;
+  const processModule = nodeRequire("process") as NodeModules["process"];
+  return processModule.env?.[name];
+}
+
 export async function getPremiereStatus(): Promise<PremiereStatus> {
   if (!isCepEnvironment()) {
     return {
@@ -185,6 +198,7 @@ function getNodeModules(): NodeModules {
     fs: nodeRequire("fs") as NodeModules["fs"],
     os: nodeRequire("os") as NodeModules["os"],
     path: nodeRequire("path") as NodeModules["path"],
+    process: nodeRequire("process") as NodeModules["process"],
   };
 }
 
