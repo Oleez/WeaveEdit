@@ -24,8 +24,13 @@ import {
   AiSegmentRanking,
   AiSegmentRequest,
 } from "@/lib/ai/types";
-import { formatSeconds, parseTimestampScript } from "@/lib/script-parser";
-import { TimelinePlacement, buildTimelinePlan } from "@/lib/timeline-plan";
+import { ScriptSegment, formatSeconds, parseTimestampScript } from "@/lib/script-parser";
+import {
+  TimelineCoverageSummary,
+  TimelinePlacement,
+  buildTimelinePlan,
+  resolveTimelineCoverage,
+} from "@/lib/timeline-plan";
 import { MediaLibraryItem, MediaLibraryMode, getFileName, normalizePath } from "@/lib/media";
 
 const STORAGE_KEY = "weave-edit-settings";
@@ -58,6 +63,7 @@ interface WorkingPlan {
   clippedCount: number;
   rangeStartSec: number;
   rangeEndSec: number;
+  coverage: TimelineCoverageSummary;
 }
 
 const defaultSettings: StoredSettings = {
@@ -111,6 +117,7 @@ const Index = () => {
   const [aiBusyMessage, setAiBusyMessage] = useState<string | null>(null);
   const [aiHealth, setAiHealth] = useState<AiHealthStatus[]>([]);
   const [aiErrors, setAiErrors] = useState<string[]>([]);
+  const [aiCacheHits, setAiCacheHits] = useState(0);
   const [aiRankingsBySegmentId, setAiRankingsBySegmentId] = useState<
     Record<string, AiSegmentRanking>
   >({});
@@ -273,10 +280,15 @@ const Index = () => {
       aiConfidenceThreshold,
       allowLowConfidenceFallback: true,
       maxOverlapLayers: 2,
+      frameRate: hostStatus?.frameRate ?? 30,
+      sequenceEndSec: hostStatus?.range.sequenceEndSec,
+      targetSecondsPerClip: Math.max(minDurationSec, Math.min(maxDurationSec, 6)),
     });
   }, [
     aiConfidenceThreshold,
     aiRankingsBySegmentId,
+    hostStatus?.frameRate,
+    hostStatus?.range.sequenceEndSec,
     mediaItems,
     manualOverridesBySegmentId,
     maxDurationSec,
@@ -297,19 +309,32 @@ const Index = () => {
         clippedCount: 0,
         rangeStartSec: 0,
         rangeEndSec: 0,
+        coverage: basePlan.coverage,
       };
     }
 
     const range = hostStatus?.range;
     if (range?.hasMeaningfulInOut) {
       const clipped = applyWorkingRange(basePlan.placements, range.inSec, range.outSec);
-      return {
-        mode: "sequence_in_out",
-        placements: clipped.placements,
-        skippedCount: clipped.skippedCount,
-        clippedCount: clipped.clippedCount,
+      const resolved = resolveTimelineCoverage(clipped.placements, {
+        minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
+        maxDurationSec: Math.max(minDurationSec, maxDurationSec),
+        frameRate: hostStatus?.frameRate ?? 30,
         rangeStartSec: range.inSec,
         rangeEndSec: range.outSec,
+        targetSecondsPerClip: Math.max(minDurationSec, Math.min(maxDurationSec, 6)),
+      });
+      return {
+        mode: "sequence_in_out",
+        placements: resolved.placements,
+        skippedCount: clipped.skippedCount,
+        clippedCount: clipped.clippedCount + resolved.summary.adjustedPlacementCount,
+        rangeStartSec: range.inSec,
+        rangeEndSec: range.outSec,
+        coverage: {
+          ...resolved.summary,
+          reusedAssetPlacements: basePlan.coverage.reusedAssetPlacements,
+        },
       };
     }
 
@@ -321,6 +346,7 @@ const Index = () => {
         clippedCount: 0,
         rangeStartSec: 0,
         rangeEndSec: hostStatus?.range.sequenceEndSec ?? 0,
+        coverage: basePlan.coverage,
       };
     }
 
@@ -331,8 +357,9 @@ const Index = () => {
       clippedCount: 0,
       rangeStartSec: 0,
       rangeEndSec: hostStatus?.range.sequenceEndSec ?? 0,
+      coverage: basePlan.coverage,
     };
-  }, [appendAtTrackEnd, basePlan, hostStatus, useWholeSequenceFallback]);
+  }, [appendAtTrackEnd, basePlan, hostStatus, maxDurationSec, minDurationSec, useWholeSequenceFallback]);
 
   const previewStats = useMemo(() => {
     const placements = effectivePlan?.placements ?? [];
@@ -406,8 +433,9 @@ const Index = () => {
       ffmpegAvailable: videoTooling.ffmpegAvailable,
       ffprobeAvailable: videoTooling.ffprobeAvailable,
       customInstructions,
+      fullScriptContext: parsedScriptState.result ? buildFullScriptContext(parsedScriptState.result.segments) : undefined,
     }),
-    [customInstructions, geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel, videoTooling],
+    [customInstructions, geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel, parsedScriptState.result, videoTooling],
   );
 
   async function runAiHealthCheck() {
@@ -434,11 +462,14 @@ const Index = () => {
 
     setAiBusyMessage("Ranking segment assets");
     setAiErrors([]);
+    setAiCacheHits(0);
 
     try {
       const preprocessingWarnings: string[] = [];
       const segments = parsedScriptState.result.segments;
+      const fullScriptContext = buildFullScriptContext(segments);
       const segmentRequests: AiSegmentRequest[] = [];
+      let cacheHits = 0;
 
       // Sequential prep avoids dozens of parallel ffmpeg/ffprobe calls freezing the panel.
       for (let i = 0; i < segments.length; i += 1) {
@@ -453,6 +484,7 @@ const Index = () => {
             mediaType: item.type,
           })),
         );
+        cacheHits += hydrated.cacheHits;
         preprocessingWarnings.push(...hydrated.warnings);
 
         segmentRequests.push({
@@ -460,6 +492,11 @@ const Index = () => {
           text: segment.text,
           startSec: segment.startSec,
           endSec: segment.endSec,
+          segmentIndex: i,
+          segmentTotal: segments.length,
+          previousText: segments[i - 1]?.text,
+          nextText: segments[i + 1]?.text,
+          fullScriptContext,
           wordCount: segment.wordCount,
           sentenceCount: segment.sentenceCount,
           sentenceComplete: segment.sentenceComplete,
@@ -478,6 +515,7 @@ const Index = () => {
         setAiBusyMessage(`AI ranking segment ${done}/${total}`);
       });
       setAiRankingsBySegmentId(ranked.rankingsBySegmentId);
+      setAiCacheHits(cacheHits);
       const fallbackWarnings = segmentRequests.flatMap((request) =>
         request.candidates
           .filter((candidate) => candidate.mediaType === "video" && !candidate.visualPaths?.length)
@@ -567,9 +605,9 @@ const Index = () => {
     const payload: ExecuteTimelineJobInput = {
       targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
       appendAtTrackEnd,
-      useSequenceInOut: effectivePlan.mode === "sequence_in_out",
-      rangeStartSec: effectivePlan.mode === "sequence_in_out" ? effectivePlan.rangeStartSec : null,
-      rangeEndSec: effectivePlan.mode === "sequence_in_out" ? effectivePlan.rangeEndSec : null,
+      useSequenceInOut: false,
+      rangeStartSec: null,
+      rangeEndSec: null,
       placements: effectivePlan.placements.map((placement) => ({
         id: placement.id,
         groupId: placement.groupId,
@@ -1078,12 +1116,18 @@ const Index = () => {
                 <StatCard label="Overlap layers" value={previewStats.overlap.toString()} />
                 <StatCard label="Skipped by range" value={(effectivePlan?.skippedCount ?? 0).toString()} />
                 <StatCard label="Clipped by range" value={(effectivePlan?.clippedCount ?? 0).toString()} />
+                <StatCard label="Covered duration" value={formatSeconds(effectivePlan?.coverage.coveredSec ?? 0)} />
+                <StatCard label="Remaining gap" value={`${(effectivePlan?.coverage.gapSec ?? 0).toFixed(2)}s`} />
+                <StatCard label="Filled gaps" value={(effectivePlan?.coverage.filledGapCount ?? 0).toString()} />
+                <StatCard label="Removed slivers" value={(effectivePlan?.coverage.discardedSliverCount ?? 0).toString()} />
+                <StatCard label="Reused media" value={(effectivePlan?.coverage.reusedAssetPlacements ?? 0).toString()} />
+                <StatCard label="Cached reviews" value={aiCacheHits.toString()} />
               </div>
               <div className="rounded-3xl border border-border/70 bg-background/60 p-4 text-sm text-muted-foreground">
                 {effectivePlan?.mode === "append"
                   ? "Placements will be appended after the current end of the target track."
                   : effectivePlan?.mode === "sequence_in_out"
-                    ? `Only placements inside ${formatSeconds(effectivePlan.rangeStartSec)} - ${formatSeconds(effectivePlan.rangeEndSec)} will be sent; clear or widen In/Out to fill the whole script.`
+                    ? `Resolved no-gap coverage inside ${formatSeconds(effectivePlan.rangeStartSec)} - ${formatSeconds(effectivePlan.rangeEndSec)}. Premiere receives final times, so it will not trim these clips again.`
                     : effectivePlan?.mode === "whole_sequence"
                       ? "Whole-sequence fallback is active because sequence In/Out is not being used."
                       : "Set sequence In/Out or enable whole-sequence fallback to make the preview executable."}
@@ -1300,6 +1344,25 @@ function formatMarkerTranscript(segments: PremiereTranscriptSegment[]): string {
     .join("\n\n");
 }
 
+function buildFullScriptContext(segments: ScriptSegment[]): string {
+  const totalDuration =
+    segments.length > 0
+      ? (segments[segments.length - 1].endSec ?? segments[segments.length - 1].startSec) - segments[0].startSec
+      : 0;
+  const scriptPreview = segments
+    .map((segment, index) => `${index + 1}. ${segment.text}`)
+    .join(" ")
+    .slice(0, 1800);
+
+  return [
+    `Segments: ${segments.length}.`,
+    totalDuration > 0 ? `Transcript span: ${totalDuration.toFixed(2)} seconds.` : "",
+    `Story preview: ${scriptPreview}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
@@ -1380,7 +1443,7 @@ function applyWorkingRange(
       ...placement,
       startSec: nextStart,
       endSec: nextEnd,
-      durationSec: Math.max(0.3, Math.round((nextEnd - nextStart) * 100) / 100),
+      durationSec: Math.max(0, Math.round((nextEnd - nextStart) * 100) / 100),
     });
   });
 

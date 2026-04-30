@@ -175,20 +175,18 @@ function aggregateRankings(request: AiSegmentRequest, rankings: AiSegmentRanking
     rationale: `Timeline agent combined ${providerNames.join(", ")} reviewers for asset fit and coverage.`,
     rankedAssets,
     fallbackUsed: rankings.every((ranking) => ranking.fallbackUsed),
-    suggestedDurationSec: averageNumeric(rankings.map((ranking) => ranking.suggestedDurationSec)) ?? estimateDuration(request),
+    suggestedDurationSec: estimateDuration(request),
     suggestedLayerCount: clampLayerCount(
       averageNumeric(rankings.map((ranking) => ranking.suggestedLayerCount)) ?? 1,
       request,
     ),
-    suggestedClipCount: clampClipCount(
-      Math.max(...rankings.map((ranking) => ranking.suggestedClipCount ?? estimateClipCount(request))),
-    ),
+    suggestedClipCount: estimateClipCount(request),
     overlapStyle: chooseOverlapStyle(rankings),
     timingRationale: rankings
       .map((ranking) => ranking.timingRationale)
       .filter(Boolean)
       .slice(0, 2)
-      .join(" | ") || "Timing aggregated from agent reviewers.",
+      .join(" | ") || "Timing uses deterministic transcript coverage; AI timing stays advisory.",
     coverageNotes: rankings
       .map((ranking) => ranking.coverageNotes)
       .filter(Boolean)

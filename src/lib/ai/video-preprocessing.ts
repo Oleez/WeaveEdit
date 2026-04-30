@@ -34,7 +34,15 @@ export interface HydrateCandidatesResult {
   candidates: AiAssetCandidate[];
   warnings: string[];
   tooling: VideoToolingStatus;
+  cacheHits: number;
 }
+
+interface CachedHydration {
+  candidate: AiAssetCandidate;
+  warnings: string[];
+}
+
+const hydrationCache = new Map<string, CachedHydration>();
 
 export function detectVideoTooling(): VideoToolingStatus {
   if (!isNodeEnabled()) {
@@ -63,27 +71,56 @@ export async function hydrateAiCandidates(
       })),
       warnings,
       tooling,
+      cacheHits: 0,
     };
   }
 
   const enriched: AiAssetCandidate[] = [];
+  let cacheHits = 0;
 
   for (const candidate of candidates) {
-    if (candidate.mediaType === "image") {
+    const cacheKey = buildHydrationCacheKey(candidate, tooling);
+    const cached = hydrationCache.get(cacheKey);
+    if (cached) {
+      cacheHits += 1;
       enriched.push({
-        ...candidate,
-        descriptor: candidate.descriptor ?? buildFilenameDescriptor(candidate),
-        visualPaths: [candidate.path],
+        ...cached.candidate,
+        id: candidate.id,
+        path: candidate.path,
+        name: candidate.name,
+        mediaType: candidate.mediaType,
       });
       continue;
     }
 
+    if (candidate.mediaType === "image") {
+      const hydratedCandidate = {
+        ...candidate,
+        descriptor: candidate.descriptor ?? buildFilenameDescriptor(candidate),
+        visualPaths: [candidate.path],
+      };
+      hydrationCache.set(cacheKey, { candidate: hydratedCandidate, warnings: [] });
+      enriched.push(hydratedCandidate);
+      continue;
+    }
+
     const videoResult = hydrateVideoCandidate(candidate, tooling);
+    hydrationCache.set(cacheKey, videoResult);
     enriched.push(videoResult.candidate);
     warnings.push(...videoResult.warnings);
   }
 
-  return { candidates: enriched, warnings, tooling };
+  return { candidates: enriched, warnings, tooling, cacheHits };
+}
+
+function buildHydrationCacheKey(candidate: AiAssetCandidate, tooling: VideoToolingStatus): string {
+  return [
+    normalizePath(candidate.path),
+    candidate.mediaType,
+    tooling.ffprobeAvailable ? "ffprobe" : "no-ffprobe",
+    tooling.ffmpegAvailable ? "ffmpeg" : "no-ffmpeg",
+    "samples-v1",
+  ].join("|");
 }
 
 function hydrateVideoCandidate(

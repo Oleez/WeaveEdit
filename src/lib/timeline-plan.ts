@@ -11,6 +11,11 @@ export interface TimelinePlannerSettings {
   aiConfidenceThreshold?: number;
   allowLowConfidenceFallback?: boolean;
   maxOverlapLayers?: number;
+  frameRate?: number;
+  sequenceEndSec?: number;
+  rangeStartSec?: number | null;
+  rangeEndSec?: number | null;
+  targetSecondsPerClip?: number;
 }
 
 export interface TimelinePlacement {
@@ -44,6 +49,16 @@ export interface TimelinePlan {
   matchedByFallback: number;
   overlapPlacements: number;
   blanks: number;
+  coverage: TimelineCoverageSummary;
+}
+
+export interface TimelineCoverageSummary {
+  coveredSec: number;
+  gapSec: number;
+  filledGapCount: number;
+  discardedSliverCount: number;
+  reusedAssetPlacements: number;
+  adjustedPlacementCount: number;
 }
 
 const STOP_WORDS = new Set([
@@ -96,6 +111,12 @@ interface DurationDecision {
   rationale: string;
 }
 
+interface SegmentWindow {
+  durationSec: number;
+  maxAvailableWindow: number;
+  source: "segment" | "sequence" | "heuristic";
+}
+
 interface ClipWindow {
   index: number;
   count: number;
@@ -137,30 +158,21 @@ export function buildTimelinePlan(
   let matchedByFallback = 0;
   let overlapPlacements = 0;
   let blanks = 0;
+  let reusedAssetPlacements = 0;
   const aiConfidenceThreshold = settings.aiConfidenceThreshold ?? 0.42;
   const allowLowConfidenceFallback = settings.allowLowConfidenceFallback ?? true;
   const maxOverlapLayers = Math.max(1, settings.maxOverlapLayers ?? 2);
 
   segments.forEach((segment, index) => {
     const nextSegment = segments[index + 1];
-    const rawWindow =
-      segment.endSec && segment.endSec > segment.startSec
-        ? segment.endSec - segment.startSec
-        : nextSegment && nextSegment.startSec > segment.startSec
-          ? nextSegment.startSec - segment.startSec
-          : estimateDurationFromText(segment.text);
-
-    const maxAvailableWindow =
-      nextSegment && nextSegment.startSec > segment.startSec
-        ? nextSegment.startSec - segment.startSec
-        : Number.POSITIVE_INFINITY;
+    const segmentWindow = resolveSegmentWindow(segment, nextSegment, settings);
 
     const aiRanking = settings.aiRankingsBySegmentId?.[segment.id];
-    const durationDecision = resolveDuration(segment, rawWindow, maxAvailableWindow, settings, aiRanking);
+    const durationDecision = resolveDuration(segment, segmentWindow, settings, aiRanking);
     const override = settings.manualOverridesBySegmentId?.[segment.id] ?? "auto";
     const overlapStyle: TimelinePlacement["overlapStyle"] = aiRanking?.overlapStyle ?? "single";
     const groupId = `segment-group-${index + 1}`;
-    const clipWindows = createClipWindows(segment, durationDecision.durationSec, aiRanking);
+    const clipWindows = createClipWindows(segment, durationDecision.durationSec, settings, aiRanking);
     const pathsUsedInSegment = new Set<string>();
 
     if (override === "blank") {
@@ -275,6 +287,10 @@ export function buildTimelinePlan(
       }
 
       if (selectedIndex !== null) {
+        const previousUsage = assetUsageByIndex.get(selectedIndex);
+        if (previousUsage) {
+          reusedAssetPlacements += 1;
+        }
         recordAssetUsage(assetUsageByIndex, selectedIndex, index, clipWindow.startSec + clipWindow.durationSec);
         pathsUsedInSegment.add(normalizePath(assets[selectedIndex].path));
       }
@@ -347,12 +363,18 @@ export function buildTimelinePlan(
     });
   });
 
+  const resolved = resolveNoGapCoverage(placements, settings);
+
   return {
-    placements,
+    placements: resolved.placements,
     matchedByAi,
     matchedByFallback,
     overlapPlacements,
     blanks,
+    coverage: {
+      ...resolved.summary,
+      reusedAssetPlacements,
+    },
   };
 }
 
@@ -488,40 +510,79 @@ function estimateDurationFromText(text: string): number {
   return Math.max(2, Math.min(8, wordCount / 2.2));
 }
 
+function resolveSegmentWindow(
+  segment: ScriptSegment,
+  nextSegment: ScriptSegment | undefined,
+  settings: TimelinePlannerSettings,
+): SegmentWindow {
+  if (segment.endSec && segment.endSec > segment.startSec) {
+    return {
+      durationSec: segment.endSec - segment.startSec,
+      maxAvailableWindow: segment.endSec - segment.startSec,
+      source: "segment",
+    };
+  }
+
+  if (nextSegment && nextSegment.startSec > segment.startSec) {
+    return {
+      durationSec: nextSegment.startSec - segment.startSec,
+      maxAvailableWindow: nextSegment.startSec - segment.startSec,
+      source: "segment",
+    };
+  }
+
+  const explicitEnd = firstFinitePositive(settings.rangeEndSec, settings.sequenceEndSec);
+  if (explicitEnd && explicitEnd > segment.startSec) {
+    return {
+      durationSec: explicitEnd - segment.startSec,
+      maxAvailableWindow: explicitEnd - segment.startSec,
+      source: "sequence",
+    };
+  }
+
+  const estimatedDuration = estimateDurationFromText(segment.text);
+  return {
+    durationSec: estimatedDuration,
+    maxAvailableWindow: estimatedDuration,
+    source: "heuristic",
+  };
+}
+
 function resolveDuration(
   segment: ScriptSegment,
-  rawWindow: number,
-  maxWindow: number,
+  segmentWindow: SegmentWindow,
   settings: TimelinePlannerSettings,
   aiRanking?: AiSegmentRanking,
-): {
-  durationSec: number;
-  source: TimelinePlacement["timingSource"];
-  rationale: string;
-} {
+): DurationDecision {
   const hasAiSuggestion = Boolean(aiRanking?.suggestedDurationSec && aiRanking.suggestedDurationSec > 0);
-  const baseDuration = hasAiSuggestion
-    ? aiRanking?.suggestedDurationSec ?? rawWindow
-    : segment.endSec && segment.endSec > segment.startSec
-      ? rawWindow
+  const hasTranscriptWindow = segmentWindow.source !== "heuristic";
+  const baseDuration = hasTranscriptWindow
+    ? segmentWindow.durationSec
+    : hasAiSuggestion
+      ? aiRanking?.suggestedDurationSec ?? segmentWindow.durationSec
       : deriveSentenceAwareDuration(segment);
 
   return {
-    durationSec: clampDuration(baseDuration, maxWindow, settings),
-    source: hasAiSuggestion ? "ai" : segment.endSec ? "segment" : "heuristic",
-    rationale: hasAiSuggestion
-      ? aiRanking?.timingRationale ?? "Timing proposed by AI transcript analysis."
-      : segment.endSec
-        ? "Used transcript timing from the segment window."
+    durationSec: clampCoverageDuration(baseDuration, segmentWindow.maxAvailableWindow, settings, hasTranscriptWindow),
+    source: hasTranscriptWindow ? "segment" : hasAiSuggestion ? "ai" : "heuristic",
+    rationale: hasTranscriptWindow
+      ? `Filled the ${segmentWindow.source === "sequence" ? "sequence/range" : "transcript"} timing window; AI timing is used only as pacing guidance.`
+      : hasAiSuggestion
+        ? aiRanking?.timingRationale ?? "Timing proposed by AI transcript analysis."
         : "Derived timing from sentence cadence and completion.",
   };
 }
 
-function clampDuration(
+function clampCoverageDuration(
   requestedDuration: number,
   maxWindow: number,
   settings: TimelinePlannerSettings,
+  fillWindow: boolean,
 ): number {
+  if (fillWindow && Number.isFinite(maxWindow)) {
+    return roundDuration(Math.max(0.3, maxWindow));
+  }
+
   const bounded = Math.min(
     Math.max(requestedDuration, settings.minDurationSec),
     settings.maxDurationSec,
@@ -532,6 +593,16 @@ function clampDuration(
   }
 
   return roundDuration(Math.max(0.3, Math.min(bounded, maxWindow)));
+}
+
+function firstFinitePositive(...values: Array<number | null | undefined>): number | null {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+
+  return null;
 }
 
 function roundDuration(value: number): number {
@@ -554,9 +625,10 @@ function deriveSentenceAwareDuration(segment: ScriptSegment): number {
 function createClipWindows(
   segment: ScriptSegment,
   durationSec: number,
+  settings: TimelinePlannerSettings,
   aiRanking?: AiSegmentRanking,
 ): ClipWindow[] {
-  const clipCount = resolveClipCount(segment, durationSec, aiRanking);
+  const clipCount = resolveClipCount(segment, durationSec, settings, aiRanking);
   if (clipCount <= 1) {
     return [
       {
@@ -591,27 +663,45 @@ function createClipWindows(
 function resolveClipCount(
   segment: ScriptSegment,
   durationSec: number,
+  settings: TimelinePlannerSettings,
   aiRanking?: AiSegmentRanking,
 ): number {
+  const minReadableClipSec = resolveMinReadableClipSec(settings);
+  const targetSecondsPerClip = resolveTargetSecondsPerClip(settings);
+  const maxByReadableLength = Math.max(1, Math.floor(durationSec / minReadableClipSec));
+  const deterministicCount = Math.max(
+    Math.ceil(durationSec / targetSecondsPerClip),
+    Math.ceil((segment.wordCount || 0) / 24),
+    Math.max(1, Math.min(segment.sentenceCount || 1, Math.ceil(durationSec / minReadableClipSec))),
+  );
   const aiClipCount = aiRanking?.suggestedClipCount;
   if (aiClipCount && aiClipCount > 0) {
-    return clampClipCount(Math.round(aiClipCount));
+    const boundedAiCount = Math.max(deterministicCount - 1, Math.min(deterministicCount + 1, Math.round(aiClipCount)));
+    return clampClipCount(boundedAiCount, maxByReadableLength);
   }
 
-  const durationDrivenCount = Math.ceil(durationSec / 5.5);
-  const wordDrivenCount = Math.ceil((segment.wordCount || 0) / 18);
-  const sentenceDrivenCount = Math.max(1, segment.sentenceCount || 1);
-  const incompleteBoost = !segment.sentenceComplete && (segment.wordCount || 0) > 16 ? 1 : 0;
-
-  return clampClipCount(Math.max(durationDrivenCount, wordDrivenCount, sentenceDrivenCount + incompleteBoost));
+  return clampClipCount(deterministicCount, maxByReadableLength);
 }
 
-function clampClipCount(value: number): number {
+function resolveTargetSecondsPerClip(settings: TimelinePlannerSettings): number {
+  const configured = settings.targetSecondsPerClip ?? settings.maxDurationSec;
+  if (!Number.isFinite(configured)) {
+    return 6;
+  }
+
+  return Math.max(resolveMinReadableClipSec(settings), Math.min(12, configured));
+}
+
+function resolveMinReadableClipSec(settings: TimelinePlannerSettings): number {
+  return Math.max(1.25, Math.min(4, settings.minDurationSec));
+}
+
+function clampClipCount(value: number, maxByReadableLength = 64): number {
   if (!Number.isFinite(value)) {
     return 1;
   }
 
-  return Math.max(1, Math.min(4, value));
+  return Math.max(1, Math.min(Math.max(1, maxByReadableLength), Math.round(value)));
 }
 
 function splitTextForClips(text: string, clipCount: number): string[] {
@@ -676,6 +766,159 @@ function recordAssetUsage(
     lastSegmentIndex: segmentIndex,
     lastEndSec: endSec,
   });
+}
+
+export function resolveTimelineCoverage(
+  placements: TimelinePlacement[],
+  settings: Pick<
+    TimelinePlannerSettings,
+    "frameRate" | "minDurationSec" | "maxDurationSec" | "rangeStartSec" | "rangeEndSec" | "targetSecondsPerClip"
+  >,
+): { placements: TimelinePlacement[]; summary: Omit<TimelineCoverageSummary, "reusedAssetPlacements"> } {
+  const frameRate = Math.max(1, settings.frameRate ?? 30);
+  const minReadableClipSec = resolveMinReadableClipSec({
+    minDurationSec: settings.minDurationSec,
+    maxDurationSec: settings.maxDurationSec,
+    blankWhenNoImage: true,
+  });
+  const primaryPlacements = placements
+    .filter((placement) => placement.trackOffset === 0)
+    .sort((left, right) => left.startSec - right.startSec || left.id.localeCompare(right.id));
+  const overlayPlacements = placements.filter((placement) => placement.trackOffset !== 0);
+
+  if (primaryPlacements.length === 0) {
+    return {
+      placements: quantizePlacements(placements, frameRate),
+      summary: {
+        coveredSec: 0,
+        gapSec: 0,
+        filledGapCount: 0,
+        discardedSliverCount: 0,
+        adjustedPlacementCount: 0,
+      },
+    };
+  }
+
+  const targetStartSec = quantizeToFrame(
+    typeof settings.rangeStartSec === "number" && Number.isFinite(settings.rangeStartSec)
+      ? settings.rangeStartSec
+      : primaryPlacements[0].startSec,
+    frameRate,
+  );
+  const targetEndSec = quantizeToFrame(
+    typeof settings.rangeEndSec === "number" && Number.isFinite(settings.rangeEndSec) && settings.rangeEndSec > targetStartSec
+      ? settings.rangeEndSec
+      : primaryPlacements[primaryPlacements.length - 1].endSec,
+    frameRate,
+  );
+  const targetSpanSec = Math.max(0, targetEndSec - targetStartSec);
+  const maxReadablePlacements = Math.max(1, Math.floor(targetSpanSec / minReadableClipSec));
+  const discardIds = new Set<string>();
+  let discardedSliverCount = 0;
+
+  primaryPlacements
+    .map((placement) => ({
+      id: placement.id,
+      durationSec: Math.max(0, placement.endSec - placement.startSec),
+    }))
+    .sort((left, right) => left.durationSec - right.durationSec)
+    .forEach((entry) => {
+      const remaining = primaryPlacements.length - discardIds.size;
+      if (remaining <= maxReadablePlacements && entry.durationSec >= minReadableClipSec) {
+        return;
+      }
+
+      if (remaining > 1 && (entry.durationSec < minReadableClipSec || remaining > maxReadablePlacements)) {
+        discardIds.add(entry.id);
+        discardedSliverCount += 1;
+      }
+    });
+
+  const keptPrimary = primaryPlacements.filter((placement) => !discardIds.has(placement.id));
+  const totalWeight = keptPrimary.reduce(
+    (sum, placement) => sum + Math.max(minReadableClipSec, placement.endSec - placement.startSec),
+    0,
+  );
+  const resolvedPrimary: TimelinePlacement[] = [];
+  let cursor = targetStartSec;
+  let filledGapCount = 0;
+  let adjustedPlacementCount = 0;
+
+  keptPrimary.forEach((placement, index) => {
+    const isLast = index === keptPrimary.length - 1;
+    const remainingSlots = keptPrimary.length - index;
+    const originalDuration = Math.max(minReadableClipSec, placement.endSec - placement.startSec);
+    const proportionalDuration = totalWeight > 0 ? (targetSpanSec * originalDuration) / totalWeight : targetSpanSec;
+    const maxEndForReadableTail = targetEndSec - Math.max(0, remainingSlots - 1) * minReadableClipSec;
+    const desiredEnd = isLast
+      ? targetEndSec
+      : Math.min(maxEndForReadableTail, cursor + Math.max(minReadableClipSec, proportionalDuration));
+    const nextEnd = quantizeToFrame(Math.max(cursor + 1 / frameRate, desiredEnd), frameRate);
+    const startSec = quantizeToFrame(cursor, frameRate);
+    const endSec = isLast ? targetEndSec : Math.min(targetEndSec, nextEnd);
+
+    if (Math.abs(placement.startSec - startSec) > 1 / frameRate || Math.abs(placement.endSec - endSec) > 1 / frameRate) {
+      adjustedPlacementCount += 1;
+    }
+
+    if (placement.startSec > cursor + 1 / frameRate) {
+      filledGapCount += 1;
+    }
+
+    resolvedPrimary.push({
+      ...placement,
+      startSec,
+      endSec,
+      durationSec: roundDuration(Math.max(1 / frameRate, endSec - startSec)),
+      fallbackReason:
+        placement.fallbackReason ??
+        (adjustedPlacementCount > 0 ? "Adjusted by no-gap resolver to keep transcript coverage continuous." : null),
+    });
+    cursor = endSec;
+  });
+
+  const resolvedOverlays = overlayPlacements
+    .filter((placement) => !discardIds.has(placement.id))
+    .map((placement) => quantizePlacement(placement, frameRate));
+  const resolvedPlacements = [...resolvedPrimary, ...resolvedOverlays]
+    .sort((left, right) => left.startSec - right.startSec || left.trackOffset - right.trackOffset || left.id.localeCompare(right.id));
+
+  return {
+    placements: resolvedPlacements,
+    summary: {
+      coveredSec: roundDuration(targetSpanSec),
+      gapSec: 0,
+      filledGapCount,
+      discardedSliverCount,
+      adjustedPlacementCount,
+    },
+  };
+}
+
+function resolveNoGapCoverage(
+  placements: TimelinePlacement[],
+  settings: TimelinePlannerSettings,
+): { placements: TimelinePlacement[]; summary: Omit<TimelineCoverageSummary, "reusedAssetPlacements"> } {
+  return resolveTimelineCoverage(placements, settings);
+}
+
+function quantizePlacements(placements: TimelinePlacement[], frameRate: number): TimelinePlacement[] {
+  return placements.map((placement) => quantizePlacement(placement, frameRate));
+}
+
+function quantizePlacement(placement: TimelinePlacement, frameRate: number): TimelinePlacement {
+  const startSec = quantizeToFrame(placement.startSec, frameRate);
+  const endSec = quantizeToFrame(Math.max(startSec + 1 / frameRate, placement.endSec), frameRate);
+  return {
+    ...placement,
+    startSec,
+    endSec,
+    durationSec: roundDuration(endSec - startSec),
+  };
+}
+
+function quantizeToFrame(seconds: number, frameRate: number): number {
+  return Math.round(seconds * frameRate) / frameRate;
 }
 
 function findSecondaryAiMatch(

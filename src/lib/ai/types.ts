@@ -18,6 +18,11 @@ export interface AiSegmentRequest {
   text: string;
   startSec: number;
   endSec: number | null;
+  segmentIndex?: number;
+  segmentTotal?: number;
+  previousText?: string;
+  nextText?: string;
+  fullScriptContext?: string;
   wordCount?: number;
   sentenceCount?: number;
   sentenceComplete?: boolean;
@@ -70,6 +75,7 @@ export interface AiScoringContext {
   ffmpegAvailable?: boolean;
   ffprobeAvailable?: boolean;
   customInstructions?: string;
+  fullScriptContext?: string;
 }
 
 export interface AiBatchResult {
