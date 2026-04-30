@@ -17,7 +17,13 @@ import {
 } from "@/lib/cep";
 import { detectVideoTooling, hydrateAiCandidates } from "@/lib/ai/video-preprocessing";
 import { checkAiProviders, rankSegmentsWithAi } from "@/lib/ai/router";
-import { AiHealthStatus, AiMode, AiScoringContext, AiSegmentRanking } from "@/lib/ai/types";
+import {
+  AiHealthStatus,
+  AiMode,
+  AiScoringContext,
+  AiSegmentRanking,
+  AiSegmentRequest,
+} from "@/lib/ai/types";
 import { formatSeconds, parseTimestampScript } from "@/lib/script-parser";
 import { TimelinePlacement, buildTimelinePlan } from "@/lib/timeline-plan";
 import { MediaLibraryItem, MediaLibraryMode, getFileName, normalizePath } from "@/lib/media";
@@ -112,6 +118,52 @@ const Index = () => {
     Record<string, string | "blank" | "auto">
   >({});
 
+  const refreshPremiereStatus = useCallback(async () => {
+    setBusyMessage("Checking Premiere sequence");
+
+    try {
+      const nextStatus = await getPremiereStatus();
+      setHostStatus(nextStatus);
+
+      if (nextStatus.ok && targetVideoTrack > nextStatus.videoTracks.length) {
+        setTargetVideoTrack(Math.max(1, nextStatus.videoTracks.length));
+      }
+    } catch (error) {
+      setHostStatus({
+        ok: false,
+        connected: true,
+        projectName: "",
+        sequenceName: "",
+        videoTracks: [],
+        frameRate: 30,
+        range: {
+          inSec: 0,
+          outSec: 0,
+          sequenceEndSec: 0,
+          hasMeaningfulInOut: false,
+        },
+        message: String(error),
+      });
+    } finally {
+      setBusyMessage(null);
+    }
+  }, [targetVideoTrack]);
+
+  const applyScanResult = useCallback((scanResult: MediaScanResult) => {
+    setMediaItems(scanResult.items);
+    setScanWarnings(scanResult.warnings);
+    setFolderError(
+      scanResult.items.length > 0
+        ? null
+        : libraryMode === "images"
+          ? "The selected folder does not contain supported image files."
+          : libraryMode === "videos"
+            ? "The selected folder does not contain supported video files."
+            : "The selected folder does not contain supported image or video files.",
+    );
+    setResult(null);
+  }, [libraryMode]);
+
   useEffect(() => {
     const stored = loadStoredSettings();
     if (!stored) {
@@ -177,14 +229,6 @@ const Index = () => {
     geminiModel,
     aiConfidenceThreshold,
   ]);
-
-  useEffect(() => {
-    if (!isCepEnvironment()) {
-      return;
-    }
-
-    void refreshPremiereStatus();
-  }, [refreshPremiereStatus]);
 
   useEffect(() => {
     if (!imageFolderPath || !isNodeEnabled()) {
@@ -324,6 +368,10 @@ const Index = () => {
   );
 
   const executeReason = useMemo(() => {
+    if (!hostStatus) {
+      return "Click Refresh in Premiere status after the panel opens.";
+    }
+
     if (!hostStatus?.ok) {
       return "Open a Premiere project and activate a sequence first.";
     }
@@ -389,42 +437,48 @@ const Index = () => {
 
     try {
       const preprocessingWarnings: string[] = [];
-      const requests = await Promise.all(
-        parsedScriptState.result.segments.map(async (segment) => {
-          const shortlisted = shortlistCandidates(segment.text, mediaItems, 20);
-          const hydrated = await hydrateAiCandidates(
-            shortlisted.map((item) => ({
-              id: normalizePath(item.path),
-              path: item.path,
-              name: getFileName(item.path),
-              mediaType: item.type,
-            })),
-          );
-          preprocessingWarnings.push(...hydrated.warnings);
+      const segments = parsedScriptState.result.segments;
+      const segmentRequests: AiSegmentRequest[] = [];
 
-          return {
-            segmentId: segment.id,
-            text: segment.text,
-            startSec: segment.startSec,
-            endSec: segment.endSec,
-            wordCount: segment.wordCount,
-            sentenceCount: segment.sentenceCount,
-            sentenceComplete: segment.sentenceComplete,
-            maxRecommendations: 3,
-            minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
-            maxDurationSec: Math.max(minDurationSec, maxDurationSec),
-            customInstructions,
-            allowOverlap: true,
-            maxOverlapLayers: 2,
-            transcriptSource: transcriptSourceMode,
-            candidates: hydrated.candidates,
-          };
-        }),
-      );
+      // Sequential prep avoids dozens of parallel ffmpeg/ffprobe calls freezing the panel.
+      for (let i = 0; i < segments.length; i += 1) {
+        const segment = segments[i];
+        setAiBusyMessage(`Preparing media for segment ${i + 1}/${segments.length}`);
+        const shortlisted = shortlistCandidates(segment.text, mediaItems, 30);
+        const hydrated = await hydrateAiCandidates(
+          shortlisted.map((item) => ({
+            id: normalizePath(item.path),
+            path: item.path,
+            name: getFileName(item.path),
+            mediaType: item.type,
+          })),
+        );
+        preprocessingWarnings.push(...hydrated.warnings);
 
-      const ranked = await rankSegmentsWithAi(requests, aiMode, aiContext);
+        segmentRequests.push({
+          segmentId: segment.id,
+          text: segment.text,
+          startSec: segment.startSec,
+          endSec: segment.endSec,
+          wordCount: segment.wordCount,
+          sentenceCount: segment.sentenceCount,
+          sentenceComplete: segment.sentenceComplete,
+          maxRecommendations: 6,
+          minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
+          maxDurationSec: Math.max(minDurationSec, maxDurationSec),
+          customInstructions,
+          allowOverlap: true,
+          maxOverlapLayers: 2,
+          transcriptSource: transcriptSourceMode,
+          candidates: hydrated.candidates,
+        });
+      }
+
+      const ranked = await rankSegmentsWithAi(segmentRequests, aiMode, aiContext, (done, total) => {
+        setAiBusyMessage(`AI ranking segment ${done}/${total}`);
+      });
       setAiRankingsBySegmentId(ranked.rankingsBySegmentId);
-      const fallbackWarnings = requests.flatMap((request) =>
+      const fallbackWarnings = segmentRequests.flatMap((request) =>
         request.candidates
           .filter((candidate) => candidate.mediaType === "video" && !candidate.visualPaths?.length)
           .map((candidate) => `Limited video analysis for ${candidate.name}; extracted frames were unavailable.`),
@@ -436,37 +490,6 @@ const Index = () => {
       setAiBusyMessage(null);
     }
   }
-
-  const refreshPremiereStatus = useCallback(async () => {
-    setBusyMessage("Checking Premiere sequence");
-
-    try {
-      const nextStatus = await getPremiereStatus();
-      setHostStatus(nextStatus);
-
-      if (nextStatus.ok && targetVideoTrack > nextStatus.videoTracks.length) {
-        setTargetVideoTrack(Math.max(1, nextStatus.videoTracks.length));
-      }
-    } catch (error) {
-      setHostStatus({
-        ok: false,
-        connected: true,
-        projectName: "",
-        sequenceName: "",
-        videoTracks: [],
-        frameRate: 30,
-        range: {
-          inSec: 0,
-          outSec: 0,
-          sequenceEndSec: 0,
-          hasMeaningfulInOut: false,
-        },
-        message: String(error),
-      });
-    } finally {
-      setBusyMessage(null);
-    }
-  }, [targetVideoTrack]);
 
   async function chooseImageFolder() {
     try {
@@ -532,21 +555,6 @@ const Index = () => {
 
     applyScanResult(scanLibraryFolder(imageFolderPath, libraryMode));
   }
-
-  const applyScanResult = useCallback((scanResult: MediaScanResult) => {
-    setMediaItems(scanResult.items);
-    setScanWarnings(scanResult.warnings);
-    setFolderError(
-      scanResult.items.length > 0
-        ? null
-        : libraryMode === "images"
-          ? "The selected folder does not contain supported image files."
-          : libraryMode === "videos"
-            ? "The selected folder does not contain supported video files."
-            : "The selected folder does not contain supported image or video files.",
-    );
-    setResult(null);
-  }, [libraryMode]);
 
   async function handlePlaceOnTimeline() {
     if (!effectivePlan) {
@@ -992,11 +1000,11 @@ const Index = () => {
                 />
                 <StatusCard
                   label="Timing engine"
-                  value="AI proposes sentence-aware duration; min/max only clamp outliers."
+                  value="AI and heuristic reviewers propose duration plus sequential clip count; min/max only clamp outliers."
                 />
                 <StatusCard
                   label="Overlap policy"
-                  value="AI may place up to 2 visual layers when the sentence benefits from simultaneous coverage."
+                  value="Long segments can split into multiple same-track clips; overlays are reserved for simultaneous coverage."
                 />
               </div>
               {!appendAtTrackEnd && !hasMeaningfulInOut && !useWholeSequenceFallback ? (
@@ -1075,7 +1083,7 @@ const Index = () => {
                 {effectivePlan?.mode === "append"
                   ? "Placements will be appended after the current end of the target track."
                   : effectivePlan?.mode === "sequence_in_out"
-                    ? `Only placements inside ${formatSeconds(effectivePlan.rangeStartSec)} - ${formatSeconds(effectivePlan.rangeEndSec)} will be sent.`
+                    ? `Only placements inside ${formatSeconds(effectivePlan.rangeStartSec)} - ${formatSeconds(effectivePlan.rangeEndSec)} will be sent; clear or widen In/Out to fill the whole script.`
                     : effectivePlan?.mode === "whole_sequence"
                       ? "Whole-sequence fallback is active because sequence In/Out is not being used."
                       : "Set sequence In/Out or enable whole-sequence fallback to make the preview executable."}

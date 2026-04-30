@@ -46,8 +46,11 @@ export interface AiSegmentRanking {
   fallbackUsed: boolean;
   suggestedDurationSec?: number;
   suggestedLayerCount?: number;
+  suggestedClipCount?: number;
   overlapStyle?: "single" | "parallel" | "staggered";
   timingRationale?: string;
+  coverageNotes?: string;
+  reviewerNotes?: string[];
   lowConfidenceReason?: string;
 }
 

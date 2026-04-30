@@ -90,8 +90,10 @@ export class GeminiAiProvider implements AiProvider {
       fallbackUsed: false,
       suggestedDurationSec: editPlan.suggestedDurationSec,
       suggestedLayerCount: editPlan.suggestedLayerCount,
+      suggestedClipCount: editPlan.suggestedClipCount,
       overlapStyle: editPlan.overlapStyle,
       timingRationale: editPlan.rationale,
+      coverageNotes: editPlan.coverageNotes,
       lowConfidenceReason:
         (rankedAssets[0]?.score ?? 0) < 0.55
           ? "AI confidence is below the editorial threshold, so placement should be reviewed."
@@ -197,7 +199,7 @@ function createEditPlanPrompt(
 ): string {
   return [
     "You are deciding editorial timing for one transcript segment.",
-    'Return strict JSON only with shape: {"suggestedDurationSec":0.0,"suggestedLayerCount":1,"overlapStyle":"single","rationale":"short sentence"}',
+    'Return strict JSON only with shape: {"suggestedDurationSec":0.0,"suggestedLayerCount":1,"suggestedClipCount":1,"overlapStyle":"single","coverageNotes":"short sentence","rationale":"short sentence"}',
     `Segment text: "${request.text}"`,
     `Sentence complete: ${request.sentenceComplete ? "yes" : "no"}`,
     `Word count: ${request.wordCount ?? 0}`,
@@ -211,6 +213,9 @@ function createEditPlanPrompt(
       .slice(0, 3)
       .map((asset) => `${asset.candidateId}=${asset.score.toFixed(2)}`)
       .join(", ")}`,
+    "Suggested clip count decides how many sequential visuals should cover this segment on the same track.",
+    "Use 1 clip for a short/simple thought, 2 clips for long or two-part narration, and 3-4 clips for dense multi-clause narration.",
+    "Use layer count only for simultaneous overlays, not for sequential coverage.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -245,14 +250,18 @@ function parseEditPlanResponse(
 ): {
   suggestedDurationSec: number;
   suggestedLayerCount: number;
+  suggestedClipCount: number;
   overlapStyle: "single" | "parallel" | "staggered";
+  coverageNotes: string;
   rationale: string;
 } {
   const parsed = safeJsonParse(extractJsonObject(raw)) as
     | {
         suggestedDurationSec?: number;
         suggestedLayerCount?: number;
+        suggestedClipCount?: number;
         overlapStyle?: "single" | "parallel" | "staggered";
+        coverageNotes?: string;
         rationale?: string;
       }
     | null;
@@ -269,12 +278,28 @@ function parseEditPlanResponse(
     suggestedLayerCount: request.allowOverlap
       ? Math.max(1, Math.min(requestedLayers, Math.round(parsed?.suggestedLayerCount ?? 1)))
       : 1,
+    suggestedClipCount: clampClipCount(parsed?.suggestedClipCount, request),
     overlapStyle:
       request.allowOverlap && (parsed?.overlapStyle === "parallel" || parsed?.overlapStyle === "staggered")
         ? parsed.overlapStyle
         : "single",
+    coverageNotes: String(parsed?.coverageNotes ?? "Sequential clip count derived from transcript density."),
     rationale: String(parsed?.rationale ?? "Timing aligned to transcript cadence."),
   };
+}
+
+function clampClipCount(value: number | undefined, request: AiSegmentRequest): number {
+  const heuristic = Math.max(
+    Math.ceil((request.wordCount ?? 0) / 18),
+    Math.ceil(((request.maxDurationSec ?? 8) || 1) / 5.5),
+    request.sentenceCount ?? 1,
+  );
+  const parsed = Number(value ?? heuristic);
+  if (!Number.isFinite(parsed)) {
+    return Math.max(1, Math.min(4, heuristic));
+  }
+
+  return Math.max(1, Math.min(4, Math.round(parsed)));
 }
 
 function extractJsonObject(raw: string): string {

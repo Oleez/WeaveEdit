@@ -84,6 +84,36 @@ interface MediaCandidate extends MediaLibraryItem {
   tokens: Set<string>;
 }
 
+interface AssetUsage {
+  count: number;
+  lastSegmentIndex: number;
+  lastEndSec: number;
+}
+
+interface DurationDecision {
+  durationSec: number;
+  source: TimelinePlacement["timingSource"];
+  rationale: string;
+}
+
+interface ClipWindow {
+  index: number;
+  count: number;
+  startSec: number;
+  durationSec: number;
+  text: string;
+}
+
+interface AssetMatch {
+  asset: MediaCandidate;
+  index: number;
+  confidence: number;
+  rationale: string;
+  provider: string;
+  lowConfidence: boolean;
+  fallbackReason: string | null;
+}
+
 export function buildTimelinePlan(
   segments: ScriptSegment[],
   mediaItems: MediaLibraryItem[],
@@ -97,7 +127,7 @@ export function buildTimelinePlan(
       tokens: tokenize(mediaItem.name),
     }));
 
-  const usedAssetIndexes = new Set<number>();
+  const assetUsageByIndex = new Map<number, AssetUsage>();
   const assetIndexByPath = new Map<string, number>();
   assets.forEach((asset, index) => {
     assetIndexByPath.set(normalizePath(asset.path), index);
@@ -128,49 +158,144 @@ export function buildTimelinePlan(
     const aiRanking = settings.aiRankingsBySegmentId?.[segment.id];
     const durationDecision = resolveDuration(segment, rawWindow, maxAvailableWindow, settings, aiRanking);
     const override = settings.manualOverridesBySegmentId?.[segment.id] ?? "auto";
-    const aiMatch = findAiMatch(
-      aiRanking,
-      assets,
-      assetIndexByPath,
-      usedAssetIndexes,
-      aiConfidenceThreshold,
-      override,
-      allowLowConfidenceFallback,
-    );
-    const keywordMatch = findKeywordMatch(segment.text, assets, usedAssetIndexes);
-
-    let strategy: TimelinePlacement["strategy"] = "blank";
-    let mediaPath: string | null = null;
-    let mediaName: string | null = null;
-    let mediaType: MediaLibraryItem["type"] | null = null;
-    let keywordScore = 0;
-    let aiConfidence = 0;
-    let aiRationale: string | null = null;
-    let aiProvider: string | null = null;
-    let lowConfidence = false;
-    let fallbackReason: string | null = null;
     const overlapStyle: TimelinePlacement["overlapStyle"] = aiRanking?.overlapStyle ?? "single";
     const groupId = `segment-group-${index + 1}`;
+    const clipWindows = createClipWindows(segment, durationDecision.durationSec, aiRanking);
+    const pathsUsedInSegment = new Set<string>();
 
     if (override === "blank") {
-      blanks += 1;
+      clipWindows.forEach((clipWindow) => {
+        blanks += 1;
+        placements.push(createBlankPlacement({
+          id: buildPlacementId(index, clipWindow),
+          groupId,
+          segment,
+          clipWindow,
+          durationDecision,
+          overlapStyle,
+          rationale: "Manually overridden to blank.",
+        }));
+      });
+      return;
+    }
+
+    clipWindows.forEach((clipWindow) => {
+      let strategy: TimelinePlacement["strategy"] = "blank";
+      let mediaPath: string | null = null;
+      let mediaName: string | null = null;
+      let mediaType: MediaLibraryItem["type"] | null = null;
+      let keywordScore = 0;
+      let aiConfidence = 0;
+      let aiRationale: string | null = null;
+      let aiProvider: string | null = null;
+      let lowConfidence = false;
+      let fallbackReason: string | null = null;
+      let selectedIndex: number | null = null;
+
+      if (override !== "auto" && override) {
+        const overrideIndex = assetIndexByPath.get(normalizePath(override));
+        if (overrideIndex !== undefined) {
+          const overrideAsset = assets[overrideIndex];
+          strategy = "manual";
+          mediaPath = overrideAsset.path;
+          mediaName = overrideAsset.name;
+          mediaType = overrideAsset.type;
+          aiConfidence = 1;
+          aiRationale = "Manually overridden in review.";
+          aiProvider = "manual";
+          selectedIndex = overrideIndex;
+          matchedByAi += 1;
+        }
+      }
+
+      const aiMatch = !mediaPath
+        ? findAiMatch(
+            aiRanking,
+            assets,
+            assetIndexByPath,
+            assetUsageByIndex,
+            pathsUsedInSegment,
+            aiConfidenceThreshold,
+            override,
+            allowLowConfidenceFallback,
+            index,
+            clipWindow.startSec,
+          )
+        : null;
+      const keywordMatch = !mediaPath
+        ? findKeywordMatch(segment.text, assets, assetUsageByIndex, pathsUsedInSegment, index, clipWindow.startSec)
+        : null;
+      const genericFallbackMatch = !mediaPath && !keywordMatch && assets.length > 0
+        ? findReusableAsset(assets, assetUsageByIndex, pathsUsedInSegment, index, clipWindow.startSec)
+        : null;
+
+      if (!mediaPath && aiMatch) {
+        strategy = aiMatch.lowConfidence ? "fallback" : "ai";
+        mediaPath = aiMatch.asset.path;
+        mediaName = aiMatch.asset.name;
+        mediaType = aiMatch.asset.type;
+        aiConfidence = aiMatch.confidence;
+        aiRationale = aiMatch.rationale;
+        aiProvider = aiMatch.provider;
+        lowConfidence = aiMatch.lowConfidence;
+        fallbackReason = aiMatch.fallbackReason;
+        selectedIndex = aiMatch.index;
+        if (aiMatch.lowConfidence) {
+          matchedByFallback += 1;
+        } else {
+          matchedByAi += 1;
+        }
+      } else if (!mediaPath && keywordMatch) {
+        strategy = "fallback";
+        mediaPath = keywordMatch.asset.path;
+        mediaName = keywordMatch.asset.name;
+        mediaType = keywordMatch.asset.type;
+        keywordScore = keywordMatch.score;
+        aiConfidence = aiRanking?.confidence ?? 0;
+        aiRationale = aiRanking?.rationale ?? "No high-confidence semantic match was available, so a lexical hint was used.";
+        aiProvider = aiRanking?.provider ?? null;
+        lowConfidence = true;
+        fallbackReason = "Used lexical fallback because AI confidence was below threshold.";
+        selectedIndex = keywordMatch.index;
+        matchedByFallback += 1;
+      } else if (!mediaPath && genericFallbackMatch) {
+        strategy = "fallback";
+        mediaPath = genericFallbackMatch.asset.path;
+        mediaName = genericFallbackMatch.asset.name;
+        mediaType = genericFallbackMatch.asset.type;
+        aiConfidence = aiRanking?.confidence ?? 0;
+        aiRationale = aiRanking?.rationale ?? "No semantic or lexical match was available, so the least-repeated asset was reused to keep the timeline filled.";
+        aiProvider = aiRanking?.provider ?? null;
+        lowConfidence = true;
+        fallbackReason = "Reused available media to avoid leaving this script span blank.";
+        selectedIndex = genericFallbackMatch.index;
+        matchedByFallback += 1;
+      } else if (!mediaPath && settings.blankWhenNoImage) {
+        blanks += 1;
+      }
+
+      if (selectedIndex !== null) {
+        recordAssetUsage(assetUsageByIndex, selectedIndex, index, clipWindow.startSec + clipWindow.durationSec);
+        pathsUsedInSegment.add(normalizePath(assets[selectedIndex].path));
+      }
+
       placements.push({
-        id: `placement-${index + 1}`,
+        id: buildPlacementId(index, clipWindow),
         groupId,
         segmentId: segment.id,
         layerIndex: 0,
         trackOffset: 0,
-        startSec: segment.startSec,
-        endSec: segment.startSec + durationDecision.durationSec,
-        durationSec: durationDecision.durationSec,
+        startSec: roundDuration(clipWindow.startSec),
+        endSec: roundDuration(clipWindow.startSec + clipWindow.durationSec),
+        durationSec: roundDuration(clipWindow.durationSec),
         strategy,
         mediaPath,
         mediaName,
         mediaType,
-        text: segment.text,
+        text: clipWindow.text,
         keywordScore,
         aiConfidence,
-        aiRationale: "Manually overridden to blank.",
+        aiRationale,
         aiProvider,
         lowConfidence,
         fallbackReason,
@@ -178,118 +303,48 @@ export function buildTimelinePlan(
         timingRationale: durationDecision.rationale,
         overlapStyle,
       });
-      return;
-    }
 
-    if (override !== "auto" && override) {
-      const overrideIndex = assetIndexByPath.get(normalizePath(override));
-      if (overrideIndex !== undefined && !usedAssetIndexes.has(overrideIndex)) {
-        usedAssetIndexes.add(overrideIndex);
-        strategy = "manual";
-        mediaPath = assets[overrideIndex].path;
-        mediaName = assets[overrideIndex].name;
-        mediaType = assets[overrideIndex].type;
-        aiConfidence = 1;
-        aiRationale = "Manually overridden in review.";
-        aiProvider = "manual";
-        matchedByAi += 1;
+      if (
+        mediaPath &&
+        aiRanking &&
+        maxOverlapLayers > 1 &&
+        aiRanking.suggestedLayerCount &&
+        aiRanking.suggestedLayerCount > 1
+      ) {
+        const secondaryMatch = findSecondaryAiMatch(
+          aiRanking,
+          assets,
+          assetIndexByPath,
+          assetUsageByIndex,
+          pathsUsedInSegment,
+          mediaPath,
+          index,
+          clipWindow.startSec,
+        );
+
+        if (secondaryMatch) {
+          recordAssetUsage(assetUsageByIndex, secondaryMatch.index, index, clipWindow.startSec + clipWindow.durationSec);
+          pathsUsedInSegment.add(normalizePath(secondaryMatch.asset.path));
+          const overlapPlacement = createOverlapPlacement({
+            placementId: `${index + 1}-${clipWindow.index + 1}-overlay-1`,
+            groupId,
+            segment,
+            clipWindow,
+            overlapStyle,
+            baseConfidence: aiConfidence,
+            baseRationale: aiRationale,
+            provider: aiProvider,
+            lowConfidence,
+            fallbackReason,
+            timingSource: durationDecision.source,
+            timingRationale: durationDecision.rationale,
+            match: secondaryMatch,
+          });
+          placements.push(overlapPlacement);
+          overlapPlacements += 1;
+        }
       }
-    }
-
-    if (!mediaPath && aiMatch) {
-      usedAssetIndexes.add(aiMatch.index);
-      strategy = aiMatch.lowConfidence ? "fallback" : "ai";
-      mediaPath = aiMatch.asset.path;
-      mediaName = aiMatch.asset.name;
-      mediaType = aiMatch.asset.type;
-      aiConfidence = aiMatch.confidence;
-      aiRationale = aiMatch.rationale;
-      aiProvider = aiMatch.provider;
-      lowConfidence = aiMatch.lowConfidence;
-      fallbackReason = aiMatch.fallbackReason;
-      if (aiMatch.lowConfidence) {
-        matchedByFallback += 1;
-      } else {
-        matchedByAi += 1;
-      }
-    } else if (!mediaPath && keywordMatch) {
-      usedAssetIndexes.add(keywordMatch.index);
-      strategy = "fallback";
-      mediaPath = keywordMatch.asset.path;
-      mediaName = keywordMatch.asset.name;
-      mediaType = keywordMatch.asset.type;
-      keywordScore = keywordMatch.score;
-      aiConfidence = aiRanking?.confidence ?? 0;
-      aiRationale = aiRanking?.rationale ?? "No high-confidence semantic match was available, so a lexical hint was used.";
-      aiProvider = aiRanking?.provider ?? null;
-      lowConfidence = true;
-      fallbackReason = "Used lexical fallback because AI confidence was below threshold.";
-      matchedByFallback += 1;
-    } else if (!mediaPath && settings.blankWhenNoImage) {
-      blanks += 1;
-    }
-
-    placements.push({
-      id: `placement-${index + 1}`,
-      groupId,
-      segmentId: segment.id,
-      layerIndex: 0,
-      trackOffset: 0,
-      startSec: segment.startSec,
-      endSec: segment.startSec + durationDecision.durationSec,
-      durationSec: durationDecision.durationSec,
-      strategy,
-      mediaPath,
-      mediaName,
-      mediaType,
-      text: segment.text,
-      keywordScore,
-      aiConfidence,
-      aiRationale,
-      aiProvider,
-      lowConfidence,
-      fallbackReason,
-      timingSource: durationDecision.source,
-      timingRationale: durationDecision.rationale,
-      overlapStyle,
     });
-
-    if (
-      mediaPath &&
-      aiRanking &&
-      maxOverlapLayers > 1 &&
-      aiRanking.suggestedLayerCount &&
-      aiRanking.suggestedLayerCount > 1
-    ) {
-      const secondaryMatch = findSecondaryAiMatch(
-        aiRanking,
-        assets,
-        assetIndexByPath,
-        usedAssetIndexes,
-        mediaPath,
-      );
-
-      if (secondaryMatch) {
-        usedAssetIndexes.add(secondaryMatch.index);
-        const overlapPlacement = createOverlapPlacement({
-          placementId: `${index + 1}-overlay-1`,
-          groupId,
-          segment,
-          durationSec: durationDecision.durationSec,
-          overlapStyle,
-          baseConfidence: aiConfidence,
-          baseRationale: aiRationale,
-          provider: aiProvider,
-          lowConfidence,
-          fallbackReason,
-          timingSource: durationDecision.source,
-          timingRationale: durationDecision.rationale,
-          match: secondaryMatch,
-        });
-        placements.push(overlapPlacement);
-        overlapPlacements += 1;
-      }
-    }
   });
 
   return {
@@ -305,19 +360,14 @@ function findAiMatch(
   aiRanking: AiSegmentRanking | undefined,
   assets: MediaCandidate[],
   assetIndexByPath: Map<string, number>,
-  usedAssetIndexes: Set<number>,
+  assetUsageByIndex: Map<number, AssetUsage>,
+  pathsUsedInSegment: Set<string>,
   confidenceThreshold: number,
   override: string | "blank" | "auto",
   allowLowConfidenceFallback: boolean,
-): {
-  asset: MediaCandidate;
-  index: number;
-  confidence: number;
-  rationale: string;
-  provider: string;
-  lowConfidence: boolean;
-  fallbackReason: string | null;
-} | null {
+  segmentIndex: number,
+  startSec: number,
+): AssetMatch | null {
   if (!aiRanking || override === "blank") {
     return null;
   }
@@ -326,14 +376,30 @@ function findAiMatch(
     return null;
   }
 
+  let bestMatch: AssetMatch | null = null;
+  let bestAdjustedScore = Number.NEGATIVE_INFINITY;
+
   for (const ranked of aiRanking.rankedAssets) {
     const index = assetIndexByPath.get(normalizePath(ranked.candidateId));
-    if (index === undefined || usedAssetIndexes.has(index)) {
+    if (index === undefined) {
       continue;
     }
 
     const asset = assets[index];
-    return {
+    const adjustedScore = (ranked.score || aiRanking.confidence) - getReusePenalty(
+      index,
+      assetUsageByIndex,
+      pathsUsedInSegment,
+      segmentIndex,
+      startSec,
+    );
+
+    if (adjustedScore <= bestAdjustedScore) {
+      continue;
+    }
+
+    bestAdjustedScore = adjustedScore;
+    bestMatch = {
       asset,
       index,
       confidence: ranked.score || aiRanking.confidence,
@@ -347,26 +413,25 @@ function findAiMatch(
     };
   }
 
-  return null;
+  return bestMatch;
 }
 
 function findKeywordMatch(
   text: string,
   assets: MediaCandidate[],
-  usedAssetIndexes: Set<number>,
+  assetUsageByIndex: Map<number, AssetUsage>,
+  pathsUsedInSegment: Set<string>,
+  segmentIndex: number,
+  startSec: number,
 ): { asset: MediaCandidate; index: number; score: number } | null {
   const textTokens = tokenize(text);
-  let bestMatch: { asset: MediaCandidate; index: number; score: number } | null = null;
+  let bestMatch: { asset: MediaCandidate; index: number; score: number; adjustedScore: number } | null = null;
 
   if (textTokens.size === 0) {
     return null;
   }
 
   assets.forEach((asset, index) => {
-    if (usedAssetIndexes.has(index)) {
-      return;
-    }
-
     let score = 0;
     textTokens.forEach((token) => {
       if (asset.tokens.has(token)) {
@@ -378,8 +443,29 @@ function findKeywordMatch(
       return;
     }
 
-    if (!bestMatch || score > bestMatch.score) {
-      bestMatch = { asset, index, score };
+    const adjustedScore = score - getReusePenalty(index, assetUsageByIndex, pathsUsedInSegment, segmentIndex, startSec);
+
+    if (!bestMatch || adjustedScore > bestMatch.adjustedScore) {
+      bestMatch = { asset, index, score, adjustedScore };
+    }
+  });
+
+  return bestMatch;
+}
+
+function findReusableAsset(
+  assets: MediaCandidate[],
+  assetUsageByIndex: Map<number, AssetUsage>,
+  pathsUsedInSegment: Set<string>,
+  segmentIndex: number,
+  startSec: number,
+): { asset: MediaCandidate; index: number } | null {
+  let bestMatch: { asset: MediaCandidate; index: number; adjustedScore: number } | null = null;
+
+  assets.forEach((asset, index) => {
+    const adjustedScore = -getReusePenalty(index, assetUsageByIndex, pathsUsedInSegment, segmentIndex, startSec);
+    if (!bestMatch || adjustedScore > bestMatch.adjustedScore) {
+      bestMatch = { asset, index, adjustedScore };
     }
   });
 
@@ -452,6 +538,12 @@ function roundDuration(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+function buildPlacementId(segmentIndex: number, clipWindow: ClipWindow): string {
+  return clipWindow.count === 1
+    ? `placement-${segmentIndex + 1}`
+    : `placement-${segmentIndex + 1}-${clipWindow.index + 1}`;
+}
+
 function deriveSentenceAwareDuration(segment: ScriptSegment): number {
   const cadenceDuration = Math.max(1.25, segment.wordCount / 2.8);
   const punctuationBonus = segment.sentenceComplete ? 0.75 : 0;
@@ -459,16 +551,148 @@ function deriveSentenceAwareDuration(segment: ScriptSegment): number {
   return cadenceDuration + punctuationBonus + sentenceBonus;
 }
 
+function createClipWindows(
+  segment: ScriptSegment,
+  durationSec: number,
+  aiRanking?: AiSegmentRanking,
+): ClipWindow[] {
+  const clipCount = resolveClipCount(segment, durationSec, aiRanking);
+  if (clipCount <= 1) {
+    return [
+      {
+        index: 0,
+        count: 1,
+        startSec: segment.startSec,
+        durationSec,
+        text: segment.text,
+      },
+    ];
+  }
+
+  const snippets = splitTextForClips(segment.text, clipCount);
+  const baseDuration = durationSec / clipCount;
+  const windows: ClipWindow[] = [];
+
+  for (let clipIndex = 0; clipIndex < clipCount; clipIndex += 1) {
+    const startSec = segment.startSec + baseDuration * clipIndex;
+    const endSec = clipIndex === clipCount - 1 ? segment.startSec + durationSec : startSec + baseDuration;
+    windows.push({
+      index: clipIndex,
+      count: clipCount,
+      startSec: roundDuration(startSec),
+      durationSec: roundDuration(endSec - startSec),
+      text: snippets[clipIndex] ?? segment.text,
+    });
+  }
+
+  return windows;
+}
+
+function resolveClipCount(
+  segment: ScriptSegment,
+  durationSec: number,
+  aiRanking?: AiSegmentRanking,
+): number {
+  const aiClipCount = aiRanking?.suggestedClipCount;
+  if (aiClipCount && aiClipCount > 0) {
+    return clampClipCount(Math.round(aiClipCount));
+  }
+
+  const durationDrivenCount = Math.ceil(durationSec / 5.5);
+  const wordDrivenCount = Math.ceil((segment.wordCount || 0) / 18);
+  const sentenceDrivenCount = Math.max(1, segment.sentenceCount || 1);
+  const incompleteBoost = !segment.sentenceComplete && (segment.wordCount || 0) > 16 ? 1 : 0;
+
+  return clampClipCount(Math.max(durationDrivenCount, wordDrivenCount, sentenceDrivenCount + incompleteBoost));
+}
+
+function clampClipCount(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1;
+  }
+
+  return Math.max(1, Math.min(4, value));
+}
+
+function splitTextForClips(text: string, clipCount: number): string[] {
+  const sentenceParts = text
+    .match(/[^.!?]+[.!?]+["')\]]*|[^.!?]+$/g)
+    ?.map((part) => part.trim())
+    .filter(Boolean);
+
+  if (sentenceParts && sentenceParts.length >= clipCount) {
+    return distributeParts(sentenceParts, clipCount);
+  }
+
+  const words = text.split(/\s+/).filter(Boolean);
+  if (words.length === 0) {
+    return Array.from({ length: clipCount }, () => text);
+  }
+
+  const wordsPerClip = Math.ceil(words.length / clipCount);
+  return Array.from({ length: clipCount }, (_, index) =>
+    words.slice(index * wordsPerClip, (index + 1) * wordsPerClip).join(" ") || text,
+  );
+}
+
+function distributeParts(parts: string[], bucketCount: number): string[] {
+  const buckets = Array.from({ length: bucketCount }, () => "");
+  parts.forEach((part, index) => {
+    const bucketIndex = Math.min(bucketCount - 1, Math.floor((index * bucketCount) / parts.length));
+    buckets[bucketIndex] = `${buckets[bucketIndex]} ${part}`.trim();
+  });
+  return buckets.map((bucket) => bucket || (parts[0] ?? ""));
+}
+
+function getReusePenalty(
+  index: number,
+  assetUsageByIndex: Map<number, AssetUsage>,
+  pathsUsedInSegment: Set<string>,
+  segmentIndex: number,
+  startSec: number,
+): number {
+  const usage = assetUsageByIndex.get(index);
+  if (!usage) {
+    return 0;
+  }
+
+  const sameSegmentPenalty = pathsUsedInSegment.size > 0 ? 0.18 : 0;
+  const repeatPenalty = Math.min(0.45, usage.count * 0.12);
+  const adjacentPenalty = usage.lastSegmentIndex >= segmentIndex - 1 ? 0.14 : 0;
+  const temporalPenalty = Math.abs(startSec - usage.lastEndSec) < 1 ? 0.08 : 0;
+
+  return repeatPenalty + sameSegmentPenalty + adjacentPenalty + temporalPenalty;
+}
+
+function recordAssetUsage(
+  assetUsageByIndex: Map<number, AssetUsage>,
+  index: number,
+  segmentIndex: number,
+  endSec: number,
+) {
+  const existing = assetUsageByIndex.get(index);
+  assetUsageByIndex.set(index, {
+    count: (existing?.count ?? 0) + 1,
+    lastSegmentIndex: segmentIndex,
+    lastEndSec: endSec,
+  });
+}
+
 function findSecondaryAiMatch(
   aiRanking: AiSegmentRanking,
   assets: MediaCandidate[],
   assetIndexByPath: Map<string, number>,
-  usedAssetIndexes: Set<number>,
+  assetUsageByIndex: Map<number, AssetUsage>,
+  pathsUsedInSegment: Set<string>,
   excludedPath: string,
+  segmentIndex: number,
+  startSec: number,
 ): { asset: MediaCandidate; index: number; confidence: number; rationale: string } | null {
+  let bestMatch: { asset: MediaCandidate; index: number; confidence: number; rationale: string; adjustedScore: number } | null = null;
+
   for (const ranked of aiRanking.rankedAssets.slice(1)) {
     const index = assetIndexByPath.get(normalizePath(ranked.candidateId));
-    if (index === undefined || usedAssetIndexes.has(index)) {
+    if (index === undefined) {
       continue;
     }
 
@@ -481,22 +705,63 @@ function findSecondaryAiMatch(
       continue;
     }
 
-    return {
+    const adjustedScore = ranked.score - getReusePenalty(index, assetUsageByIndex, pathsUsedInSegment, segmentIndex, startSec);
+    if (bestMatch && adjustedScore <= bestMatch.adjustedScore) {
+      continue;
+    }
+
+    bestMatch = {
       asset,
       index,
       confidence: ranked.score,
       rationale: ranked.rationale,
+      adjustedScore,
     };
   }
 
-  return null;
+  return bestMatch;
+}
+
+function createBlankPlacement(input: {
+  id: string;
+  groupId: string;
+  segment: ScriptSegment;
+  clipWindow: ClipWindow;
+  durationDecision: DurationDecision;
+  overlapStyle: TimelinePlacement["overlapStyle"];
+  rationale: string;
+}): TimelinePlacement {
+  return {
+    id: input.id,
+    groupId: input.groupId,
+    segmentId: input.segment.id,
+    layerIndex: 0,
+    trackOffset: 0,
+    startSec: roundDuration(input.clipWindow.startSec),
+    endSec: roundDuration(input.clipWindow.startSec + input.clipWindow.durationSec),
+    durationSec: roundDuration(input.clipWindow.durationSec),
+    strategy: "blank",
+    mediaPath: null,
+    mediaName: null,
+    mediaType: null,
+    text: input.clipWindow.text,
+    keywordScore: 0,
+    aiConfidence: 0,
+    aiRationale: input.rationale,
+    aiProvider: null,
+    lowConfidence: false,
+    fallbackReason: null,
+    timingSource: input.durationDecision.source,
+    timingRationale: input.durationDecision.rationale,
+    overlapStyle: input.overlapStyle,
+  };
 }
 
 function createOverlapPlacement(input: {
   placementId: string;
   groupId: string;
   segment: ScriptSegment;
-  durationSec: number;
+  clipWindow: ClipWindow;
   overlapStyle: TimelinePlacement["overlapStyle"];
   baseConfidence: number;
   baseRationale: string | null;
@@ -509,10 +774,10 @@ function createOverlapPlacement(input: {
 }): TimelinePlacement {
   const overlapStart =
     input.overlapStyle === "staggered"
-      ? input.segment.startSec + Math.min(input.durationSec * 0.18, Math.max(0.2, input.durationSec - 0.6))
-      : input.segment.startSec;
+      ? input.clipWindow.startSec + Math.min(input.clipWindow.durationSec * 0.18, Math.max(0.2, input.clipWindow.durationSec - 0.6))
+      : input.clipWindow.startSec;
   const overlapDuration =
-    input.overlapStyle === "staggered" ? Math.max(0.6, input.durationSec * 0.72) : input.durationSec;
+    input.overlapStyle === "staggered" ? Math.max(0.6, input.clipWindow.durationSec * 0.72) : input.clipWindow.durationSec;
 
   return {
     id: `placement-${input.placementId}`,
@@ -527,7 +792,7 @@ function createOverlapPlacement(input: {
     mediaPath: input.match.asset.path,
     mediaName: input.match.asset.name,
     mediaType: input.match.asset.type,
-    text: input.segment.text,
+    text: input.clipWindow.text,
     keywordScore: 0,
     aiConfidence: input.match.confidence,
     aiRationale: input.match.rationale || input.baseRationale,

@@ -93,8 +93,10 @@ export class OllamaAiProvider implements AiProvider {
       fallbackUsed: false,
       suggestedDurationSec: editPlan.suggestedDurationSec,
       suggestedLayerCount: editPlan.suggestedLayerCount,
+      suggestedClipCount: editPlan.suggestedClipCount,
       overlapStyle: editPlan.overlapStyle,
       timingRationale: editPlan.rationale,
+      coverageNotes: editPlan.coverageNotes,
       lowConfidenceReason:
         topScore < 0.55
           ? "AI confidence is below the editorial threshold, so placement should be reviewed."
@@ -208,12 +210,14 @@ async function suggestEditPlan(
 ): Promise<{
   suggestedDurationSec: number;
   suggestedLayerCount: number;
+  suggestedClipCount: number;
   overlapStyle: "single" | "parallel" | "staggered";
+  coverageNotes: string;
   rationale: string;
 }> {
   const prompt = [
     "You are deciding editorial timing for one transcript segment.",
-    'Return strict JSON only with shape: {"suggestedDurationSec":0.0,"suggestedLayerCount":1,"overlapStyle":"single","rationale":"short sentence"}',
+    'Return strict JSON only with shape: {"suggestedDurationSec":0.0,"suggestedLayerCount":1,"suggestedClipCount":1,"overlapStyle":"single","coverageNotes":"short sentence","rationale":"short sentence"}',
     `Segment text: "${request.text}"`,
     `Segment start: ${request.startSec.toFixed(2)}`,
     `Segment end: ${request.endSec ?? "unknown"}`,
@@ -230,7 +234,10 @@ async function suggestEditPlan(
       .map((asset) => `${asset.candidateId}=${asset.score.toFixed(2)}`)
       .join(", ")}`,
     "Use longer durations for complete thoughts and shorter durations for partial thoughts.",
+    "Suggested clip count decides how many sequential visuals should cover this segment on the same track.",
+    "Use 1 clip for a short/simple thought, 2 clips for long or two-part narration, and 3-4 clips for dense multi-clause narration.",
     "Only suggest 2 layers when the segment likely benefits from simultaneous visual reinforcement.",
+    "Use layer count only for overlays, not for sequential coverage.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -259,7 +266,9 @@ async function suggestEditPlan(
     | {
         suggestedDurationSec?: number;
         suggestedLayerCount?: number;
+        suggestedClipCount?: number;
         overlapStyle?: "single" | "parallel" | "staggered";
+        coverageNotes?: string;
         rationale?: string;
       }
     | null;
@@ -271,7 +280,9 @@ async function suggestEditPlan(
   return {
     suggestedDurationSec: clampDurationSuggestion(parsed.suggestedDurationSec, request),
     suggestedLayerCount: clampLayerCount(parsed.suggestedLayerCount, request),
+    suggestedClipCount: clampClipCount(parsed.suggestedClipCount, request),
     overlapStyle: normalizeOverlapStyle(parsed.overlapStyle, request),
+    coverageNotes: String(parsed.coverageNotes ?? "Sequential clip count derived from transcript density."),
     rationale: String(parsed.rationale ?? "Timing aligned to transcript cadence."),
   };
 }
@@ -286,8 +297,10 @@ function defaultEditPlan(request: AiSegmentRequest) {
     suggestedDurationSec: heuristic,
     suggestedLayerCount:
       request.allowOverlap && (request.wordCount ?? 0) > 18 ? Math.min(request.maxOverlapLayers ?? 2, 2) : 1,
+    suggestedClipCount: clampClipCount(undefined, request),
     overlapStyle:
       request.allowOverlap && (request.wordCount ?? 0) > 18 ? ("staggered" as const) : ("single" as const),
+    coverageNotes: "Sequential clip count derived from transcript density.",
     rationale: "Timing derived from transcript cadence and sentence completion.",
   };
 }
@@ -314,6 +327,20 @@ function clampLayerCount(value: number | undefined, request: AiSegmentRequest): 
   }
 
   return Math.max(1, Math.min(maxLayers, Math.round(parsed)));
+}
+
+function clampClipCount(value: number | undefined, request: AiSegmentRequest): number {
+  const heuristic = Math.max(
+    Math.ceil((request.wordCount ?? 0) / 18),
+    Math.ceil(((request.maxDurationSec ?? 8) || 1) / 5.5),
+    request.sentenceCount ?? 1,
+  );
+  const parsed = Number(value ?? heuristic);
+  if (!Number.isFinite(parsed)) {
+    return Math.max(1, Math.min(4, heuristic));
+  }
+
+  return Math.max(1, Math.min(4, Math.round(parsed)));
 }
 
 function normalizeOverlapStyle(
