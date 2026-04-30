@@ -9,7 +9,7 @@
     "build:web": "vite build",
     "build:dev": "vite build --mode development",
     "build:cep": "vite build && node ./scripts/prepare-cep.mjs",
-    "install:premiere": "npm run build:cep && node ./scripts/install-premiere-extension.mjs",
+    "install:premiere": "node ./scripts/install-premiere-extension.mjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },

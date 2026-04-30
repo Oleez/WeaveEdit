@@ -1,11 +1,16 @@
 export type MediaType = "image" | "video";
 export type MediaLibraryMode = "images" | "videos" | "mixed";
+export type MediaSortMode = "name" | "created-oldest" | "modified-oldest" | "downloaded-oldest";
 
 export interface MediaLibraryItem {
   path: string;
   name: string;
   type: MediaType;
   extension: string;
+  createdMs?: number;
+  modifiedMs?: number;
+  folderIndex?: number;
+  sortKey?: number;
 }
 
 export const IMAGE_EXTENSIONS = new Set([
@@ -72,7 +77,10 @@ export function isSupportedMediaPath(filePath: string, mode: MediaLibraryMode = 
   return mode === "images" ? mediaType === "image" : mediaType === "video";
 }
 
-export function createMediaLibraryItem(filePath: string): MediaLibraryItem | null {
+export function createMediaLibraryItem(
+  filePath: string,
+  metadata: Pick<MediaLibraryItem, "createdMs" | "modifiedMs" | "folderIndex" | "sortKey"> = {},
+): MediaLibraryItem | null {
   const normalizedPath = normalizePath(filePath);
   const type = getMediaTypeFromPath(normalizedPath);
 
@@ -85,5 +93,6 @@ export function createMediaLibraryItem(filePath: string): MediaLibraryItem | nul
     name: getFileName(normalizedPath),
     type,
     extension: getExtension(normalizedPath),
+    ...metadata,
   };
 }

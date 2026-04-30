@@ -2,6 +2,7 @@ import { TimelinePlacement } from "./timeline-plan";
 import {
   MediaLibraryItem,
   MediaLibraryMode,
+  MediaSortMode,
   createMediaLibraryItem,
   normalizePath,
 } from "./media";
@@ -82,6 +83,51 @@ export interface PremiereTranscriptSegment {
   text: string;
 }
 
+export interface PremiereAudioClipInfo {
+  id: string;
+  trackIndex: number;
+  name: string;
+  mediaPath: string;
+  startSec: number;
+  endSec: number;
+  inPointSec: number;
+}
+
+export interface SilenceSpan {
+  id: string;
+  trackIndex: number;
+  sourcePath: string;
+  clipName: string;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
+
+export interface SilencePreviewInput {
+  targetAudioTrackIndex: number;
+  silenceThresholdDb: number;
+  minSilenceSec: number;
+  keepSilenceSec: number;
+}
+
+export interface SilencePreviewResult {
+  ok: boolean;
+  message: string;
+  spans: SilenceSpan[];
+  details: string[];
+}
+
+export interface SilenceCleanupJobInput extends SilencePreviewInput {
+  spans: SilenceSpan[];
+}
+
+export interface SilenceCleanupResult {
+  ok: boolean;
+  message: string;
+  markerCount: number;
+  details: string[];
+}
+
 type NodeRequire = (moduleName: string) => unknown;
 
 interface NodeModules {
@@ -91,7 +137,20 @@ interface NodeModules {
       name: string;
     }>;
     readFileSync: (path: string, encoding: string) => string;
+    statSync: (path: string) => { birthtimeMs?: number; ctimeMs?: number; mtimeMs?: number };
     writeFileSync: (path: string, data: string, encoding?: string) => void;
+  };
+  childProcess: {
+    execFileSync: (
+      file: string,
+      args?: string[],
+      options?: { encoding?: BufferEncoding; stdio?: "pipe" | "ignore" | Array<unknown> },
+    ) => string;
+    spawnSync: (
+      file: string,
+      args?: string[],
+      options?: { encoding?: BufferEncoding },
+    ) => { status: number | null; stdout?: string; stderr?: string; error?: Error };
   };
   os: {
     tmpdir: () => string;
@@ -167,10 +226,12 @@ export async function pickFolder(initialPath = ""): Promise<FolderPickResult> {
 export function listMediaFiles(
   folderPath: string,
   mode: MediaLibraryMode = "images",
+  sortMode: MediaSortMode = "name",
 ): MediaScanResult {
   const { fs, path } = getNodeModules();
   const collected = new Map<string, MediaLibraryItem>();
   const warnings: string[] = [];
+  let folderIndex = 0;
 
   function walk(currentPath: string) {
     let entries: ReturnType<NodeModules["fs"]["readdirSync"]>;
@@ -190,7 +251,25 @@ export function listMediaFiles(
         return;
       }
 
-      const item = createMediaLibraryItem(fullPath);
+      const fileIndex = folderIndex;
+      folderIndex += 1;
+      let createdMs: number | undefined;
+      let modifiedMs: number | undefined;
+      try {
+        const stat = fs.statSync(fullPath);
+        createdMs = firstFiniteNumber(stat.birthtimeMs, stat.ctimeMs, stat.mtimeMs);
+        modifiedMs = firstFiniteNumber(stat.mtimeMs, stat.ctimeMs, stat.birthtimeMs);
+      } catch (error) {
+        warnings.push(`Could not read file time for ${normalizePath(fullPath)}: ${String(error)}`);
+      }
+
+      const sortKey = resolveMediaSortKey(sortMode, createdMs, modifiedMs, fileIndex);
+      const item = createMediaLibraryItem(fullPath, {
+        createdMs,
+        modifiedMs,
+        folderIndex: fileIndex,
+        sortKey,
+      });
       if (!item) {
         return;
       }
@@ -203,9 +282,43 @@ export function listMediaFiles(
 
   walk(folderPath);
   return {
-    items: Array.from(collected.values()).sort((left, right) => left.path.localeCompare(right.path)),
+    items: sortMediaItems(Array.from(collected.values()), sortMode),
     warnings,
   };
+}
+
+function firstFiniteNumber(...values: Array<number | undefined>): number | undefined {
+  return values.find((value) => typeof value === "number" && Number.isFinite(value));
+}
+
+function resolveMediaSortKey(
+  sortMode: MediaSortMode,
+  createdMs: number | undefined,
+  modifiedMs: number | undefined,
+  folderIndex: number,
+): number {
+  if (sortMode === "modified-oldest") {
+    return modifiedMs ?? createdMs ?? folderIndex;
+  }
+
+  if (sortMode === "created-oldest" || sortMode === "downloaded-oldest") {
+    return createdMs ?? modifiedMs ?? folderIndex;
+  }
+
+  return folderIndex;
+}
+
+function sortMediaItems(items: MediaLibraryItem[], sortMode: MediaSortMode): MediaLibraryItem[] {
+  if (sortMode === "name") {
+    return items.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  return items.sort(
+    (left, right) =>
+      (left.sortKey ?? left.folderIndex ?? 0) - (right.sortKey ?? right.folderIndex ?? 0) ||
+      (left.folderIndex ?? 0) - (right.folderIndex ?? 0) ||
+      left.path.localeCompare(right.path),
+  );
 }
 
 export function getEnvironmentVariable(name: string): string | undefined {
@@ -250,6 +363,39 @@ export async function getPremiereTranscriptSegments(): Promise<PremiereTranscrip
   return evaluateJson<PremiereTranscriptSegment[]>("weaveEdit.getTranscriptSegments()");
 }
 
+export async function previewSilenceCleanup(input: SilencePreviewInput): Promise<SilencePreviewResult> {
+  if (!isCepEnvironment()) {
+    throw new Error("Open Weave Edit inside Premiere Pro to inspect timeline audio.");
+  }
+
+  await ensureHostLoaded();
+  const clips = await evaluateJson<PremiereAudioClipInfo[]>("weaveEdit.getAudioClips()");
+  const targetClips = clips.filter((clip) => clip.trackIndex === input.targetAudioTrackIndex);
+
+  if (targetClips.length === 0) {
+    return {
+      ok: false,
+      message: `No audio clips found on A${input.targetAudioTrackIndex + 1}.`,
+      spans: [],
+      details: [],
+    };
+  }
+
+  return detectSilenceSpans(targetClips, input);
+}
+
+export async function executeSilenceCleanup(payload: SilenceCleanupJobInput): Promise<SilenceCleanupResult> {
+  if (!isCepEnvironment()) {
+    throw new Error("Open Weave Edit inside Premiere Pro to clean silence.");
+  }
+
+  await ensureHostLoaded();
+
+  const tempJobPath = writeTempJob(payload);
+  const escapedJobPath = escapeForJsx(tempJobPath);
+  return evaluateJson<SilenceCleanupResult>(`weaveEdit.applySilenceCleanupFromFile("${escapedJobPath}")`);
+}
+
 export async function executeTimelineJob(
   payload: ExecuteTimelineJobInput,
 ): Promise<PremiereRunResult> {
@@ -272,10 +418,108 @@ function getNodeModules(): NodeModules {
   const nodeRequire = window.require as NodeRequire;
   return {
     fs: nodeRequire("fs") as NodeModules["fs"],
+    childProcess: nodeRequire("child_process") as NodeModules["childProcess"],
     os: nodeRequire("os") as NodeModules["os"],
     path: nodeRequire("path") as NodeModules["path"],
     process: nodeRequire("process") as NodeModules["process"],
   };
+}
+
+function detectSilenceSpans(
+  clips: PremiereAudioClipInfo[],
+  input: SilencePreviewInput,
+): SilencePreviewResult {
+  const { childProcess } = getNodeModules();
+  const spans: SilenceSpan[] = [];
+  const details: string[] = [];
+
+  clips.forEach((clip) => {
+    try {
+      const result = childProcess.spawnSync(
+        "ffmpeg",
+        [
+          "-hide_banner",
+          "-nostats",
+          "-i",
+          clip.mediaPath,
+          "-af",
+          `silencedetect=noise=${input.silenceThresholdDb}dB:d=${input.minSilenceSec}`,
+          "-f",
+          "null",
+          "-",
+        ],
+        { encoding: "utf8" },
+      );
+      const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+      if (result.error) {
+        throw result.error;
+      }
+      spans.push(...parseSilenceDetectOutput(output, clip, input.keepSilenceSec));
+    } catch (error) {
+      const output = String((error as { stdout?: string; stderr?: string }).stderr ?? (error as { stdout?: string }).stdout ?? "");
+      const parsed = parseSilenceDetectOutput(output, clip, input.keepSilenceSec);
+      if (parsed.length > 0) {
+        spans.push(...parsed);
+      } else {
+        details.push(`Silence detection failed for ${clip.name}: ${String(error)}`);
+      }
+    }
+  });
+
+  const sortedSpans = spans
+    .filter((span) => span.durationSec > Math.max(0.01, input.keepSilenceSec * 2))
+    .sort((left, right) => left.startSec - right.startSec);
+
+  return {
+    ok: true,
+    message: `Detected ${sortedSpans.length} silent timeline spans on A${input.targetAudioTrackIndex + 1}.`,
+    spans: sortedSpans,
+    details,
+  };
+}
+
+function parseSilenceDetectOutput(
+  output: string,
+  clip: PremiereAudioClipInfo,
+  keepSilenceSec: number,
+): SilenceSpan[] {
+  const spans: SilenceSpan[] = [];
+  const silenceStarts: number[] = [];
+  const lines = output.split(/\r?\n/);
+
+  lines.forEach((line) => {
+    const startMatch = /silence_start:\s*([0-9.]+)/.exec(line);
+    if (startMatch) {
+      silenceStarts.push(Number(startMatch[1]));
+      return;
+    }
+
+    const endMatch = /silence_end:\s*([0-9.]+)/.exec(line);
+    if (!endMatch || silenceStarts.length === 0) {
+      return;
+    }
+
+    const sourceStart = silenceStarts.shift() ?? 0;
+    const sourceEnd = Number(endMatch[1]);
+    const timelineStart = clip.startSec + Math.max(0, sourceStart - clip.inPointSec) + keepSilenceSec;
+    const timelineEnd = clip.startSec + Math.max(0, sourceEnd - clip.inPointSec) - keepSilenceSec;
+    const startSec = Math.max(clip.startSec, timelineStart);
+    const endSec = Math.min(clip.endSec, timelineEnd);
+
+    if (Number.isFinite(startSec) && Number.isFinite(endSec) && endSec > startSec) {
+      spans.push({
+        id: `${clip.id}-silence-${spans.length + 1}`,
+        trackIndex: clip.trackIndex,
+        sourcePath: clip.mediaPath,
+        clipName: clip.name,
+        startSec,
+        endSec,
+        durationSec: Math.round((endSec - startSec) * 100) / 100,
+      });
+    }
+  });
+
+  return spans;
 }
 
 async function ensureHostLoaded(): Promise<void> {

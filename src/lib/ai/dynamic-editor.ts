@@ -111,7 +111,7 @@ export function buildScriptBeats(
   segments.forEach((segment, segmentIndex) => {
     const segmentDuration = resolveSegmentDuration(segment, segments[segmentIndex + 1], settings);
     const chunks = splitSegmentIntoBeatText(segment.text, settings.cutBoundaryMode);
-    const weights = chunks.map((chunk) => Math.max(1, tokenize(chunk).length));
+    const weights = chunks.map((chunk) => resolveBeatWeight(chunk, settings.pacingPreset));
     const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || 1;
     let cursor = segment.startSec;
 
@@ -281,10 +281,7 @@ function resolveSegmentDuration(
 
 function splitSegmentIntoBeatText(text: string, boundaryMode: CutBoundaryMode): string[] {
   if (boundaryMode === "phrase" || boundaryMode === "ai") {
-    const phrases = text
-      .split(/(?<=[,;:])\s+|\s+(?=but|and then|then|because|while|when)\s+/i)
-      .map((part) => part.trim())
-      .filter((part) => part.length > 0);
+    const phrases = splitPhrasesWithoutLookbehind(text);
     if (phrases.length > 1) {
       return phrases;
     }
@@ -301,6 +298,54 @@ function splitSegmentIntoBeatText(text: string, boundaryMode: CutBoundaryMode): 
   }
 
   return [text.trim()].filter(Boolean);
+}
+
+function splitPhrasesWithoutLookbehind(text: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  const words = text.split(/\s+/).filter(Boolean);
+
+  words.forEach((word, index) => {
+    const normalized = word.toLowerCase().replace(/[^a-z]/g, "");
+    const startsNewPhrase =
+      index > 0 && ["but", "because", "while", "when", "then"].includes(normalized);
+
+    if (startsNewPhrase && current.trim()) {
+      parts.push(current.trim());
+      current = word;
+      return;
+    }
+
+    current = `${current} ${word}`.trim();
+
+    if (/[,;:]$/.test(word)) {
+      parts.push(current.trim());
+      current = "";
+    }
+  });
+
+  if (current.trim()) {
+    parts.push(current.trim());
+  }
+
+  return parts.filter(Boolean);
+}
+
+function resolveBeatWeight(text: string, pacingPreset: EditorPacingPreset): number {
+  const tokens = tokenize(text);
+  const wordWeight = Math.max(1, tokens.length);
+  const punctuationWeight = /[.!?]["')\]]*$/.test(text.trim()) ? 1.2 : /[,;:]$/.test(text.trim()) ? 0.8 : 1;
+  const pacingWeight =
+    pacingPreset === "social-fast"
+      ? 0.82
+      : pacingPreset === "cinematic-slow"
+        ? 1.28
+        : pacingPreset === "tutorial"
+          ? 1.1
+          : 1;
+  const emotionalWeight = inferEmotionalTone(text) === "reflective" ? 1.18 : inferEmotionalTone(text) === "urgent" ? 0.88 : 1;
+
+  return Math.max(0.75, wordWeight * punctuationWeight * pacingWeight * emotionalWeight);
 }
 
 function scoreProfileForBeat(
@@ -390,7 +435,7 @@ function inferMoodTags(tokens: string[]): string[] {
     if (["sun", "smile", "bright", "win", "happy"].includes(token)) tags.add("uplift");
     if (["screen", "diagram", "desk", "tool", "work"].includes(token)) tags.add("informative");
   });
-  return Array.from(tags.length ? tags : new Set(["neutral"]));
+  return tags.size > 0 ? Array.from(tags) : ["neutral"];
 }
 
 function inferShotScale(tokens: string[]): AssetSemanticProfile["shotScale"] {

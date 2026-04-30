@@ -1,5 +1,5 @@
 import { ScriptSegment } from "./script-parser";
-import { AiSegmentRanking } from "./ai/types";
+import { AiSegmentRanking, PlacementStrategyMode } from "./ai/types";
 import { MediaLibraryItem, normalizePath } from "./media";
 
 export interface TimelinePlannerSettings {
@@ -16,6 +16,7 @@ export interface TimelinePlannerSettings {
   rangeStartSec?: number | null;
   rangeEndSec?: number | null;
   targetSecondsPerClip?: number;
+  placementStrategyMode?: PlacementStrategyMode;
 }
 
 export interface TimelinePlacement {
@@ -140,9 +141,16 @@ export function buildTimelinePlan(
   mediaItems: MediaLibraryItem[],
   settings: TimelinePlannerSettings,
 ): TimelinePlan {
+  const placementStrategyMode = settings.placementStrategyMode ?? "ai-dynamic";
+  const usesStrictFolderOrder = placementStrategyMode === "folder-order";
+  const usesFolderOrderFallback = placementStrategyMode === "hybrid-fallback";
   const assets = mediaItems
     .slice()
-    .sort((left, right) => left.path.localeCompare(right.path))
+    .sort((left, right) =>
+      usesStrictFolderOrder || usesFolderOrderFallback
+        ? compareMediaOrder(left, right)
+        : left.path.localeCompare(right.path),
+    )
     .map<MediaCandidate>((mediaItem) => ({
       ...mediaItem,
       tokens: tokenize(mediaItem.name),
@@ -162,6 +170,7 @@ export function buildTimelinePlan(
   const aiConfidenceThreshold = settings.aiConfidenceThreshold ?? 0.42;
   const allowLowConfidenceFallback = settings.allowLowConfidenceFallback ?? true;
   const maxOverlapLayers = Math.max(1, settings.maxOverlapLayers ?? 2);
+  let nextOrderedAssetIndex = 0;
 
   segments.forEach((segment, index) => {
     const nextSegment = segments[index + 1];
@@ -220,7 +229,15 @@ export function buildTimelinePlan(
         }
       }
 
-      const aiMatch = !mediaPath
+      const orderedMatch = !mediaPath && usesStrictFolderOrder
+        ? findNextOrderedAsset(assets, assetUsageByIndex, pathsUsedInSegment, nextOrderedAssetIndex)
+        : null;
+
+      if (orderedMatch) {
+        nextOrderedAssetIndex = orderedMatch.nextCursor;
+      }
+
+      const aiMatch = !mediaPath && !orderedMatch
         ? findAiMatch(
             aiRanking,
             assets,
@@ -234,14 +251,30 @@ export function buildTimelinePlan(
             clipWindow.startSec,
           )
         : null;
-      const keywordMatch = !mediaPath
+      const keywordMatch = !mediaPath && !usesFolderOrderFallback
         ? findKeywordMatch(segment.text, assets, assetUsageByIndex, pathsUsedInSegment, index, clipWindow.startSec)
         : null;
-      const genericFallbackMatch = !mediaPath && !keywordMatch && assets.length > 0
+      const orderedFallbackMatch = !mediaPath && usesFolderOrderFallback
+        ? findNextOrderedAsset(assets, assetUsageByIndex, pathsUsedInSegment, nextOrderedAssetIndex)
+        : null;
+      if (orderedFallbackMatch) {
+        nextOrderedAssetIndex = orderedFallbackMatch.nextCursor;
+      }
+      const genericFallbackMatch = !mediaPath && !keywordMatch && !orderedFallbackMatch && assets.length > 0
         ? findReusableAsset(assets, assetUsageByIndex, pathsUsedInSegment, index, clipWindow.startSec)
         : null;
 
-      if (!mediaPath && aiMatch) {
+      if (!mediaPath && orderedMatch) {
+        strategy = "manual";
+        mediaPath = orderedMatch.asset.path;
+        mediaName = orderedMatch.asset.name;
+        mediaType = orderedMatch.asset.type;
+        aiConfidence = 1;
+        aiRationale = "Strict folder-order mode selected this media by download/creation order.";
+        aiProvider = "folder-order";
+        selectedIndex = orderedMatch.index;
+        matchedByAi += 1;
+      } else if (!mediaPath && aiMatch) {
         strategy = aiMatch.lowConfidence ? "fallback" : "ai";
         mediaPath = aiMatch.asset.path;
         mediaName = aiMatch.asset.name;
@@ -269,6 +302,18 @@ export function buildTimelinePlan(
         lowConfidence = true;
         fallbackReason = "Used lexical fallback because AI confidence was below threshold.";
         selectedIndex = keywordMatch.index;
+        matchedByFallback += 1;
+      } else if (!mediaPath && orderedFallbackMatch) {
+        strategy = "fallback";
+        mediaPath = orderedFallbackMatch.asset.path;
+        mediaName = orderedFallbackMatch.asset.name;
+        mediaType = orderedFallbackMatch.asset.type;
+        aiConfidence = aiRanking?.confidence ?? 0;
+        aiRationale = aiRanking?.rationale ?? "Hybrid mode used folder order because no strong AI match was available.";
+        aiProvider = aiRanking?.provider ?? "folder-order";
+        lowConfidence = true;
+        fallbackReason = "Used old-to-new folder order as the fallback placement strategy.";
+        selectedIndex = orderedFallbackMatch.index;
         matchedByFallback += 1;
       } else if (!mediaPath && genericFallbackMatch) {
         strategy = "fallback";
@@ -323,6 +368,7 @@ export function buildTimelinePlan(
       if (
         mediaPath &&
         aiRanking &&
+        !usesStrictFolderOrder &&
         maxOverlapLayers > 1 &&
         aiRanking.suggestedLayerCount &&
         aiRanking.suggestedLayerCount > 1
@@ -492,6 +538,44 @@ function findReusableAsset(
   });
 
   return bestMatch;
+}
+
+function findNextOrderedAsset(
+  assets: MediaCandidate[],
+  assetUsageByIndex: Map<number, AssetUsage>,
+  pathsUsedInSegment: Set<string>,
+  cursor: number,
+): { asset: MediaCandidate; index: number; nextCursor: number } | null {
+  if (assets.length === 0) {
+    return null;
+  }
+
+  for (let offset = 0; offset < assets.length; offset += 1) {
+    const index = (cursor + offset) % assets.length;
+    const asset = assets[index];
+    const used = assetUsageByIndex.has(index);
+    const usedInSegment = pathsUsedInSegment.has(normalizePath(asset.path));
+
+    if (!used && !usedInSegment) {
+      return { asset, index, nextCursor: index + 1 };
+    }
+  }
+
+  const repeatIndex = cursor % assets.length;
+  return {
+    asset: assets[repeatIndex],
+    index: repeatIndex,
+    nextCursor: repeatIndex + 1,
+  };
+}
+
+function compareMediaOrder(left: MediaLibraryItem, right: MediaLibraryItem): number {
+  return (
+    (left.sortKey ?? left.createdMs ?? left.modifiedMs ?? left.folderIndex ?? 0) -
+      (right.sortKey ?? right.createdMs ?? right.modifiedMs ?? right.folderIndex ?? 0) ||
+    (left.folderIndex ?? 0) - (right.folderIndex ?? 0) ||
+    left.path.localeCompare(right.path)
+  );
 }
 
 function tokenize(value: string): Set<string> {

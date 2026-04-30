@@ -7,6 +7,7 @@ export type MatchStyle = "literal" | "emotional" | "metaphorical" | "balanced";
 export type AssetReusePolicy = "avoid-repeat" | "allow-small-folder-repeat" | "story-continuity";
 export type VideoTrimPolicy = "full-clip" | "trim-to-beat" | "best-subspan";
 export type AnalysisDepth = "fast" | "visual-frames" | "full-ai";
+export type PlacementStrategyMode = "ai-dynamic" | "folder-order" | "hybrid-fallback";
 
 export interface AiAssetCandidate {
   id: string;

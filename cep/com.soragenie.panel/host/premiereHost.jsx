@@ -239,6 +239,51 @@ var weaveEdit = (function () {
     return stringify(segments);
   }
 
+  function getAudioClips() {
+    if (!app || !app.project || !app.project.activeSequence) {
+      return stringify([]);
+    }
+
+    var sequence = app.project.activeSequence;
+    var clips = [];
+
+    for (var trackIndex = 0; trackIndex < sequence.audioTracks.numTracks; trackIndex += 1) {
+      var track = sequence.audioTracks[trackIndex];
+      if (!track || !track.clips) {
+        continue;
+      }
+
+      for (var clipIndex = 0; clipIndex < track.clips.numItems; clipIndex += 1) {
+        var clip = track.clips[clipIndex];
+        var mediaPath = "";
+
+        try {
+          if (clip.projectItem && clip.projectItem.getMediaPath) {
+            mediaPath = normalizePath(clip.projectItem.getMediaPath());
+          }
+        } catch (error) {
+          mediaPath = "";
+        }
+
+        if (!mediaPath) {
+          continue;
+        }
+
+        clips.push({
+          id: "audio-" + (trackIndex + 1) + "-" + (clipIndex + 1),
+          trackIndex: trackIndex,
+          name: clip.name || (clip.projectItem ? clip.projectItem.name : "Audio clip"),
+          mediaPath: mediaPath,
+          startSec: Number(clip.start.seconds || 0),
+          endSec: Number(clip.end.seconds || 0),
+          inPointSec: clip.inPoint ? Number(clip.inPoint.seconds || 0) : 0
+        });
+      }
+    }
+
+    return stringify(clips);
+  }
+
   function findProjectItemByPath(projectItem, normalizedTargetPath) {
     if (!projectItem) {
       return null;
@@ -482,9 +527,75 @@ var weaveEdit = (function () {
     });
   }
 
+  function applySilenceCleanupFromFile(filePath) {
+    try {
+      var rawJob = readTextFile(filePath);
+      var job = parse(rawJob);
+      return applySilenceCleanup(job);
+    } catch (error) {
+      return stringify({
+        ok: false,
+        message: error.message || String(error),
+        markerCount: 0,
+        details: []
+      });
+    }
+  }
+
+  function applySilenceCleanup(job) {
+    if (!app || !app.project || !app.project.activeSequence) {
+      return stringify({
+        ok: false,
+        message: "Open or activate a sequence first.",
+        markerCount: 0,
+        details: []
+      });
+    }
+
+    var sequence = app.project.activeSequence;
+    var markers = sequence.markers;
+    var details = [];
+    var markerCount = 0;
+    var spans = job.spans || [];
+
+    if (!markers || !markers.createMarker) {
+      return stringify({
+        ok: false,
+        message: "This Premiere version does not expose sequence markers to the panel.",
+        markerCount: 0,
+        details: ["Detected " + spans.length + " silent spans, but could not mark them automatically."]
+      });
+    }
+
+    for (var index = 0; index < spans.length; index += 1) {
+      var span = spans[index];
+      try {
+        var marker = markers.createMarker(Number(span.startSec || 0));
+        marker.name = "Weave Edit silence";
+        marker.comments = "Silent span on A" + (Number(span.trackIndex || 0) + 1) + ": " +
+          Number(span.startSec || 0).toFixed(2) + "s - " + Number(span.endSec || 0).toFixed(2) +
+          "s. Ripple delete this range after review.";
+        if (marker.end) {
+          marker.end = makeTime(Number(span.endSec || span.startSec || 0));
+        }
+        markerCount += 1;
+      } catch (error) {
+        details.push("Could not mark silence " + (index + 1) + ": " + (error.message || String(error)));
+      }
+    }
+
+    return stringify({
+      ok: true,
+      message: "Marked " + markerCount + " silent spans for timeline cleanup. Review the markers, then ripple delete those ranges in Premiere.",
+      markerCount: markerCount,
+      details: details
+    });
+  }
+
   return {
     getStatus: getStatus,
     getTranscriptSegments: getTranscriptSegments,
+    getAudioClips: getAudioClips,
     pickFolder: selectFolderPath,
     runJob: function (rawJob) {
       try {
@@ -493,6 +604,7 @@ var weaveEdit = (function () {
         return fail(error.message || String(error));
       }
     },
-    runJobFromFile: runJobFromFile
+    runJobFromFile: runJobFromFile,
+    applySilenceCleanupFromFile: applySilenceCleanupFromFile
   };
 }());

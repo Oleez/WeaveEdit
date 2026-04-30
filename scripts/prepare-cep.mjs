@@ -1,6 +1,7 @@
 import { cp, mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { syncCepBundleToUser } from "./cep-sync-to-user.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,3 +35,11 @@ await cp(webBuildDir, outputDir, { recursive: true });
 await cp(templateDir, outputDir, { recursive: true, force: true });
 
 console.log(`Prepared CEP bundle at ${outputDir}`);
+
+const userInstall = await syncCepBundleToUser(outputDir);
+if (userInstall.installed) {
+  console.log(userInstall.message);
+  console.log("Restart Premiere Pro if it is open, then Window > Extensions > Weave Edit.");
+} else {
+  console.warn(userInstall.message);
+}
