@@ -1,4 +1,12 @@
-import { AiHealthStatus, AiModelProfile, AiScoringContext, AiSegmentRanking, AiSegmentRequest } from "./types";
+import {
+  AiAssetCandidate,
+  AiHealthStatus,
+  AiModelProfile,
+  AiScoringContext,
+  AiSegmentRanking,
+  AiSegmentRequest,
+  AssetSemanticProfile,
+} from "./types";
 
 export interface AiProvider {
   providerName: string;
@@ -7,6 +15,10 @@ export interface AiProvider {
     request: AiSegmentRequest,
     context: AiScoringContext,
   ): Promise<AiSegmentRanking>;
+  profileAsset?(
+    candidate: AiAssetCandidate,
+    context: AiScoringContext,
+  ): Promise<AssetSemanticProfile>;
   getModelProfile(context: AiScoringContext): AiModelProfile;
 }
 

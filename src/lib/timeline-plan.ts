@@ -628,6 +628,17 @@ function createClipWindows(
   settings: TimelinePlannerSettings,
   aiRanking?: AiSegmentRanking,
 ): ClipWindow[] {
+  const beatWindows = aiRanking?.beatWindows?.filter((beat) => beat.endSec > beat.startSec);
+  if (beatWindows?.length) {
+    return beatWindows.map((beatWindow, index) => ({
+      index,
+      count: beatWindows.length,
+      startSec: roundDuration(beatWindow.startSec),
+      durationSec: roundDuration(beatWindow.endSec - beatWindow.startSec),
+      text: beatWindow.text || segment.text,
+    }));
+  }
+
   const clipCount = resolveClipCount(segment, durationSec, settings, aiRanking);
   if (clipCount <= 1) {
     return [
@@ -835,10 +846,6 @@ export function resolveTimelineCoverage(
     });
 
   const keptPrimary = primaryPlacements.filter((placement) => !discardIds.has(placement.id));
-  const totalWeight = keptPrimary.reduce(
-    (sum, placement) => sum + Math.max(minReadableClipSec, placement.endSec - placement.startSec),
-    0,
-  );
   const resolvedPrimary: TimelinePlacement[] = [];
   let cursor = targetStartSec;
   let filledGapCount = 0;
@@ -846,22 +853,16 @@ export function resolveTimelineCoverage(
 
   keptPrimary.forEach((placement, index) => {
     const isLast = index === keptPrimary.length - 1;
-    const remainingSlots = keptPrimary.length - index;
-    const originalDuration = Math.max(minReadableClipSec, placement.endSec - placement.startSec);
-    const proportionalDuration = totalWeight > 0 ? (targetSpanSec * originalDuration) / totalWeight : targetSpanSec;
-    const maxEndForReadableTail = targetEndSec - Math.max(0, remainingSlots - 1) * minReadableClipSec;
-    const desiredEnd = isLast
-      ? targetEndSec
-      : Math.min(maxEndForReadableTail, cursor + Math.max(minReadableClipSec, proportionalDuration));
-    const nextEnd = quantizeToFrame(Math.max(cursor + 1 / frameRate, desiredEnd), frameRate);
-    const startSec = quantizeToFrame(cursor, frameRate);
-    const endSec = isLast ? targetEndSec : Math.min(targetEndSec, nextEnd);
+    const originalStart = quantizeToFrame(Math.max(targetStartSec, placement.startSec), frameRate);
+    const startSec = originalStart > cursor + 1 / frameRate ? cursor : Math.max(cursor, originalStart);
+    const desiredEnd = isLast ? targetEndSec : Math.max(placement.endSec, startSec + 1 / frameRate);
+    const endSec = quantizeToFrame(Math.min(targetEndSec, Math.max(startSec + 1 / frameRate, desiredEnd)), frameRate);
 
     if (Math.abs(placement.startSec - startSec) > 1 / frameRate || Math.abs(placement.endSec - endSec) > 1 / frameRate) {
       adjustedPlacementCount += 1;
     }
 
-    if (placement.startSec > cursor + 1 / frameRate) {
+    if (originalStart > cursor + 1 / frameRate) {
       filledGapCount += 1;
     }
 

@@ -15,14 +15,25 @@ import {
   listMediaFiles,
   pickFolder,
 } from "@/lib/cep";
-import { detectVideoTooling, hydrateAiCandidates } from "@/lib/ai/video-preprocessing";
-import { checkAiProviders, rankSegmentsWithAi } from "@/lib/ai/router";
+import { detectVideoTooling, indexMediaLibraryForAi } from "@/lib/ai/video-preprocessing";
+import { checkAiProviders, profileAssetsWithAi } from "@/lib/ai/router";
 import {
+  DEFAULT_DYNAMIC_EDITOR_SETTINGS,
+  buildDynamicEditorResult,
+  createFallbackAssetProfile,
+} from "@/lib/ai/dynamic-editor";
+import {
+  AnalysisDepth,
+  AssetReusePolicy,
+  CutBoundaryMode,
   AiHealthStatus,
   AiMode,
   AiScoringContext,
   AiSegmentRanking,
-  AiSegmentRequest,
+  DynamicEditorSettings,
+  EditorPacingPreset,
+  MatchStyle,
+  VideoTrimPolicy,
 } from "@/lib/ai/types";
 import { ScriptSegment, formatSeconds, parseTimestampScript } from "@/lib/script-parser";
 import {
@@ -54,6 +65,15 @@ interface StoredSettings {
   ollamaModel: string;
   geminiModel: string;
   aiConfidenceThreshold: number;
+  pacingPreset: EditorPacingPreset;
+  cutBoundaryMode: CutBoundaryMode;
+  matchStyle: MatchStyle;
+  assetReusePolicy: AssetReusePolicy;
+  videoTrimPolicy: VideoTrimPolicy;
+  analysisDepth: AnalysisDepth;
+  candidatePoolSize: number;
+  rerankDepth: number;
+  averageShotLengthSec: number;
 }
 
 interface WorkingPlan {
@@ -82,6 +102,15 @@ const defaultSettings: StoredSettings = {
   ollamaModel: "gemma4:e4b",
   geminiModel: "gemma-4-26b-a4b-it",
   aiConfidenceThreshold: 0.42,
+  pacingPreset: DEFAULT_DYNAMIC_EDITOR_SETTINGS.pacingPreset,
+  cutBoundaryMode: DEFAULT_DYNAMIC_EDITOR_SETTINGS.cutBoundaryMode,
+  matchStyle: DEFAULT_DYNAMIC_EDITOR_SETTINGS.matchStyle,
+  assetReusePolicy: DEFAULT_DYNAMIC_EDITOR_SETTINGS.assetReusePolicy,
+  videoTrimPolicy: DEFAULT_DYNAMIC_EDITOR_SETTINGS.videoTrimPolicy,
+  analysisDepth: DEFAULT_DYNAMIC_EDITOR_SETTINGS.analysisDepth,
+  candidatePoolSize: DEFAULT_DYNAMIC_EDITOR_SETTINGS.candidatePoolSize,
+  rerankDepth: DEFAULT_DYNAMIC_EDITOR_SETTINGS.rerankDepth,
+  averageShotLengthSec: DEFAULT_DYNAMIC_EDITOR_SETTINGS.averageShotLengthSec,
 };
 
 const Index = () => {
@@ -109,6 +138,15 @@ const Index = () => {
   const [aiConfidenceThreshold, setAiConfidenceThreshold] = useState(
     defaultSettings.aiConfidenceThreshold,
   );
+  const [pacingPreset, setPacingPreset] = useState<EditorPacingPreset>(defaultSettings.pacingPreset);
+  const [cutBoundaryMode, setCutBoundaryMode] = useState<CutBoundaryMode>(defaultSettings.cutBoundaryMode);
+  const [matchStyle, setMatchStyle] = useState<MatchStyle>(defaultSettings.matchStyle);
+  const [assetReusePolicy, setAssetReusePolicy] = useState<AssetReusePolicy>(defaultSettings.assetReusePolicy);
+  const [videoTrimPolicy, setVideoTrimPolicy] = useState<VideoTrimPolicy>(defaultSettings.videoTrimPolicy);
+  const [analysisDepth, setAnalysisDepth] = useState<AnalysisDepth>(defaultSettings.analysisDepth);
+  const [candidatePoolSize, setCandidatePoolSize] = useState(defaultSettings.candidatePoolSize);
+  const [rerankDepth, setRerankDepth] = useState(defaultSettings.rerankDepth);
+  const [averageShotLengthSec, setAverageShotLengthSec] = useState(defaultSettings.averageShotLengthSec);
   const [hostStatus, setHostStatus] = useState<PremiereStatus | null>(null);
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
@@ -118,6 +156,13 @@ const Index = () => {
   const [aiHealth, setAiHealth] = useState<AiHealthStatus[]>([]);
   const [aiErrors, setAiErrors] = useState<string[]>([]);
   const [aiCacheHits, setAiCacheHits] = useState(0);
+  const [dynamicMetrics, setDynamicMetrics] = useState({
+    indexedAssets: 0,
+    profiledAssets: 0,
+    beatCount: 0,
+    assignedBeats: 0,
+    reusedAssignments: 0,
+  });
   const [aiRankingsBySegmentId, setAiRankingsBySegmentId] = useState<
     Record<string, AiSegmentRanking>
   >({});
@@ -196,6 +241,15 @@ const Index = () => {
     setAiConfidenceThreshold(
       stored.aiConfidenceThreshold ?? defaultSettings.aiConfidenceThreshold,
     );
+    setPacingPreset(stored.pacingPreset ?? defaultSettings.pacingPreset);
+    setCutBoundaryMode(stored.cutBoundaryMode ?? defaultSettings.cutBoundaryMode);
+    setMatchStyle(stored.matchStyle ?? defaultSettings.matchStyle);
+    setAssetReusePolicy(stored.assetReusePolicy ?? defaultSettings.assetReusePolicy);
+    setVideoTrimPolicy(stored.videoTrimPolicy ?? defaultSettings.videoTrimPolicy);
+    setAnalysisDepth(stored.analysisDepth ?? defaultSettings.analysisDepth);
+    setCandidatePoolSize(stored.candidatePoolSize ?? defaultSettings.candidatePoolSize);
+    setRerankDepth(stored.rerankDepth ?? defaultSettings.rerankDepth);
+    setAverageShotLengthSec(clampDurationInput(stored.averageShotLengthSec ?? defaultSettings.averageShotLengthSec, 1));
   }, []);
 
   useEffect(() => {
@@ -217,6 +271,15 @@ const Index = () => {
         ollamaModel,
         geminiModel,
         aiConfidenceThreshold,
+        pacingPreset,
+        cutBoundaryMode,
+        matchStyle,
+        assetReusePolicy,
+        videoTrimPolicy,
+        analysisDepth,
+        candidatePoolSize,
+        rerankDepth,
+        averageShotLengthSec,
       } satisfies StoredSettings),
     );
   }, [
@@ -235,6 +298,15 @@ const Index = () => {
     ollamaModel,
     geminiModel,
     aiConfidenceThreshold,
+    pacingPreset,
+    cutBoundaryMode,
+    matchStyle,
+    assetReusePolicy,
+    videoTrimPolicy,
+    analysisDepth,
+    candidatePoolSize,
+    rerankDepth,
+    averageShotLengthSec,
   ]);
 
   useEffect(() => {
@@ -279,14 +351,15 @@ const Index = () => {
       manualOverridesBySegmentId,
       aiConfidenceThreshold,
       allowLowConfidenceFallback: true,
-      maxOverlapLayers: 2,
+      maxOverlapLayers: dynamicEditorSettings.pacingPreset === "cinematic-slow" ? 1 : 2,
       frameRate: hostStatus?.frameRate ?? 30,
       sequenceEndSec: hostStatus?.range.sequenceEndSec,
-      targetSecondsPerClip: Math.max(minDurationSec, Math.min(maxDurationSec, 6)),
+      targetSecondsPerClip: dynamicEditorSettings.averageShotLengthSec,
     });
   }, [
     aiConfidenceThreshold,
     aiRankingsBySegmentId,
+    dynamicEditorSettings,
     hostStatus?.frameRate,
     hostStatus?.range.sequenceEndSec,
     mediaItems,
@@ -322,7 +395,7 @@ const Index = () => {
         frameRate: hostStatus?.frameRate ?? 30,
         rangeStartSec: range.inSec,
         rangeEndSec: range.outSec,
-        targetSecondsPerClip: Math.max(minDurationSec, Math.min(maxDurationSec, 6)),
+        targetSecondsPerClip: dynamicEditorSettings.averageShotLengthSec,
       });
       return {
         mode: "sequence_in_out",
@@ -359,7 +432,7 @@ const Index = () => {
       rangeEndSec: hostStatus?.range.sequenceEndSec ?? 0,
       coverage: basePlan.coverage,
     };
-  }, [appendAtTrackEnd, basePlan, hostStatus, maxDurationSec, minDurationSec, useWholeSequenceFallback]);
+  }, [appendAtTrackEnd, basePlan, dynamicEditorSettings.averageShotLengthSec, hostStatus, maxDurationSec, minDurationSec, useWholeSequenceFallback]);
 
   const previewStats = useMemo(() => {
     const placements = effectivePlan?.placements ?? [];
@@ -423,6 +496,34 @@ const Index = () => {
   const geminiApiKey = getEnvironmentVariable("GEMINI_API_KEY");
   const videoTooling = useMemo(() => detectVideoTooling(), []);
   const canChooseFolder = hasNativeFolderPicker();
+  const dynamicEditorSettings = useMemo<DynamicEditorSettings>(
+    () => ({
+      pacingPreset,
+      cutBoundaryMode,
+      matchStyle,
+      assetReusePolicy,
+      videoTrimPolicy,
+      analysisDepth,
+      candidatePoolSize: Math.max(10, Math.round(candidatePoolSize)),
+      rerankDepth: Math.max(3, Math.round(rerankDepth)),
+      averageShotLengthSec: clampDurationInput(averageShotLengthSec, 1),
+      minClipDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
+      maxClipDurationSec: Math.max(minDurationSec, maxDurationSec),
+    }),
+    [
+      analysisDepth,
+      assetReusePolicy,
+      averageShotLengthSec,
+      candidatePoolSize,
+      cutBoundaryMode,
+      matchStyle,
+      maxDurationSec,
+      minDurationSec,
+      pacingPreset,
+      rerankDepth,
+      videoTrimPolicy,
+    ],
+  );
   const aiContext = useMemo<AiScoringContext>(
     () => ({
       ollamaBaseUrl,
@@ -460,68 +561,56 @@ const Index = () => {
       return;
     }
 
-    setAiBusyMessage("Ranking segment assets");
+    setAiBusyMessage("Indexing full media library");
     setAiErrors([]);
     setAiCacheHits(0);
+    setDynamicMetrics({
+      indexedAssets: 0,
+      profiledAssets: 0,
+      beatCount: 0,
+      assignedBeats: 0,
+      reusedAssignments: 0,
+    });
 
     try {
-      const preprocessingWarnings: string[] = [];
       const segments = parsedScriptState.result.segments;
-      const fullScriptContext = buildFullScriptContext(segments);
-      const segmentRequests: AiSegmentRequest[] = [];
-      let cacheHits = 0;
-
-      // Sequential prep avoids dozens of parallel ffmpeg/ffprobe calls freezing the panel.
-      for (let i = 0; i < segments.length; i += 1) {
-        const segment = segments[i];
-        setAiBusyMessage(`Preparing media for segment ${i + 1}/${segments.length}`);
-        const shortlisted = shortlistCandidates(segment.text, mediaItems, 30);
-        const hydrated = await hydrateAiCandidates(
-          shortlisted.map((item) => ({
-            id: normalizePath(item.path),
-            path: item.path,
-            name: getFileName(item.path),
-            mediaType: item.type,
-          })),
-        );
-        cacheHits += hydrated.cacheHits;
-        preprocessingWarnings.push(...hydrated.warnings);
-
-        segmentRequests.push({
-          segmentId: segment.id,
-          text: segment.text,
-          startSec: segment.startSec,
-          endSec: segment.endSec,
-          segmentIndex: i,
-          segmentTotal: segments.length,
-          previousText: segments[i - 1]?.text,
-          nextText: segments[i + 1]?.text,
-          fullScriptContext,
-          wordCount: segment.wordCount,
-          sentenceCount: segment.sentenceCount,
-          sentenceComplete: segment.sentenceComplete,
-          maxRecommendations: 6,
-          minDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
-          maxDurationSec: Math.max(minDurationSec, maxDurationSec),
-          customInstructions,
-          allowOverlap: true,
-          maxOverlapLayers: 2,
-          transcriptSource: transcriptSourceMode,
-          candidates: hydrated.candidates,
-        });
-      }
-
-      const ranked = await rankSegmentsWithAi(segmentRequests, aiMode, aiContext, (done, total) => {
-        setAiBusyMessage(`AI ranking segment ${done}/${total}`);
+      const indexed = await indexMediaLibraryForAi(mediaItems, (done, total) => {
+        setAiBusyMessage(`Indexing library asset ${done}/${total}`);
       });
-      setAiRankingsBySegmentId(ranked.rankingsBySegmentId);
-      setAiCacheHits(cacheHits);
-      const fallbackWarnings = segmentRequests.flatMap((request) =>
-        request.candidates
-          .filter((candidate) => candidate.mediaType === "video" && !candidate.visualPaths?.length)
-          .map((candidate) => `Limited video analysis for ${candidate.name}; extracted frames were unavailable.`),
+      setAiCacheHits(indexed.cacheHits);
+
+      setAiBusyMessage("Profiling media semantics");
+      const profilePool = indexed.candidates.slice(0, dynamicEditorSettings.candidatePoolSize);
+      const profiled = dynamicEditorSettings.analysisDepth === "fast"
+        ? {
+            profiles: profilePool.map((candidate) => createFallbackAssetProfile(candidate)),
+            providersUsed: [],
+            errors: [],
+          }
+        : await profileAssetsWithAi(profilePool, aiMode, aiContext, (done, total) => {
+            setAiBusyMessage(`Profiling media asset ${done}/${total}`);
+          });
+      const profiles = profiled.profiles;
+
+      setAiBusyMessage("Analyzing script beats and assigning media");
+      const dynamicResult = buildDynamicEditorResult(segments, mediaItems, profiles, dynamicEditorSettings);
+      setAiRankingsBySegmentId(dynamicResult.rankingsBySegmentId);
+      setDynamicMetrics(dynamicResult.metrics);
+
+      const fallbackWarnings = indexed.candidates
+        .filter((candidate) => candidate.mediaType === "video" && !candidate.visualPaths?.length)
+        .map((candidate) => `Limited video analysis for ${candidate.name}; extracted frames were unavailable.`);
+      const cappedWarning = indexed.candidates.length > profilePool.length
+        ? [`Profiled ${profilePool.length}/${indexed.candidates.length} assets based on candidate pool size.`]
+        : [];
+      setAiErrors(
+        [
+          ...indexed.warnings,
+          ...fallbackWarnings,
+          ...profiled.errors,
+          ...cappedWarning,
+        ],
       );
-      setAiErrors([...preprocessingWarnings, ...fallbackWarnings, ...ranked.errors]);
     } catch (error) {
       setAiErrors([String(error)]);
     } finally {
@@ -955,6 +1044,135 @@ const Index = () => {
                       className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
                     />
                   </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Pacing preset
+                    </span>
+                    <select
+                      value={pacingPreset}
+                      onChange={(event) => setPacingPreset(event.target.value as EditorPacingPreset)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    >
+                      <option value="documentary">Documentary</option>
+                      <option value="social-fast">Social fast cut</option>
+                      <option value="cinematic-slow">Cinematic slow</option>
+                      <option value="tutorial">Tutorial / explainer</option>
+                    </select>
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Cut boundary
+                    </span>
+                    <select
+                      value={cutBoundaryMode}
+                      onChange={(event) => setCutBoundaryMode(event.target.value as CutBoundaryMode)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    >
+                      <option value="ai">AI decides</option>
+                      <option value="phrase">Phrase</option>
+                      <option value="sentence">Sentence</option>
+                      <option value="beat">Paragraph / beat</option>
+                    </select>
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Match style
+                    </span>
+                    <select
+                      value={matchStyle}
+                      onChange={(event) => setMatchStyle(event.target.value as MatchStyle)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    >
+                      <option value="balanced">Balanced</option>
+                      <option value="literal">Literal</option>
+                      <option value="emotional">Emotional</option>
+                      <option value="metaphorical">Metaphorical</option>
+                    </select>
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Asset reuse
+                    </span>
+                    <select
+                      value={assetReusePolicy}
+                      onChange={(event) => setAssetReusePolicy(event.target.value as AssetReusePolicy)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    >
+                      <option value="avoid-repeat">Avoid repeat</option>
+                      <option value="allow-small-folder-repeat">Allow repeat for small folders</option>
+                      <option value="story-continuity">Story continuity reuse</option>
+                    </select>
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Video trim policy
+                    </span>
+                    <select
+                      value={videoTrimPolicy}
+                      onChange={(event) => setVideoTrimPolicy(event.target.value as VideoTrimPolicy)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    >
+                      <option value="trim-to-beat">Trim to beat</option>
+                      <option value="full-clip">Use full clip when possible</option>
+                      <option value="best-subspan">Best source subspan</option>
+                    </select>
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Analysis depth
+                    </span>
+                    <select
+                      value={analysisDepth}
+                      onChange={(event) => setAnalysisDepth(event.target.value as AnalysisDepth)}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    >
+                      <option value="fast">Fast metadata</option>
+                      <option value="visual-frames">Visual frames</option>
+                      <option value="full-ai">Full AI review</option>
+                    </select>
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Candidate pool size
+                    </span>
+                    <input
+                      type="number"
+                      min={10}
+                      max={500}
+                      step={10}
+                      value={candidatePoolSize}
+                      onChange={(event) => setCandidatePoolSize(Math.max(10, Number(event.target.value)))}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Average shot length
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      step={0.5}
+                      value={averageShotLengthSec}
+                      onChange={(event) => setAverageShotLengthSec(clampDurationInput(Number(event.target.value), 1))}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
+                  <label className="text-sm">
+                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                      Rerank depth
+                    </span>
+                    <input
+                      type="number"
+                      min={3}
+                      max={50}
+                      step={1}
+                      value={rerankDepth}
+                      onChange={(event) => setRerankDepth(Math.max(3, Number(event.target.value)))}
+                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    />
+                  </label>
                 </div>
                 <label className="mt-4 block text-sm">
                   <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
@@ -1038,11 +1256,11 @@ const Index = () => {
                 />
                 <StatusCard
                   label="Timing engine"
-                  value="AI and heuristic reviewers propose duration plus sequential clip count; min/max only clamp outliers."
+                  value="Dynamic editor builds script beats first, then preserves beat boundaries before no-gap repair."
                 />
                 <StatusCard
-                  label="Overlap policy"
-                  value="Long segments can split into multiple same-track clips; overlays are reserved for simultaneous coverage."
+                  label="Media review"
+                  value="The full folder is indexed before assignment; semantic profiles drive literal and emotional matching."
                 />
               </div>
               {!appendAtTrackEnd && !hasMeaningfulInOut && !useWholeSequenceFallback ? (
@@ -1122,6 +1340,10 @@ const Index = () => {
                 <StatCard label="Removed slivers" value={(effectivePlan?.coverage.discardedSliverCount ?? 0).toString()} />
                 <StatCard label="Reused media" value={(effectivePlan?.coverage.reusedAssetPlacements ?? 0).toString()} />
                 <StatCard label="Cached reviews" value={aiCacheHits.toString()} />
+                <StatCard label="Indexed assets" value={dynamicMetrics.indexedAssets.toString()} />
+                <StatCard label="Profiled assets" value={dynamicMetrics.profiledAssets.toString()} />
+                <StatCard label="Script beats" value={dynamicMetrics.beatCount.toString()} />
+                <StatCard label="Assigned beats" value={dynamicMetrics.assignedBeats.toString()} />
               </div>
               <div className="rounded-3xl border border-border/70 bg-background/60 p-4 text-sm text-muted-foreground">
                 {effectivePlan?.mode === "append"

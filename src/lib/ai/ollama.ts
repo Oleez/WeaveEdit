@@ -6,7 +6,9 @@ import {
   AiScoringContext,
   AiSegmentRanking,
   AiSegmentRequest,
+  AssetSemanticProfile,
 } from "./types";
+import { normalizePath } from "../media";
 
 interface OllamaTagResponse {
   models?: Array<{ name: string }>;
@@ -103,6 +105,63 @@ export class OllamaAiProvider implements AiProvider {
           : undefined,
     };
   }
+
+  async profileAsset(
+    candidate: AiAssetCandidate,
+    context: AiScoringContext,
+  ): Promise<AssetSemanticProfile> {
+    const timeoutMs = context.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const prompt = createAssetProfilePrompt(candidate);
+    const images = readVisualInputs(candidate.visualPaths);
+    const response = await fetchWithTimeout(
+      `${normalizeBaseUrl(context.ollamaBaseUrl)}/api/generate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: context.ollamaModel,
+          prompt,
+          images,
+          stream: false,
+          options: { temperature: 0.1 },
+        }),
+      },
+      timeoutMs,
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const payload = (await response.json()) as OllamaGenerateResponse;
+    const parsed = parseAssetProfileResponse(payload.response ?? "");
+
+    return {
+      id: candidate.id,
+      path: normalizePath(candidate.path),
+      name: candidate.name,
+      mediaType: candidate.mediaType,
+      candidate,
+      caption: parsed.caption,
+      tags: parsed.tags,
+      moodTags: parsed.moodTags,
+      entities: parsed.entities,
+      shotScale: parsed.shotScale,
+      motionEnergy: parsed.motionEnergy,
+      useCases: parsed.useCases,
+      searchText: [
+        candidate.name,
+        candidate.descriptor,
+        parsed.caption,
+        parsed.tags.join(" "),
+        parsed.moodTags.join(" "),
+        parsed.entities.join(" "),
+        parsed.useCases.join(" "),
+      ].filter(Boolean).join(" "),
+      confidence: parsed.confidence,
+      provider: this.providerName,
+    };
+  }
 }
 
 async function scoreCandidate(
@@ -185,6 +244,24 @@ function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCand
     .join("\n");
 }
 
+function createAssetProfilePrompt(candidate: AiAssetCandidate): string {
+  return [
+    "You are profiling a media asset for an automated B-roll video editor.",
+    "Use attached frames when available. Identify what a human editor would use this for.",
+    'Return strict JSON only with shape: {"caption":"one sentence","tags":["..."],"moodTags":["..."],"entities":["..."],"shotScale":"wide|medium|close|detail|unknown","motionEnergy":"static|gentle|active|high|unknown","useCases":["..."],"confidence":0.0}',
+    `Asset id: ${candidate.id}`,
+    `Asset name: ${candidate.name}`,
+    `Asset type: ${candidate.mediaType}`,
+    candidate.descriptor ? `Technical descriptor: ${candidate.descriptor}` : "",
+    candidate.durationSec ? `Duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
+    candidate.sampleTimestampsSec?.length
+      ? `Video sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function parseCandidateResponse(raw: string): { score: number; rationale: string } {
   const parsed = safeJsonParse(extractJsonObject(raw)) as
     | {
@@ -204,6 +281,46 @@ function parseCandidateResponse(raw: string): { score: number; rationale: string
     score: Number(parsed.score ?? 0),
     rationale: String(parsed.rationale ?? "Relevant to script context."),
   };
+}
+
+function parseAssetProfileResponse(raw: string): Omit<AssetSemanticProfile, "id" | "path" | "name" | "mediaType" | "candidate" | "searchText" | "provider"> {
+  const parsed = safeJsonParse(extractJsonObject(raw)) as
+    | {
+        caption?: string;
+        tags?: string[];
+        moodTags?: string[];
+        entities?: string[];
+        shotScale?: AssetSemanticProfile["shotScale"];
+        motionEnergy?: AssetSemanticProfile["motionEnergy"];
+        useCases?: string[];
+        confidence?: number;
+      }
+    | null;
+
+  return {
+    caption: String(parsed?.caption ?? "Visual asset for B-roll coverage."),
+    tags: normalizeStringArray(parsed?.tags, 12),
+    moodTags: normalizeStringArray(parsed?.moodTags, 8),
+    entities: normalizeStringArray(parsed?.entities, 8),
+    shotScale: normalizeShotScale(parsed?.shotScale),
+    motionEnergy: normalizeMotionEnergy(parsed?.motionEnergy),
+    useCases: normalizeStringArray(parsed?.useCases, 8),
+    confidence: clampScore(Number(parsed?.confidence ?? 0.6)),
+  };
+}
+
+function normalizeStringArray(value: unknown, limit: number): string[] {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry).trim()).filter(Boolean).slice(0, limit)
+    : [];
+}
+
+function normalizeShotScale(value: unknown): AssetSemanticProfile["shotScale"] {
+  return value === "wide" || value === "medium" || value === "close" || value === "detail" ? value : "unknown";
+}
+
+function normalizeMotionEnergy(value: unknown): AssetSemanticProfile["motionEnergy"] {
+  return value === "static" || value === "gentle" || value === "active" || value === "high" ? value : "unknown";
 }
 
 async function suggestEditPlan(

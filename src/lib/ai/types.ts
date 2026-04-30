@@ -1,6 +1,12 @@
 import { MediaType } from "../media";
 
 export type AiMode = "off" | "local" | "hybrid";
+export type EditorPacingPreset = "documentary" | "social-fast" | "cinematic-slow" | "tutorial";
+export type CutBoundaryMode = "phrase" | "sentence" | "beat" | "ai";
+export type MatchStyle = "literal" | "emotional" | "metaphorical" | "balanced";
+export type AssetReusePolicy = "avoid-repeat" | "allow-small-folder-repeat" | "story-continuity";
+export type VideoTrimPolicy = "full-clip" | "trim-to-beat" | "best-subspan";
+export type AnalysisDepth = "fast" | "visual-frames" | "full-ai";
 
 export interface AiAssetCandidate {
   id: string;
@@ -11,6 +17,77 @@ export interface AiAssetCandidate {
   durationSec?: number;
   sampleTimestampsSec?: number[];
   visualPaths?: string[];
+}
+
+export interface AssetSemanticProfile {
+  id: string;
+  path: string;
+  name: string;
+  mediaType: MediaType;
+  candidate: AiAssetCandidate;
+  caption: string;
+  tags: string[];
+  moodTags: string[];
+  entities: string[];
+  shotScale: "wide" | "medium" | "close" | "detail" | "unknown";
+  motionEnergy: "static" | "gentle" | "active" | "high" | "unknown";
+  useCases: string[];
+  searchText: string;
+  confidence: number;
+  provider: string;
+}
+
+export interface ScriptBeat {
+  id: string;
+  segmentId: string;
+  segmentIndex: number;
+  beatIndex: number;
+  startSec: number;
+  endSec: number;
+  text: string;
+  boundary: CutBoundaryMode;
+  emotionalTone: string;
+  keywords: string[];
+  pacing: "slow" | "medium" | "fast";
+  matchStyle: MatchStyle;
+  minDurationSec: number;
+  maxDurationSec: number;
+}
+
+export interface DynamicEditorSettings {
+  pacingPreset: EditorPacingPreset;
+  cutBoundaryMode: CutBoundaryMode;
+  matchStyle: MatchStyle;
+  assetReusePolicy: AssetReusePolicy;
+  videoTrimPolicy: VideoTrimPolicy;
+  analysisDepth: AnalysisDepth;
+  candidatePoolSize: number;
+  rerankDepth: number;
+  averageShotLengthSec: number;
+  minClipDurationSec: number;
+  maxClipDurationSec: number;
+}
+
+export interface DynamicAssignment {
+  beat: ScriptBeat;
+  profile: AssetSemanticProfile | null;
+  score: number;
+  rationale: string;
+  reused: boolean;
+}
+
+export interface DynamicEditorResult {
+  profiles: AssetSemanticProfile[];
+  beats: ScriptBeat[];
+  assignments: DynamicAssignment[];
+  rankingsBySegmentId: Record<string, AiSegmentRanking>;
+  metrics: {
+    indexedAssets: number;
+    profiledAssets: number;
+    beatCount: number;
+    assignedBeats: number;
+    reusedAssignments: number;
+  };
 }
 
 export interface AiSegmentRequest {
@@ -57,6 +134,16 @@ export interface AiSegmentRanking {
   coverageNotes?: string;
   reviewerNotes?: string[];
   lowConfidenceReason?: string;
+  beatWindows?: AiBeatWindow[];
+}
+
+export interface AiBeatWindow {
+  id: string;
+  startSec: number;
+  endSec: number;
+  text: string;
+  emotionalTone?: string;
+  pacing?: "slow" | "medium" | "fast";
 }
 
 export interface AiHealthStatus {

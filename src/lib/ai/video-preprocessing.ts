@@ -1,5 +1,5 @@
 import { AiAssetCandidate } from "./types";
-import { getFileName, normalizePath } from "../media";
+import { MediaLibraryItem, getFileName, normalizePath } from "../media";
 
 interface NodeRequire {
   (moduleName: string): unknown;
@@ -35,6 +35,10 @@ export interface HydrateCandidatesResult {
   warnings: string[];
   tooling: VideoToolingStatus;
   cacheHits: number;
+}
+
+export interface LibraryIndexResult extends HydrateCandidatesResult {
+  indexedCount: number;
 }
 
 interface CachedHydration {
@@ -111,6 +115,39 @@ export async function hydrateAiCandidates(
   }
 
   return { candidates: enriched, warnings, tooling, cacheHits };
+}
+
+export async function indexMediaLibraryForAi(
+  mediaItems: MediaLibraryItem[],
+  onProgress?: (done: number, total: number) => void,
+): Promise<LibraryIndexResult> {
+  const candidates = mediaItems.map<AiAssetCandidate>((item) => ({
+    id: normalizePath(item.path),
+    path: item.path,
+    name: getFileName(item.path),
+    mediaType: item.type,
+  }));
+  const hydrated: AiAssetCandidate[] = [];
+  const warnings: string[] = [];
+  let cacheHits = 0;
+  let tooling = detectVideoTooling();
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const result = await hydrateAiCandidates([candidates[index]]);
+    hydrated.push(...result.candidates);
+    warnings.push(...result.warnings);
+    cacheHits += result.cacheHits;
+    tooling = result.tooling;
+    onProgress?.(index + 1, candidates.length);
+  }
+
+  return {
+    candidates: hydrated,
+    warnings,
+    tooling,
+    cacheHits,
+    indexedCount: hydrated.length,
+  };
 }
 
 function buildHydrationCacheKey(candidate: AiAssetCandidate, tooling: VideoToolingStatus): string {

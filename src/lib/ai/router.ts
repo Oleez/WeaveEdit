@@ -6,10 +6,13 @@ import {
   AiHealthStatus,
   AiMode,
   AiRankedAsset,
+  AiAssetCandidate,
   AiScoringContext,
   AiSegmentRanking,
   AiSegmentRequest,
+  AssetSemanticProfile,
 } from "./types";
+import { createFallbackAssetProfile } from "./dynamic-editor";
 
 const ollamaProvider = new OllamaAiProvider();
 const geminiProvider = new GeminiAiProvider();
@@ -82,6 +85,44 @@ export async function checkAiProviders(
 
   const checks = resolveProviderOrder(mode, context).map((provider) => provider.healthCheck(context));
   return Promise.all(checks);
+}
+
+export async function profileAssetsWithAi(
+  candidates: AiAssetCandidate[],
+  mode: AiMode,
+  context: AiScoringContext,
+  onAssetProgress?: (assetIndex: number, assetTotal: number) => void,
+): Promise<{ profiles: AssetSemanticProfile[]; providersUsed: string[]; errors: string[] }> {
+  const providers = resolveProviderOrder(mode, context).filter((provider) => provider.profileAsset);
+  const providersUsed = new Set<string>();
+  const errors: string[] = [];
+  const profiles: AssetSemanticProfile[] = [];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    onAssetProgress?.(index + 1, candidates.length);
+    let profile: AssetSemanticProfile | null = null;
+
+    for (const provider of providers) {
+      try {
+        profile = await provider.profileAsset?.(candidate, context) ?? null;
+        if (profile) {
+          providersUsed.add(provider.providerName);
+          break;
+        }
+      } catch (error) {
+        errors.push(`${provider.providerName}:profile:${candidate.id}: ${String(error)}`);
+      }
+    }
+
+    profiles.push(profile ?? createFallbackAssetProfile(candidate));
+  }
+
+  return {
+    profiles,
+    providersUsed: Array.from(providersUsed),
+    errors,
+  };
 }
 
 function resolveProviderOrder(mode: AiMode, context: AiScoringContext): AiProvider[] {

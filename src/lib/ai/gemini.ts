@@ -6,7 +6,9 @@ import {
   AiScoringContext,
   AiSegmentRanking,
   AiSegmentRequest,
+  AssetSemanticProfile,
 } from "./types";
+import { normalizePath } from "../media";
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
@@ -98,6 +100,45 @@ export class GeminiAiProvider implements AiProvider {
         (rankedAssets[0]?.score ?? 0) < 0.55
           ? "AI confidence is below the editorial threshold, so placement should be reviewed."
           : undefined,
+    };
+  }
+
+  async profileAsset(
+    candidate: AiAssetCandidate,
+    context: AiScoringContext,
+  ): Promise<AssetSemanticProfile> {
+    if (!context.geminiApiKey) {
+      throw new Error("Missing GEMINI_API_KEY in environment.");
+    }
+
+    const parts: GeminiPart[] = [{ text: createAssetProfilePrompt(candidate) }, ...createInlineImageParts(candidate)];
+    const text = await this.generate(context, parts);
+    const parsed = parseAssetProfileResponse(text);
+
+    return {
+      id: candidate.id,
+      path: normalizePath(candidate.path),
+      name: candidate.name,
+      mediaType: candidate.mediaType,
+      candidate,
+      caption: parsed.caption,
+      tags: parsed.tags,
+      moodTags: parsed.moodTags,
+      entities: parsed.entities,
+      shotScale: parsed.shotScale,
+      motionEnergy: parsed.motionEnergy,
+      useCases: parsed.useCases,
+      searchText: [
+        candidate.name,
+        candidate.descriptor,
+        parsed.caption,
+        parsed.tags.join(" "),
+        parsed.moodTags.join(" "),
+        parsed.entities.join(" "),
+        parsed.useCases.join(" "),
+      ].filter(Boolean).join(" "),
+      confidence: parsed.confidence,
+      provider: this.providerName,
     };
   }
 
@@ -229,6 +270,24 @@ function createEditPlanPrompt(
     .join("\n");
 }
 
+function createAssetProfilePrompt(candidate: AiAssetCandidate): string {
+  return [
+    "You are profiling a media asset for an automated B-roll video editor.",
+    'Return strict JSON only with shape: {"caption":"one sentence","tags":["..."],"moodTags":["..."],"entities":["..."],"shotScale":"wide|medium|close|detail|unknown","motionEnergy":"static|gentle|active|high|unknown","useCases":["..."],"confidence":0.0}',
+    `Asset id: ${candidate.id}`,
+    `Asset name: ${candidate.name}`,
+    `Asset type: ${candidate.mediaType}`,
+    candidate.descriptor ? `Technical descriptor: ${candidate.descriptor}` : "",
+    candidate.durationSec ? `Duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
+    candidate.sampleTimestampsSec?.length
+      ? `Video sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
+      : "",
+    "Describe what this asset visually contains, its emotional tone, and where an editor should use it.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function parseCandidateResponse(
   raw: string,
 ): { score: number; rationale: string } {
@@ -294,6 +353,46 @@ function parseEditPlanResponse(
     coverageNotes: String(parsed?.coverageNotes ?? "Sequential clip count derived from transcript density."),
     rationale: String(parsed?.rationale ?? "Timing aligned to transcript cadence."),
   };
+}
+
+function parseAssetProfileResponse(raw: string): Omit<AssetSemanticProfile, "id" | "path" | "name" | "mediaType" | "candidate" | "searchText" | "provider"> {
+  const parsed = safeJsonParse(extractJsonObject(raw)) as
+    | {
+        caption?: string;
+        tags?: string[];
+        moodTags?: string[];
+        entities?: string[];
+        shotScale?: AssetSemanticProfile["shotScale"];
+        motionEnergy?: AssetSemanticProfile["motionEnergy"];
+        useCases?: string[];
+        confidence?: number;
+      }
+    | null;
+
+  return {
+    caption: String(parsed?.caption ?? "Visual asset for B-roll coverage."),
+    tags: normalizeStringArray(parsed?.tags, 12),
+    moodTags: normalizeStringArray(parsed?.moodTags, 8),
+    entities: normalizeStringArray(parsed?.entities, 8),
+    shotScale: normalizeShotScale(parsed?.shotScale),
+    motionEnergy: normalizeMotionEnergy(parsed?.motionEnergy),
+    useCases: normalizeStringArray(parsed?.useCases, 8),
+    confidence: clampScore(Number(parsed?.confidence ?? 0.6)),
+  };
+}
+
+function normalizeStringArray(value: unknown, limit: number): string[] {
+  return Array.isArray(value)
+    ? value.map((entry) => String(entry).trim()).filter(Boolean).slice(0, limit)
+    : [];
+}
+
+function normalizeShotScale(value: unknown): AssetSemanticProfile["shotScale"] {
+  return value === "wide" || value === "medium" || value === "close" || value === "detail" ? value : "unknown";
+}
+
+function normalizeMotionEnergy(value: unknown): AssetSemanticProfile["motionEnergy"] {
+  return value === "static" || value === "gentle" || value === "active" || value === "high" ? value : "unknown";
 }
 
 function clampClipCount(value: number | undefined, request: AiSegmentRequest): number {
