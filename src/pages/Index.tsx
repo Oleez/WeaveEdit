@@ -18,8 +18,29 @@ import {
   pickFolder,
   previewSilenceCleanup,
 } from "@/lib/cep";
-import { detectVideoTooling, indexMediaLibraryForAi } from "@/lib/ai/video-preprocessing";
+import { detectVideoTooling, indexMediaLibraryForAi, probeVideoDuration } from "@/lib/ai/video-preprocessing";
 import { checkAiProviders, profileAssetsWithAi } from "@/lib/ai/router";
+import {
+  buildMissingAssetPlan,
+  formatMissingAssetPlanMarkdown,
+  formatMissingAssetPrompt,
+} from "@/lib/ai/missing-asset-plan";
+import {
+  AppliedGeneratedAssetMap,
+  GeneratedAssetApplySummary,
+  applyGeneratedAssetsToPlacements,
+  buildApprovedGeneratedAssetMap,
+} from "@/lib/ai/generated-asset-planner";
+import {
+  AssetAttachDraft,
+  createImportedGeneratedAsset,
+  formatAssetInboxCsv,
+} from "@/lib/ai/asset-inbox";
+import {
+  PromptPlanRefinementResult,
+  refineMissingAssetPlanWithAi,
+  resetPromptRefinement,
+} from "@/lib/ai/prompt-plan-refiner";
 import {
   DEFAULT_DYNAMIC_EDITOR_SETTINGS,
   buildDynamicEditorResult,
@@ -35,7 +56,9 @@ import {
   AiSegmentRanking,
   DynamicEditorSettings,
   EditorPacingPreset,
+  ImportedGeneratedAsset,
   MatchStyle,
+  MissingAssetPlan,
   PlacementStrategyMode,
   VideoTrimPolicy,
 } from "@/lib/ai/types";
@@ -53,6 +76,71 @@ const LEGACY_STORAGE_KEY = "sora-genie-settings";
 const statusPillBase =
   "inline-flex rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]";
 
+type EditGoal =
+  | "views-retention"
+  | "leads-webinar"
+  | "sales-product"
+  | "authority-personal-brand"
+  | "education-tutorial"
+  | "clean-client-delivery";
+type EditStyle =
+  | "premium-business"
+  | "fast-viral"
+  | "clean-podcast"
+  | "luxury-minimal"
+  | "ugc-ad"
+  | "cinematic-documentary"
+  | "high-energy-shorts";
+type BrollStyle =
+  | "literal"
+  | "metaphorical"
+  | "mixed"
+  | "minimal-face-time"
+  | "stock-footage-heavy"
+  | "generated-asset-ready";
+type CaptionStyle =
+  | "clean-bold"
+  | "hormozi-punchy"
+  | "minimal-premium"
+  | "documentary-lower-third"
+  | "ugc-native";
+
+const EDIT_GOAL_OPTIONS: Array<{ value: EditGoal; label: string }> = [
+  { value: "views-retention", label: "Views / Retention" },
+  { value: "leads-webinar", label: "Leads / Webinar" },
+  { value: "sales-product", label: "Sales / Product" },
+  { value: "authority-personal-brand", label: "Authority / Personal Brand" },
+  { value: "education-tutorial", label: "Education / Tutorial" },
+  { value: "clean-client-delivery", label: "Clean Client Delivery" },
+];
+
+const EDIT_STYLE_OPTIONS: Array<{ value: EditStyle; label: string }> = [
+  { value: "premium-business", label: "Premium Business" },
+  { value: "fast-viral", label: "Fast Viral" },
+  { value: "clean-podcast", label: "Clean Podcast" },
+  { value: "luxury-minimal", label: "Luxury Minimal" },
+  { value: "ugc-ad", label: "UGC Ad" },
+  { value: "cinematic-documentary", label: "Cinematic Documentary" },
+  { value: "high-energy-shorts", label: "High-Energy Shorts" },
+];
+
+const BROLL_STYLE_OPTIONS: Array<{ value: BrollStyle; label: string }> = [
+  { value: "literal", label: "Literal" },
+  { value: "metaphorical", label: "Metaphorical" },
+  { value: "mixed", label: "Mixed" },
+  { value: "minimal-face-time", label: "Minimal / Face-Time Heavy" },
+  { value: "stock-footage-heavy", label: "Stock Footage Heavy" },
+  { value: "generated-asset-ready", label: "Generated Asset Ready" },
+];
+
+const CAPTION_STYLE_OPTIONS: Array<{ value: CaptionStyle; label: string }> = [
+  { value: "clean-bold", label: "Clean Bold" },
+  { value: "hormozi-punchy", label: "Hormozi-Style Punchy" },
+  { value: "minimal-premium", label: "Minimal Premium" },
+  { value: "documentary-lower-third", label: "Documentary Lower Third" },
+  { value: "ugc-native", label: "UGC Native" },
+];
+
 interface StoredSettings {
   scriptText: string;
   imageFolderPath: string;
@@ -60,6 +148,14 @@ interface StoredSettings {
   transcriptSourceMode: "upload" | "premiere-markers";
   mediaSortMode: MediaSortMode;
   placementStrategyMode: PlacementStrategyMode;
+  editGoal: EditGoal;
+  editStyle: EditStyle;
+  brollStyle: BrollStyle;
+  captionStyle: CaptionStyle;
+  ctaContext: string;
+  creativeDirection: string;
+  brandNotes: string;
+  generatedAssets: ImportedGeneratedAsset[];
   customInstructions: string;
   minDurationSec: number;
   maxDurationSec: number;
@@ -80,6 +176,7 @@ interface StoredSettings {
   candidatePoolSize: number;
   rerankDepth: number;
   averageShotLengthSec: number;
+  variationStrength: number;
   silenceThresholdDb: number;
   minSilenceSec: number;
   keepSilenceSec: number;
@@ -103,6 +200,14 @@ const defaultSettings: StoredSettings = {
   transcriptSourceMode: "premiere-markers",
   mediaSortMode: "downloaded-oldest",
   placementStrategyMode: "folder-order",
+  editGoal: "views-retention",
+  editStyle: "premium-business",
+  brollStyle: "mixed",
+  captionStyle: "clean-bold",
+  ctaContext: "",
+  creativeDirection: "Make the edit polished, useful, and retention-focused without random B-roll.",
+  brandNotes: "",
+  generatedAssets: [],
   customInstructions: "",
   minDurationSec: 2,
   maxDurationSec: 8,
@@ -123,6 +228,7 @@ const defaultSettings: StoredSettings = {
   candidatePoolSize: DEFAULT_DYNAMIC_EDITOR_SETTINGS.candidatePoolSize,
   rerankDepth: DEFAULT_DYNAMIC_EDITOR_SETTINGS.rerankDepth,
   averageShotLengthSec: DEFAULT_DYNAMIC_EDITOR_SETTINGS.averageShotLengthSec,
+  variationStrength: DEFAULT_DYNAMIC_EDITOR_SETTINGS.variationStrength,
   silenceThresholdDb: -45,
   minSilenceSec: 0.35,
   keepSilenceSec: 0.05,
@@ -141,6 +247,13 @@ const Index = () => {
   const [placementStrategyMode, setPlacementStrategyMode] = useState<PlacementStrategyMode>(
     defaultSettings.placementStrategyMode,
   );
+  const [editGoal, setEditGoal] = useState<EditGoal>(defaultSettings.editGoal);
+  const [editStyle, setEditStyle] = useState<EditStyle>(defaultSettings.editStyle);
+  const [brollStyle, setBrollStyle] = useState<BrollStyle>(defaultSettings.brollStyle);
+  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>(defaultSettings.captionStyle);
+  const [ctaContext, setCtaContext] = useState(defaultSettings.ctaContext);
+  const [creativeDirection, setCreativeDirection] = useState(defaultSettings.creativeDirection);
+  const [brandNotes, setBrandNotes] = useState(defaultSettings.brandNotes);
   const [customInstructions, setCustomInstructions] = useState(defaultSettings.customInstructions);
   const [mediaItems, setMediaItems] = useState<MediaLibraryItem[]>([]);
   const [scanWarnings, setScanWarnings] = useState<string[]>([]);
@@ -167,6 +280,7 @@ const Index = () => {
   const [candidatePoolSize, setCandidatePoolSize] = useState(defaultSettings.candidatePoolSize);
   const [rerankDepth, setRerankDepth] = useState(defaultSettings.rerankDepth);
   const [averageShotLengthSec, setAverageShotLengthSec] = useState(defaultSettings.averageShotLengthSec);
+  const [variationStrength, setVariationStrength] = useState(defaultSettings.variationStrength);
   const [silenceThresholdDb, setSilenceThresholdDb] = useState(defaultSettings.silenceThresholdDb);
   const [minSilenceSec, setMinSilenceSec] = useState(defaultSettings.minSilenceSec);
   const [keepSilenceSec, setKeepSilenceSec] = useState(defaultSettings.keepSilenceSec);
@@ -175,6 +289,7 @@ const Index = () => {
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [silencePreview, setSilencePreview] = useState<SilencePreviewResult | null>(null);
   const [silenceBusyMessage, setSilenceBusyMessage] = useState<string | null>(null);
+  const [showAdvancedUi, setShowAdvancedUi] = useState(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [folderError, setFolderError] = useState<string | null>(null);
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
@@ -195,6 +310,19 @@ const Index = () => {
   const [manualOverridesBySegmentId, setManualOverridesBySegmentId] = useState<
     Record<string, string | "blank" | "auto">
   >({});
+  const [copiedPromptIds, setCopiedPromptIds] = useState<Record<string, boolean>>({});
+  const [refinedMissingAssetPlan, setRefinedMissingAssetPlan] = useState<MissingAssetPlan | null>(null);
+  const [promptRefineBusyMessage, setPromptRefineBusyMessage] = useState<string | null>(null);
+  const [promptRefinementResult, setPromptRefinementResult] = useState<PromptPlanRefinementResult | null>(null);
+  const [generatedAssets, setGeneratedAssets] = useState<ImportedGeneratedAsset[]>(defaultSettings.generatedAssets);
+  const [activeAttachPromptId, setActiveAttachPromptId] = useState<string | null>(null);
+  const [assetDraftsByPromptId, setAssetDraftsByPromptId] = useState<Record<string, AssetAttachDraft>>({});
+  const [assetStatusFilter, setAssetStatusFilter] = useState<"all" | ImportedGeneratedAsset["status"]>("all");
+  const [assetTypeFilter, setAssetTypeFilter] = useState<"all" | ImportedGeneratedAsset["fileType"]>("all");
+  const [appliedGeneratedAssetIdsByPlacementId, setAppliedGeneratedAssetIdsByPlacementId] =
+    useState<AppliedGeneratedAssetMap>({});
+  const [generatedAssetApplySummary, setGeneratedAssetApplySummary] =
+    useState<GeneratedAssetApplySummary | null>(null);
 
   const dynamicEditorSettings = useMemo<DynamicEditorSettings>(
     () => ({
@@ -207,15 +335,31 @@ const Index = () => {
       candidatePoolSize: Math.max(10, Math.round(candidatePoolSize)),
       rerankDepth: Math.max(3, Math.round(rerankDepth)),
       averageShotLengthSec: clampDurationInput(averageShotLengthSec, 1),
+      variationStrength: clampVariationStrength(variationStrength),
       minClipDurationSec: Math.max(0.5, Math.min(minDurationSec, maxDurationSec)),
       maxClipDurationSec: Math.max(minDurationSec, maxDurationSec),
+      editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
+      editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
+      brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
+      captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
+      ctaContext,
+      creativeDirection,
+      brandNotes,
     }),
     [
       analysisDepth,
       assetReusePolicy,
       averageShotLengthSec,
+      brandNotes,
+      brollStyle,
+      variationStrength,
       candidatePoolSize,
+      captionStyle,
+      creativeDirection,
+      ctaContext,
       cutBoundaryMode,
+      editGoal,
+      editStyle,
       matchStyle,
       maxDurationSec,
       minDurationSec,
@@ -283,6 +427,14 @@ const Index = () => {
     setTranscriptSourceMode(stored.transcriptSourceMode ?? defaultSettings.transcriptSourceMode);
     setMediaSortMode(stored.mediaSortMode ?? defaultSettings.mediaSortMode);
     setPlacementStrategyMode(stored.placementStrategyMode ?? defaultSettings.placementStrategyMode);
+    setEditGoal(stored.editGoal ?? defaultSettings.editGoal);
+    setEditStyle(stored.editStyle ?? defaultSettings.editStyle);
+    setBrollStyle(stored.brollStyle ?? defaultSettings.brollStyle);
+    setCaptionStyle(stored.captionStyle ?? defaultSettings.captionStyle);
+    setCtaContext(stored.ctaContext ?? defaultSettings.ctaContext);
+    setCreativeDirection(stored.creativeDirection ?? defaultSettings.creativeDirection);
+    setBrandNotes(stored.brandNotes ?? defaultSettings.brandNotes);
+    setGeneratedAssets(stored.generatedAssets ?? defaultSettings.generatedAssets);
     setCustomInstructions(stored.customInstructions ?? defaultSettings.customInstructions);
     setMinDurationSec(clampDurationInput(stored.minDurationSec ?? defaultSettings.minDurationSec, 0.5));
     setMaxDurationSec(clampDurationInput(stored.maxDurationSec ?? defaultSettings.maxDurationSec, 0.5));
@@ -307,6 +459,7 @@ const Index = () => {
     setCandidatePoolSize(stored.candidatePoolSize ?? defaultSettings.candidatePoolSize);
     setRerankDepth(stored.rerankDepth ?? defaultSettings.rerankDepth);
     setAverageShotLengthSec(clampDurationInput(stored.averageShotLengthSec ?? defaultSettings.averageShotLengthSec, 1));
+    setVariationStrength(clampVariationStrength(stored.variationStrength ?? defaultSettings.variationStrength));
     setSilenceThresholdDb(stored.silenceThresholdDb ?? defaultSettings.silenceThresholdDb);
     setMinSilenceSec(clampDurationInput(stored.minSilenceSec ?? defaultSettings.minSilenceSec, 0.05));
     setKeepSilenceSec(clampDurationInput(stored.keepSilenceSec ?? defaultSettings.keepSilenceSec, 0));
@@ -323,6 +476,14 @@ const Index = () => {
         transcriptSourceMode,
         mediaSortMode,
         placementStrategyMode,
+        editGoal,
+        editStyle,
+        brollStyle,
+        captionStyle,
+        ctaContext,
+        creativeDirection,
+        brandNotes,
+        generatedAssets,
         customInstructions,
         minDurationSec,
         maxDurationSec,
@@ -343,6 +504,7 @@ const Index = () => {
         candidatePoolSize,
         rerankDepth,
         averageShotLengthSec,
+        variationStrength,
         silenceThresholdDb,
         minSilenceSec,
         keepSilenceSec,
@@ -356,6 +518,14 @@ const Index = () => {
     transcriptSourceMode,
     mediaSortMode,
     placementStrategyMode,
+    editGoal,
+    editStyle,
+    brollStyle,
+    captionStyle,
+    ctaContext,
+    creativeDirection,
+    brandNotes,
+    generatedAssets,
     customInstructions,
     maxDurationSec,
     minDurationSec,
@@ -376,6 +546,7 @@ const Index = () => {
     candidatePoolSize,
     rerankDepth,
     averageShotLengthSec,
+    variationStrength,
     silenceThresholdDb,
     minSilenceSec,
     keepSilenceSec,
@@ -394,7 +565,20 @@ const Index = () => {
     setAiRankingsBySegmentId({});
     setManualOverridesBySegmentId({});
     setAiErrors([]);
-  }, [scriptText, imageFolderPath, customInstructions, placementStrategyMode, mediaSortMode]);
+  }, [
+    scriptText,
+    imageFolderPath,
+    customInstructions,
+    editGoal,
+    editStyle,
+    brollStyle,
+    captionStyle,
+    ctaContext,
+    creativeDirection,
+    brandNotes,
+    placementStrategyMode,
+    mediaSortMode,
+  ]);
 
   const parsedScriptState = useMemo(() => {
     if (!scriptText.trim()) {
@@ -429,6 +613,8 @@ const Index = () => {
       sequenceEndSec: hostStatus?.range.sequenceEndSec,
       targetSecondsPerClip: dynamicEditorSettings.averageShotLengthSec,
       placementStrategyMode,
+      variationStrength: dynamicEditorSettings.variationStrength,
+      editorPacingPreset: pacingPreset,
     });
   }, [
     aiConfidenceThreshold,
@@ -442,6 +628,7 @@ const Index = () => {
     minDurationSec,
     parsedScriptState.result,
     placementStrategyMode,
+    pacingPreset,
   ]);
 
   const effectivePlan = useMemo<WorkingPlan | null>(() => {
@@ -471,6 +658,8 @@ const Index = () => {
         rangeStartSec: range.inSec,
         rangeEndSec: range.outSec,
         targetSecondsPerClip: dynamicEditorSettings.averageShotLengthSec,
+        variationStrength: dynamicEditorSettings.variationStrength,
+        editorPacingPreset: pacingPreset,
       });
       return {
         mode: "sequence_in_out",
@@ -507,10 +696,60 @@ const Index = () => {
       rangeEndSec: hostStatus?.range.sequenceEndSec ?? 0,
       coverage: basePlan.coverage,
     };
-  }, [appendAtTrackEnd, basePlan, dynamicEditorSettings.averageShotLengthSec, hostStatus, maxDurationSec, minDurationSec, useWholeSequenceFallback]);
+  }, [
+    appendAtTrackEnd,
+    basePlan,
+    dynamicEditorSettings.averageShotLengthSec,
+    dynamicEditorSettings.variationStrength,
+    hostStatus,
+    maxDurationSec,
+    minDurationSec,
+    pacingPreset,
+    useWholeSequenceFallback,
+  ]);
+
+  const baseMissingAssetPlan = useMemo(
+    () =>
+      buildMissingAssetPlan(
+        effectivePlan?.placements ?? [],
+        dynamicEditorSettings,
+      ),
+    [dynamicEditorSettings, effectivePlan],
+  );
+
+  const missingAssetPlan = refinedMissingAssetPlan ?? baseMissingAssetPlan;
+  const promptRecommendedPlacementIds = useMemo(
+    () => new Set(missingAssetPlan.prompts.map((prompt) => prompt.placementId)),
+    [missingAssetPlan],
+  );
+
+  const generatedAssetPlanResult = useMemo(
+    () =>
+      effectivePlan
+        ? applyGeneratedAssetsToPlacements({
+            placements: effectivePlan.placements,
+            assets: generatedAssets,
+            appliedAssetIdsByPlacementId: appliedGeneratedAssetIdsByPlacementId,
+            fileExists: generatedAssetPathExists,
+            promptRecommendedPlacementIds,
+          })
+        : null,
+    [appliedGeneratedAssetIdsByPlacementId, effectivePlan, generatedAssets, promptRecommendedPlacementIds],
+  );
+
+  const previewPlan = useMemo<WorkingPlan | null>(
+    () =>
+      effectivePlan && generatedAssetPlanResult
+        ? {
+            ...effectivePlan,
+            placements: generatedAssetPlanResult.placements,
+          }
+        : effectivePlan,
+    [effectivePlan, generatedAssetPlanResult],
+  );
 
   const previewStats = useMemo(() => {
-    const placements = effectivePlan?.placements ?? [];
+    const placements = previewPlan?.placements ?? [];
 
     return placements.reduce(
       (summary, placement) => {
@@ -520,6 +759,8 @@ const Index = () => {
           summary.fallback += 1;
         } else if (placement.strategy === "manual") {
           summary.manual += 1;
+        } else if (placement.strategy === "generated") {
+          summary.generated += 1;
         } else {
           summary.blank += 1;
         }
@@ -530,7 +771,62 @@ const Index = () => {
 
         return summary;
       },
-      { ai: 0, fallback: 0, manual: 0, overlap: 0, blank: 0 },
+      { ai: 0, fallback: 0, manual: 0, generated: 0, overlap: 0, blank: 0 },
+    );
+  }, [previewPlan]);
+
+  const promptByPlacementId = useMemo(
+    () =>
+      new Map(
+        missingAssetPlan.prompts.map((prompt) => [prompt.placementId, prompt]),
+      ),
+    [missingAssetPlan],
+  );
+
+  const assetsByPromptId = useMemo(() => {
+    const grouped = new Map<string, ImportedGeneratedAsset[]>();
+    generatedAssets.forEach((asset) => {
+      grouped.set(asset.linkedPromptId, [...(grouped.get(asset.linkedPromptId) ?? []), asset]);
+    });
+    return grouped;
+  }, [generatedAssets]);
+
+  const assetsByPlacementId = useMemo(() => {
+    const grouped = new Map<string, ImportedGeneratedAsset[]>();
+    generatedAssets.forEach((asset) => {
+      grouped.set(asset.linkedPlacementId, [...(grouped.get(asset.linkedPlacementId) ?? []), asset]);
+    });
+    return grouped;
+  }, [generatedAssets]);
+
+  const filteredGeneratedAssets = useMemo(
+    () =>
+      generatedAssets.filter(
+        (asset) =>
+          (assetStatusFilter === "all" || asset.status === assetStatusFilter) &&
+          (assetTypeFilter === "all" || asset.fileType === assetTypeFilter),
+      ),
+    [assetStatusFilter, assetTypeFilter, generatedAssets],
+  );
+
+  useEffect(() => {
+    setRefinedMissingAssetPlan(null);
+    setPromptRefinementResult(null);
+    setCopiedPromptIds({});
+  }, [baseMissingAssetPlan]);
+
+  useEffect(() => {
+    if (!effectivePlan) {
+      setAppliedGeneratedAssetIdsByPlacementId({});
+      setGeneratedAssetApplySummary(null);
+      return;
+    }
+
+    const placementIds = new Set(effectivePlan.placements.map((placement) => placement.id));
+    setAppliedGeneratedAssetIdsByPlacementId((previous) =>
+      Object.fromEntries(
+        Object.entries(previous).filter(([placementId]) => placementIds.has(placementId)),
+      ),
     );
   }, [effectivePlan]);
 
@@ -555,16 +851,16 @@ const Index = () => {
       return "Add a valid timestamped script and media folder first.";
     }
 
-    if (!effectivePlan || effectivePlan.placements.length === 0) {
+    if (!previewPlan || previewPlan.placements.length === 0) {
       return "No placements fall inside the current working range.";
     }
 
-    if (effectivePlan.mode === "missing_range") {
+    if (previewPlan.mode === "missing_range") {
       return "Set sequence In/Out marks or enable whole-sequence fallback.";
     }
 
     return null;
-  }, [basePlan, effectivePlan, hostStatus]);
+  }, [basePlan, hostStatus, previewPlan]);
 
   const canExecute = !busyMessage && !executeReason;
   const hasMeaningfulInOut = Boolean(hostStatus?.range.hasMeaningfulInOut);
@@ -581,9 +877,31 @@ const Index = () => {
       ffmpegAvailable: videoTooling.ffmpegAvailable,
       ffprobeAvailable: videoTooling.ffprobeAvailable,
       customInstructions,
+      editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
+      editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
+      brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
+      captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
+      ctaContext,
+      creativeDirection,
+      brandNotes,
       fullScriptContext: parsedScriptState.result ? buildFullScriptContext(parsedScriptState.result.segments) : undefined,
     }),
-    [customInstructions, geminiApiKey, geminiModel, ollamaBaseUrl, ollamaModel, parsedScriptState.result, videoTooling],
+    [
+      brandNotes,
+      brollStyle,
+      captionStyle,
+      creativeDirection,
+      ctaContext,
+      customInstructions,
+      editGoal,
+      editStyle,
+      geminiApiKey,
+      geminiModel,
+      ollamaBaseUrl,
+      ollamaModel,
+      parsedScriptState.result,
+      videoTooling,
+    ],
   );
 
   async function runAiHealthCheck() {
@@ -626,6 +944,13 @@ const Index = () => {
 
     try {
       const segments = parsedScriptState.result.segments;
+      const fullScriptContext = buildFullScriptContext(segments);
+      if (!fullScriptContext.trim()) {
+        setAiErrors(["Add transcript text before analyzing so the assistant can read the full script context first."]);
+        return;
+      }
+      const scoringContext: AiScoringContext = { ...aiContext, fullScriptContext };
+
       const indexed = await indexMediaLibraryForAi(mediaItems, (done, total) => {
         setAiBusyMessage(`Indexing library asset ${done}/${total}`);
       });
@@ -639,7 +964,7 @@ const Index = () => {
             providersUsed: [],
             errors: [],
           }
-        : await profileAssetsWithAi(profilePool, aiMode, aiContext, (done, total) => {
+        : await profileAssetsWithAi(profilePool, aiMode, scoringContext, (done, total) => {
             setAiBusyMessage(`Profiling media asset ${done}/${total}`);
           });
       const profiles = profiled.profiles;
@@ -736,7 +1061,7 @@ const Index = () => {
   }
 
   async function handlePlaceOnTimeline() {
-    if (!effectivePlan) {
+    if (!previewPlan) {
       return;
     }
 
@@ -749,7 +1074,7 @@ const Index = () => {
       useSequenceInOut: false,
       rangeStartSec: null,
       rangeEndSec: null,
-      placements: effectivePlan.placements.map((placement) => ({
+      placements: previewPlan.placements.map((placement) => ({
         id: placement.id,
         groupId: placement.groupId,
         layerIndex: placement.layerIndex,
@@ -757,6 +1082,8 @@ const Index = () => {
         startSec: placement.startSec,
         endSec: placement.endSec,
         durationSec: placement.durationSec,
+        sourceInSec: placement.sourceInSec,
+        sourceOutSec: placement.sourceOutSec,
         mediaPath: placement.mediaPath,
         strategy: placement.strategy,
         text: placement.text,
@@ -783,6 +1110,220 @@ const Index = () => {
     } finally {
       setBusyMessage(null);
     }
+  }
+
+  async function handleCopyPrompt(promptId: string) {
+    const prompt = missingAssetPlan.prompts.find((item) => item.id === promptId);
+    if (!prompt) {
+      return;
+    }
+
+    await copyText(formatMissingAssetPrompt(prompt));
+    setCopiedPromptIds((previous) => ({ ...previous, [promptId]: true }));
+  }
+
+  async function handleCopyAllPrompts() {
+    await copyText(formatMissingAssetPlanMarkdown(missingAssetPlan));
+    setCopiedPromptIds((previous) => ({
+      ...previous,
+      ...Object.fromEntries(missingAssetPlan.prompts.map((prompt) => [prompt.id, true])),
+    }));
+  }
+
+  async function handleRefinePromptPlan() {
+    if (missingAssetPlan.prompts.length === 0) {
+      return;
+    }
+
+    setPromptRefineBusyMessage("Refining prompts with AI");
+    setPromptRefinementResult(null);
+    try {
+      const result = await refineMissingAssetPlanWithAi(
+        missingAssetPlan,
+        aiMode,
+        aiContext,
+        (done, total) => setPromptRefineBusyMessage(`Refining prompts ${done}/${total}`),
+      );
+      setRefinedMissingAssetPlan(result.plan);
+      setPromptRefinementResult(result);
+    } catch (error) {
+      setPromptRefinementResult({
+        plan: missingAssetPlan,
+        providerUsed: null,
+        refinedCount: 0,
+        errors: [String(error)],
+      });
+    } finally {
+      setPromptRefineBusyMessage(null);
+    }
+  }
+
+  function handleResetPrompt(promptId: string) {
+    setRefinedMissingAssetPlan((previous) => {
+      if (!previous) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        prompts: previous.prompts.map((prompt) =>
+          prompt.id === promptId ? resetPromptRefinement(prompt) : prompt,
+        ),
+      };
+    });
+  }
+
+  function handleResetAllPrompts() {
+    setRefinedMissingAssetPlan(null);
+    setPromptRefinementResult(null);
+  }
+
+  function handleAttachDraftChange(promptId: string, patch: Partial<AssetAttachDraft>) {
+    setAssetDraftsByPromptId((previous) => ({
+      ...previous,
+      [promptId]: {
+        filePath: "",
+        sourceTool: "Manual",
+        notes: "",
+        ...(previous[promptId] ?? {}),
+        ...patch,
+      },
+    }));
+  }
+
+  function handleAttachGeneratedAsset(promptId: string) {
+    const prompt = missingAssetPlan.prompts.find((item) => item.id === promptId);
+    const draft = assetDraftsByPromptId[promptId];
+    if (!prompt || !draft?.filePath.trim()) {
+      return;
+    }
+
+    const durationMetadata = probeGeneratedAssetDurationMetadata(draft.filePath);
+    const asset = createImportedGeneratedAsset(prompt, draft, durationMetadata);
+    setGeneratedAssets((previous) => [asset, ...previous]);
+    setAssetDraftsByPromptId((previous) => ({
+      ...previous,
+      [promptId]: { filePath: "", sourceTool: "Manual", notes: "" },
+    }));
+    setActiveAttachPromptId(null);
+  }
+
+  function handleUpdateGeneratedAssetStatus(
+    assetId: string,
+    status: ImportedGeneratedAsset["status"],
+  ) {
+    setGeneratedAssets((previous) =>
+      previous.map((asset) => (asset.id === assetId ? { ...asset, status } : asset)),
+    );
+    if (status !== "approved") {
+      setAppliedGeneratedAssetIdsByPlacementId((previous) =>
+        Object.fromEntries(Object.entries(previous).filter(([, appliedAssetId]) => appliedAssetId !== assetId)),
+      );
+      setGeneratedAssetApplySummary(null);
+    }
+  }
+
+  function handleUnlinkGeneratedAsset(assetId: string) {
+    setGeneratedAssets((previous) => previous.filter((asset) => asset.id !== assetId));
+    setAppliedGeneratedAssetIdsByPlacementId((previous) =>
+      Object.fromEntries(Object.entries(previous).filter(([, appliedAssetId]) => appliedAssetId !== assetId)),
+    );
+    setGeneratedAssetApplySummary(null);
+  }
+
+  async function handleCopyGeneratedAssetPath(asset: ImportedGeneratedAsset) {
+    await copyText(asset.filePath);
+  }
+
+  function handleProbeGeneratedAssetDuration(assetId: string) {
+    setGeneratedAssets((previous) =>
+      previous.map((asset) =>
+        asset.id === assetId
+          ? {
+              ...asset,
+              ...probeGeneratedAssetDurationMetadata(asset.filePath),
+            }
+          : asset,
+      ),
+    );
+    setGeneratedAssetApplySummary(null);
+  }
+
+  function handleExportAssetInbox(format: "json" | "csv") {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `weave-edit-asset-inbox-${timestamp}.${format}`;
+    const content =
+      format === "json"
+        ? JSON.stringify(generatedAssets, null, 2)
+        : formatAssetInboxCsv(generatedAssets);
+    downloadTextFile(fileName, content, format === "json" ? "application/json" : "text/csv");
+  }
+
+  function handleUseGeneratedAssetInPlan(asset: ImportedGeneratedAsset) {
+    if (!effectivePlan) {
+      return;
+    }
+
+    const nextMap = {
+      ...appliedGeneratedAssetIdsByPlacementId,
+      [asset.linkedPlacementId]: asset.id,
+    };
+    const result = applyGeneratedAssetsToPlacements({
+      placements: effectivePlan.placements,
+      assets: generatedAssets,
+      appliedAssetIdsByPlacementId: nextMap,
+      fileExists: generatedAssetPathExists,
+      promptRecommendedPlacementIds,
+    });
+    const applied = result.placements.some(
+      (placement) => placement.id === asset.linkedPlacementId && placement.generatedAssetId === asset.id,
+    );
+    setAppliedGeneratedAssetIdsByPlacementId(
+      applied
+        ? nextMap
+        : Object.fromEntries(
+            Object.entries(appliedGeneratedAssetIdsByPlacementId).filter(([, appliedAssetId]) => appliedAssetId !== asset.id),
+          ),
+    );
+    setGeneratedAssetApplySummary(result.summary);
+  }
+
+  function handleUseAllApprovedAssetsInPlan() {
+    if (!effectivePlan) {
+      return;
+    }
+
+    const result = buildApprovedGeneratedAssetMap(
+      effectivePlan.placements,
+      generatedAssets,
+      generatedAssetPathExists,
+      promptRecommendedPlacementIds,
+    );
+    setAppliedGeneratedAssetIdsByPlacementId(result.appliedAssetIdsByPlacementId);
+    setGeneratedAssetApplySummary(result.summary);
+  }
+
+  function handleRestoreGeneratedAssetPlacement(placementId: string) {
+    setAppliedGeneratedAssetIdsByPlacementId((previous) => {
+      const { [placementId]: _removed, ...next } = previous;
+      return next;
+    });
+    setGeneratedAssetApplySummary(null);
+  }
+
+  function handleRestoreAllGeneratedAssetPlacements() {
+    setAppliedGeneratedAssetIdsByPlacementId({});
+    setGeneratedAssetApplySummary(null);
+  }
+
+  function handleExportPromptBrief(format: "md" | "txt" | "json") {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `weave-edit-missing-asset-plan-${timestamp}.${format}`;
+    const content =
+      format === "json"
+        ? JSON.stringify(missingAssetPlan, null, 2)
+        : formatMissingAssetPlanMarkdown(missingAssetPlan);
+    downloadTextFile(fileName, content, format === "json" ? "application/json" : "text/plain");
   }
 
   async function handlePreviewSilenceCleanup() {
@@ -853,10 +1394,16 @@ const Index = () => {
               />
               <h1 className="mt-4 text-3xl font-semibold tracking-tight">Weave Edit</h1>
               <p className="mt-3 max-w-3xl text-sm leading-6 text-muted-foreground">
-                Build visual coverage for a marked part of your edit. Weave Edit reads a manual
-                timestamped script, scans an image or video folder, and places matching media on
-                the selected track with sequence In/Out taking priority over whole-sequence timing.
+                Premiere panel for transcript-led B-roll placement. Load markers, scan a local
+                image/video library, let Gemma shape the edit, then review before placing.
               </p>
+              <button
+                type="button"
+                onClick={() => setShowAdvancedUi((value) => !value)}
+                className="mt-4 rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+              >
+                {showAdvancedUi ? "Hide advanced UI" : "Show advanced UI"}
+              </button>
             </div>
             <div className="grid min-w-[300px] gap-3 rounded-3xl border border-border/70 bg-background/70 p-4">
               <SummaryRow label="Project" value={hostStatus?.projectName || "Not connected"} />
@@ -875,7 +1422,21 @@ const Index = () => {
               />
               <SummaryRow
                 label="Target"
-                value={`V${targetVideoTrack}${hostStatus?.videoTracks[targetVideoTrack - 1] ? ` • ${hostStatus.videoTracks[targetVideoTrack - 1].name}` : ""}`}
+                value={`V${targetVideoTrack}${hostStatus?.videoTracks[targetVideoTrack - 1] ? ` / ${hostStatus.videoTracks[targetVideoTrack - 1].name}` : ""}`}
+              />
+              <SummaryRow
+                label="AI"
+                value={
+                  aiMode === "off"
+                    ? "Off"
+                    : aiMode === "local"
+                      ? `${ollamaModel} via Ollama`
+                      : `${ollamaModel} primary / Gemini fallback`
+                }
+              />
+              <SummaryRow
+                label="Video tools"
+                value={`ffprobe ${videoTooling.ffprobeAvailable ? "ready" : "missing"} / ffmpeg ${videoTooling.ffmpegAvailable ? "ready" : "missing"}`}
               />
             </div>
           </div>
@@ -885,7 +1446,7 @@ const Index = () => {
           <div className="space-y-6">
             <PanelSection
               step="1"
-              title="Script"
+              title="Script / Transcript"
               description="Use Premiere markers when available, or upload a timestamped script. Sentence boundaries drive timing, and incomplete thoughts stay shorter unless AI has a stronger editorial reason."
               action={
                 <div className="flex flex-wrap gap-2">
@@ -911,24 +1472,32 @@ const Index = () => {
               }
             >
               <div className="grid gap-4 md:grid-cols-[0.8fr_1.2fr]">
-                <label className="grid gap-2 text-sm">
-                  <span className="text-muted-foreground">Transcript source</span>
-                  <select
-                    value={transcriptSourceMode}
-                    onChange={(event) =>
-                      setTranscriptSourceMode(event.target.value as "upload" | "premiere-markers")
-                    }
-                    className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
-                  >
-                    <option value="premiere-markers">Premiere markers first</option>
-                    <option value="upload">Uploaded script only</option>
-                  </select>
-                </label>
-                <div className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
-                  {transcriptSourceMode === "premiere-markers"
-                    ? "Preferred source: active sequence markers/comments in Premiere. Upload stays available as fallback."
-                    : "Preferred source: uploaded timestamped script. Premiere markers are optional reference only."}
-                </div>
+                {showAdvancedUi ? (
+                  <>
+                    <label className="grid gap-2 text-sm">
+                      <span className="text-muted-foreground">Transcript source</span>
+                      <select
+                        value={transcriptSourceMode}
+                        onChange={(event) =>
+                          setTranscriptSourceMode(event.target.value as "upload" | "premiere-markers")
+                        }
+                        className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                      >
+                        <option value="premiere-markers">Premiere markers first</option>
+                        <option value="upload">Uploaded script only</option>
+                      </select>
+                    </label>
+                    <div className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
+                      {transcriptSourceMode === "premiere-markers"
+                        ? "Preferred source: active sequence markers/comments in Premiere. Upload stays available as fallback."
+                        : "Preferred source: uploaded timestamped script. Premiere markers are optional reference only."}
+                    </div>
+                  </>
+                ) : (
+                  <div className="md:col-span-2 rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
+                    Default transcript workflow uses Premiere markers when available; open Advanced to pin uploads-only mode.
+                  </div>
+                )}
               </div>
               <div className="rounded-2xl border border-border/70 bg-background/60 px-4 py-3 text-xs uppercase tracking-[0.18em] text-muted-foreground">
                 Source: {scriptSourceName}
@@ -961,7 +1530,7 @@ const Index = () => {
 
             <PanelSection
               step="2"
-              title="Media library"
+              title="Media Library"
               description="Choose whether this pass should scan images, videos, or both. Folder selection should return the picked path directly into the source field, and scan warnings should stay explicit."
               action={
                 <div className="flex flex-wrap gap-2">
@@ -1041,7 +1610,7 @@ const Index = () => {
                   message={`Scan warnings: ${scanWarnings.slice(0, 2).join(" | ")}`}
                 />
               ) : null}
-              {mediaItems.length > 0 ? (
+              {showAdvancedUi && mediaItems.length > 0 ? (
                 <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
                   <p className="text-sm font-medium">First files</p>
                   <div className="mt-3 max-h-40 space-y-1 overflow-auto font-mono text-xs text-muted-foreground">
@@ -1057,11 +1626,11 @@ const Index = () => {
 
             <PanelSection
               step="3"
-              title="Range and placement"
-              description="Sequence In/Out is the primary working window. AI now proposes duration and overlap by sentence, while the duration fields below act only as safety rails."
+              title="Edit Planning"
+              description="Placement mode chooses how media lines up with each script span. Preferred shot length merges beats toward longer reads; variation adds bounded randomness inside transcript timing."
             >
-              <div className="grid gap-4 md:grid-cols-3">
-                <label className="grid gap-2 text-sm md:col-span-3">
+              <div className="grid gap-5">
+                <label className="grid gap-2 text-sm">
                   <span className="text-muted-foreground">Placement mode</span>
                   <select
                     value={placementStrategyMode}
@@ -1073,175 +1642,308 @@ const Index = () => {
                     <option value="hybrid-fallback">AI first, folder order fallback</option>
                   </select>
                   <span className="text-xs text-muted-foreground">
-                    Folder-order mode ignores AI matching and consumes images/videos exactly in scanned old-to-new order.
+                    Folder-order ignores scoring and walks files in scanned old-to-new order.
                   </span>
                 </label>
-                <NumberField
-                  label="Min safety duration"
-                  value={minDurationSec}
-                  min={0.5}
-                  step={0.5}
-                  onChange={setMinDurationSec}
-                />
-                <NumberField
-                  label="Max safety duration"
-                  value={maxDurationSec}
-                  min={0.5}
-                  step={0.5}
-                  onChange={setMaxDurationSec}
-                />
-                <TrackField
-                  tracks={hostStatus?.videoTracks ?? []}
-                  value={targetVideoTrack}
-                  onChange={setTargetVideoTrack}
-                />
+
+                <label className="grid gap-2 text-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-muted-foreground">Preferred shot length</span>
+                    <span className="font-mono text-xs text-muted-foreground">{averageShotLengthSec}s</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={2}
+                    max={14}
+                    step={0.5}
+                    value={averageShotLengthSec}
+                    onChange={(event) =>
+                      setAverageShotLengthSec(clampDurationInput(Number(event.target.value), 1))
+                    }
+                    className="w-full accent-primary"
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    Targets longer beats before phrase splits; transcript timing always wins for hard boundaries.
+                  </span>
+                </label>
+
+                <label className="grid gap-2 text-sm">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-muted-foreground">Variation strength</span>
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {(variationStrength * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={5}
+                    value={Math.round(variationStrength * 100)}
+                    onChange={(event) =>
+                      setVariationStrength(clampVariationStrength(Number(event.target.value) / 100))
+                    }
+                    className="w-full accent-primary"
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    Seeded drift reshuffles durations inside each script window—never shorter than the readable floor.
+                  </span>
+                </label>
+
+                <div className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm text-muted-foreground">
+                  Duration summary — safety rails{" "}
+                  <span className="font-mono text-foreground">
+                    {minDurationSec}s–{maxDurationSec}s
+                  </span>
+                  , pacing{" "}
+                  <span className="text-foreground">
+                    {pacingPreset === "social-fast"
+                      ? "Social fast"
+                      : pacingPreset === "cinematic-slow"
+                        ? "Cinematic slow"
+                        : pacingPreset === "tutorial"
+                          ? "Tutorial"
+                          : "Documentary"}
+                  </span>
+                  . Open Advanced to edit rails, pacing preset, or AI reviewers.
+                </div>
+
+                <div className="grid gap-3">
+                  <ToggleRow
+                    checked={appendAtTrackEnd}
+                    onChange={setAppendAtTrackEnd}
+                    label="Append after the current end of the target track"
+                    description="Continue later without relying on sequence In/Out."
+                  />
+                  <ToggleRow
+                    checked={useWholeSequenceFallback}
+                    onChange={setUseWholeSequenceFallback}
+                    disabled={appendAtTrackEnd}
+                    label="Allow whole-sequence fallback when no In/Out marks are set"
+                    description="Turn off to require editorial marks before placing."
+                  />
+                </div>
               </div>
-              <div className="grid gap-3">
-                <ToggleRow
-                  checked={appendAtTrackEnd}
-                  onChange={setAppendAtTrackEnd}
-                  label="Append after the current end of the target track"
-                  description="Use this for your next batch when you want to continue later instead of working inside the current In/Out window."
-                />
-                <ToggleRow
-                  checked={useWholeSequenceFallback}
-                  onChange={setUseWholeSequenceFallback}
-                  disabled={appendAtTrackEnd}
-                  label="Allow whole-sequence fallback when no In/Out marks are set"
-                  description="Keep this off if you want Weave Edit to require real editorial marks before placing anything."
-                />
-              </div>
-              <details className="rounded-3xl border border-border/70 bg-background/60 p-4">
-                <summary className="cursor-pointer text-sm font-medium">
-                  Advanced AI and editorial matching
-                </summary>
-                <div className="flex flex-wrap items-center justify-between gap-3">
+
+              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      AI story matching
-                    </p>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      Gemma is the main local scorer. For videos, Weave Edit extracts local frame
-                      samples with `ffmpeg` and aligns them to the script timestamps before
-                      ranking.
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Director Controls</p>
+                    <h3 className="mt-2 text-base font-semibold">Edit Recipe</h3>
+                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+                      Steer the AI like an editor: goal, style, caption feel, and the offer context.
                     </p>
                   </div>
-                  <select
-                    value={aiMode}
-                    onChange={(event) => setAiMode(event.target.value as AiMode)}
-                    className="rounded-2xl border border-border/70 bg-card px-3 py-2 text-sm"
-                  >
-                    <option value="off">Off</option>
-                    <option value="local">Local (Ollama)</option>
-                    <option value="hybrid">Hybrid (Ollama + Gemini fallback)</option>
-                  </select>
+                  <StatusPill tone="info" label={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)} />
                 </div>
                 <div className="mt-4 grid gap-3 md:grid-cols-2">
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Ollama endpoint
-                    </span>
-                    <input
-                      value={ollamaBaseUrl}
-                      onChange={(event) => setOllamaBaseUrl(event.target.value)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                  <DirectionSelect
+                    label="Edit goal"
+                    value={editGoal}
+                    options={EDIT_GOAL_OPTIONS}
+                    onChange={(value) => setEditGoal(value as EditGoal)}
+                  />
+                  <DirectionSelect
+                    label="Edit style"
+                    value={editStyle}
+                    options={EDIT_STYLE_OPTIONS}
+                    onChange={(value) => setEditStyle(value as EditStyle)}
+                  />
+                  <DirectionSelect
+                    label="B-roll style"
+                    value={brollStyle}
+                    options={BROLL_STYLE_OPTIONS}
+                    onChange={(value) => setBrollStyle(value as BrollStyle)}
+                  />
+                  <DirectionSelect
+                    label="Caption style"
+                    value={captionStyle}
+                    options={CAPTION_STYLE_OPTIONS}
+                    onChange={(value) => setCaptionStyle(value as CaptionStyle)}
+                  />
+                </div>
+                <label className="mt-4 block text-sm">
+                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                    CTA / offer context
+                  </span>
+                  <input
+                    value={ctaContext}
+                    onChange={(event) => setCtaContext(event.target.value)}
+                    placeholder="Comment MONEY and I will DM you the quiz + webinar link."
+                    className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
+                  />
+                </label>
+                <label className="mt-4 block text-sm">
+                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                    Custom creative direction
+                  </span>
+                  <textarea
+                    value={creativeDirection}
+                    onChange={(event) => setCreativeDirection(event.target.value)}
+                    placeholder="Make this feel like a premium money mentor reel. Avoid cheesy stock visuals."
+                    className="mt-2 min-h-[82px] w-full rounded-2xl border border-border/70 bg-card px-3 py-3 outline-none transition focus:border-primary"
+                  />
+                </label>
+                <label className="mt-4 block text-sm">
+                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                    Brand notes
+                  </span>
+                  <textarea
+                    value={brandNotes}
+                    onChange={(event) => setBrandNotes(event.target.value)}
+                    placeholder="Dark premium look, yellow highlight words, no emojis, confident tone."
+                    className="mt-2 min-h-[70px] w-full rounded-2xl border border-border/70 bg-card px-3 py-3 outline-none transition focus:border-primary"
+                  />
+                </label>
+              </div>
+
+              {showAdvancedUi ? (
+                <>
+                  <div className="mt-6 grid gap-4 md:grid-cols-3">
+                    <NumberField
+                      label="Min safety duration"
+                      value={minDurationSec}
+                      min={0.5}
+                      step={0.5}
+                      onChange={setMinDurationSec}
                     />
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Ollama model
-                    </span>
-                    <input
-                      value={ollamaModel}
-                      onChange={(event) => setOllamaModel(event.target.value)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    <NumberField
+                      label="Max safety duration"
+                      value={maxDurationSec}
+                      min={0.5}
+                      step={0.5}
+                      onChange={setMaxDurationSec}
                     />
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Gemini fallback model
-                    </span>
-                    <input
-                      value={geminiModel}
-                      onChange={(event) => setGeminiModel(event.target.value)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                    <TrackField
+                      tracks={hostStatus?.videoTracks ?? []}
+                      value={targetVideoTrack}
+                      onChange={setTargetVideoTrack}
                     />
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      AI confidence threshold
-                    </span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={aiConfidenceThreshold}
-                      onChange={(event) =>
-                        setAiConfidenceThreshold(Math.max(0, Math.min(1, Number(event.target.value))))
-                      }
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
-                    />
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Pacing preset
-                    </span>
-                    <select
-                      value={pacingPreset}
-                      onChange={(event) => setPacingPreset(event.target.value as EditorPacingPreset)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
-                    >
-                      <option value="documentary">Documentary</option>
-                      <option value="social-fast">Social fast cut</option>
-                      <option value="cinematic-slow">Cinematic slow</option>
-                      <option value="tutorial">Tutorial / explainer</option>
-                    </select>
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Cut boundary
-                    </span>
-                    <select
-                      value={cutBoundaryMode}
-                      onChange={(event) => setCutBoundaryMode(event.target.value as CutBoundaryMode)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
-                    >
-                      <option value="ai">AI decides</option>
-                      <option value="phrase">Phrase</option>
-                      <option value="sentence">Sentence</option>
-                      <option value="beat">Paragraph / beat</option>
-                    </select>
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Match style
-                    </span>
-                    <select
-                      value={matchStyle}
-                      onChange={(event) => setMatchStyle(event.target.value as MatchStyle)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
-                    >
-                      <option value="balanced">Balanced</option>
-                      <option value="literal">Literal</option>
-                      <option value="emotional">Emotional</option>
-                      <option value="metaphorical">Metaphorical</option>
-                    </select>
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Asset reuse
-                    </span>
-                    <select
-                      value={assetReusePolicy}
-                      onChange={(event) => setAssetReusePolicy(event.target.value as AssetReusePolicy)}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
-                    >
-                      <option value="avoid-repeat">Avoid repeat</option>
-                      <option value="allow-small-folder-repeat">Allow repeat for small folders</option>
-                      <option value="story-continuity">Story continuity reuse</option>
-                    </select>
-                  </label>
+                  </div>
+
+                  <div className="mt-6 rounded-3xl border border-border/70 bg-background/60 p-4">
+                    <p className="text-sm font-medium">Advanced AI and editorial matching</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Local models profile media after the folder is indexed; whole-script context is sent on every analyze run.
+                    </p>
+                    <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+                      <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">AI story matching</p>
+                      <select
+                        value={aiMode}
+                        onChange={(event) => setAiMode(event.target.value as AiMode)}
+                        className="rounded-2xl border border-border/70 bg-card px-3 py-2 text-sm"
+                      >
+                        <option value="off">Off</option>
+                        <option value="local">Local (Ollama)</option>
+                        <option value="hybrid">Hybrid (Ollama + Gemini fallback)</option>
+                      </select>
+                    </div>
+                    <div className="mt-4 grid gap-3 md:grid-cols-2">
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Ollama endpoint
+                        </span>
+                        <input
+                          value={ollamaBaseUrl}
+                          onChange={(event) => setOllamaBaseUrl(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Ollama model
+                        </span>
+                        <input
+                          value={ollamaModel}
+                          onChange={(event) => setOllamaModel(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Gemini fallback model
+                        </span>
+                        <input
+                          value={geminiModel}
+                          onChange={(event) => setGeminiModel(event.target.value)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          AI confidence threshold
+                        </span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={aiConfidenceThreshold}
+                          onChange={(event) =>
+                            setAiConfidenceThreshold(Math.max(0, Math.min(1, Number(event.target.value))))
+                          }
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        />
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Pacing preset
+                        </span>
+                        <select
+                          value={pacingPreset}
+                          onChange={(event) => setPacingPreset(event.target.value as EditorPacingPreset)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        >
+                          <option value="documentary">Documentary</option>
+                          <option value="social-fast">Social fast cut</option>
+                          <option value="cinematic-slow">Cinematic slow</option>
+                          <option value="tutorial">Tutorial / explainer</option>
+                        </select>
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Cut boundary
+                        </span>
+                        <select
+                          value={cutBoundaryMode}
+                          onChange={(event) => setCutBoundaryMode(event.target.value as CutBoundaryMode)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        >
+                          <option value="ai">AI decides</option>
+                          <option value="phrase">Phrase</option>
+                          <option value="sentence">Sentence</option>
+                          <option value="beat">Paragraph / beat</option>
+                        </select>
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Match style
+                        </span>
+                        <select
+                          value={matchStyle}
+                          onChange={(event) => setMatchStyle(event.target.value as MatchStyle)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        >
+                          <option value="balanced">Balanced</option>
+                          <option value="literal">Literal</option>
+                          <option value="emotional">Emotional</option>
+                          <option value="metaphorical">Metaphorical</option>
+                        </select>
+                      </label>
+                      <label className="text-sm">
+                        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                          Asset reuse
+                        </span>
+                        <select
+                          value={assetReusePolicy}
+                          onChange={(event) => setAssetReusePolicy(event.target.value as AssetReusePolicy)}
+                          className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
+                        >
+                          <option value="avoid-repeat">Avoid repeat</option>
+                          <option value="allow-small-folder-repeat">Allow repeat for small folders</option>
+                          <option value="story-continuity">Story continuity reuse</option>
+                        </select>
+                      </label>
                   <label className="text-sm">
                     <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
                       Video trim policy
@@ -1281,20 +1983,6 @@ const Index = () => {
                       step={10}
                       value={candidatePoolSize}
                       onChange={(event) => setCandidatePoolSize(Math.max(10, Number(event.target.value)))}
-                      className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
-                    />
-                  </label>
-                  <label className="text-sm">
-                    <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                      Average shot length
-                    </span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={20}
-                      step={0.5}
-                      value={averageShotLengthSec}
-                      onChange={(event) => setAverageShotLengthSec(clampDurationInput(Number(event.target.value), 1))}
                       className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2"
                     />
                   </label>
@@ -1351,6 +2039,36 @@ const Index = () => {
                   </button>
                 </div>
                 <div className="mt-4 space-y-2">
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <StatusCard
+                      label="Primary AI"
+                      value={aiMode === "off" ? "Disabled" : `Local Ollama / ${ollamaModel}`}
+                    />
+                    <StatusCard
+                      label="Fallback"
+                      value={
+                        aiMode === "hybrid"
+                          ? geminiApiKey
+                            ? `Gemini ${geminiModel} only after local failure`
+                            : "Gemini fallback unavailable: missing environment key"
+                          : "Disabled unless Hybrid mode is selected"
+                      }
+                    />
+                    <StatusCard
+                      label="Frame analysis"
+                      value={
+                        analysisDepth === "fast"
+                          ? "Fast metadata mode; no frame review"
+                          : videoTooling.ffmpegAvailable
+                            ? "Enabled for videos with extracted representative frames"
+                            : "Limited: ffmpeg missing, videos use filename/duration hints"
+                      }
+                    />
+                    <StatusCard
+                      label="Duration engine"
+                      value={`Pacing ${pacingPreset}, variation ${(variationStrength * 100).toFixed(0)}%, target ${averageShotLengthSec}s`}
+                    />
+                  </div>
                   {aiHealth.length === 0 ? (
                     <p className="text-sm text-muted-foreground">
                       Provider status will appear after running checks.
@@ -1378,45 +2096,49 @@ const Index = () => {
                     ffmpeg {videoTooling.ffmpegAvailable ? "ready" : "missing"}.
                   </p>
                 </div>
-              </details>
-              <div className="grid gap-4 md:grid-cols-2">
-                <StatusCard
-                  label="Range status"
-                  value={
-                    appendAtTrackEnd
-                      ? "Append mode active"
-                      : hasMeaningfulInOut
-                        ? `In ${formatSeconds(hostStatus?.range.inSec ?? 0)} / Out ${formatSeconds(hostStatus?.range.outSec ?? 0)}`
-                        : "No meaningful In/Out marks detected"
-                  }
-                />
-                <StatusCard
-                  label="Execution mode"
-                  value={
-                    effectivePlan?.mode === "sequence_in_out"
-                      ? "Sequence In/Out priority"
-                      : effectivePlan?.mode === "append"
-                        ? "Append after track end"
-                        : effectivePlan?.mode === "whole_sequence"
-                          ? "Whole-sequence fallback"
-                          : "Blocked until range is chosen"
-                  }
-                />
-                <StatusCard
-                  label="Timing engine"
-                  value="Dynamic editor builds script beats first, then preserves beat boundaries before no-gap repair."
-                />
-                <StatusCard
-                  label="Media review"
-                  value={
-                    placementStrategyMode === "folder-order"
-                      ? "Personal mode is active: scanned files are placed old-to-new without AI reordering."
-                      : placementStrategyMode === "hybrid-fallback"
-                        ? "AI gets first choice, then old-to-new folder order fills weak matches."
-                        : "The full folder is indexed before assignment; semantic profiles drive literal and emotional matching."
-                  }
-                />
-              </div>
+                  </div>
+                </>
+              ) : null}
+              {showAdvancedUi ? (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <StatusCard
+                    label="Range status"
+                    value={
+                      appendAtTrackEnd
+                        ? "Append mode active"
+                        : hasMeaningfulInOut
+                          ? `In ${formatSeconds(hostStatus?.range.inSec ?? 0)} / Out ${formatSeconds(hostStatus?.range.outSec ?? 0)}`
+                          : "No meaningful In/Out marks detected"
+                    }
+                  />
+                  <StatusCard
+                    label="Execution mode"
+                    value={
+                      previewPlan?.mode === "sequence_in_out"
+                        ? "Sequence In/Out priority"
+                        : previewPlan?.mode === "append"
+                          ? "Append after track end"
+                          : previewPlan?.mode === "whole_sequence"
+                            ? "Whole-sequence fallback"
+                            : "Blocked until range is chosen"
+                    }
+                  />
+                  <StatusCard
+                    label="Timing engine"
+                    value="Dynamic editor builds script beats first, then preserves beat boundaries before no-gap repair."
+                  />
+                  <StatusCard
+                    label="Media review"
+                    value={
+                      placementStrategyMode === "folder-order"
+                        ? "Personal mode is active: scanned files are placed old-to-new without AI reordering."
+                        : placementStrategyMode === "hybrid-fallback"
+                          ? "AI gets first choice, then old-to-new folder order fills weak matches."
+                          : "The full folder is indexed before assignment; semantic profiles drive literal and emotional matching."
+                    }
+                  />
+                </div>
+              ) : null}
               {!appendAtTrackEnd && !hasMeaningfulInOut && !useWholeSequenceFallback ? (
                 <InlineMessage
                   tone="warning"
@@ -1427,53 +2149,37 @@ const Index = () => {
           </div>
 
           <div className="space-y-6">
-            <PanelSection
-              step="4"
-              title="Premiere status"
-              description="The host script returns the active sequence, track endpoints, and whether In/Out marks are meaningful enough to drive placement."
-              action={
-                <button
-                  type="button"
-                  onClick={() => void refreshPremiereStatus()}
-                  className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
-                >
-                  Refresh
-                </button>
-              }
-            >
-              <div className="rounded-3xl border border-border/70 bg-background/60 p-4 text-sm">
-                <div className="grid gap-3">
-                  <SummaryRow label="Project" value={hostStatus?.projectName || "Not connected"} />
-                  <SummaryRow label="Sequence" value={hostStatus?.sequenceName || "Open a sequence"} />
-                  <SummaryRow
-                    label="In point"
-                    value={formatSeconds(hostStatus?.range.inSec ?? 0)}
-                  />
-                  <SummaryRow
-                    label="Out point"
-                    value={formatSeconds(hostStatus?.range.outSec ?? 0)}
-                  />
-                </div>
-                {hostStatus?.message ? (
-                  <p className="mt-4 text-sm text-destructive">{hostStatus.message}</p>
-                ) : null}
-                {hostStatus?.videoTracks.length ? (
-                  <div className="mt-4 space-y-2">
-                    {hostStatus.videoTracks.map((track) => (
-                      <div
-                        key={track.index}
-                        className="flex items-center justify-between rounded-2xl border border-border/70 px-3 py-2 text-sm"
-                      >
-                        <span>{track.name || `V${track.index + 1}`}</span>
-                        <span className="font-mono text-xs text-muted-foreground">
-                          end {formatSeconds(track.endSec)}
-                        </span>
-                      </div>
-                    ))}
+            {showAdvancedUi ? (
+              <PanelSection
+                step="4"
+                title="Premiere status"
+                description="Host details for troubleshooting sequence connectivity and track endpoints."
+                action={
+                  <button
+                    type="button"
+                    onClick={() => void refreshPremiereStatus()}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                  >
+                    Refresh
+                  </button>
+                }
+              >
+                <div className="rounded-3xl border border-border/70 bg-background/60 p-4 text-sm">
+                  <div className="grid gap-3">
+                    <SummaryRow label="Project" value={hostStatus?.projectName || "Not connected"} />
+                    <SummaryRow label="Sequence" value={hostStatus?.sequenceName || "Open a sequence"} />
+                    <SummaryRow
+                      label="In point"
+                      value={formatSeconds(hostStatus?.range.inSec ?? 0)}
+                    />
+                    <SummaryRow
+                      label="Out point"
+                      value={formatSeconds(hostStatus?.range.outSec ?? 0)}
+                    />
                   </div>
-                ) : null}
-              </div>
-            </PanelSection>
+                </div>
+              </PanelSection>
+            ) : null}
 
             <PanelSection
               step="5"
@@ -1563,36 +2269,525 @@ const Index = () => {
               description="Review only the placements that matter for the current working range, then send them to Premiere."
             >
               <div className="grid gap-4 md:grid-cols-2">
-                <StatCard label="Preview placements" value={(effectivePlan?.placements.length ?? 0).toString()} />
-                <StatCard label="AI-assisted" value={(previewStats.ai ?? 0).toString()} />
-                <StatCard label="Low-confidence fallback" value={previewStats.fallback.toString()} />
-                <StatCard label="Manual overrides" value={previewStats.manual.toString()} />
-                <StatCard label="Overlap layers" value={previewStats.overlap.toString()} />
-                <StatCard label="Skipped by range" value={(effectivePlan?.skippedCount ?? 0).toString()} />
-                <StatCard label="Clipped by range" value={(effectivePlan?.clippedCount ?? 0).toString()} />
-                <StatCard label="Covered duration" value={formatSeconds(effectivePlan?.coverage.coveredSec ?? 0)} />
-                <StatCard label="Remaining gap" value={`${(effectivePlan?.coverage.gapSec ?? 0).toFixed(2)}s`} />
-                <StatCard label="Filled gaps" value={(effectivePlan?.coverage.filledGapCount ?? 0).toString()} />
-                <StatCard label="Removed slivers" value={(effectivePlan?.coverage.discardedSliverCount ?? 0).toString()} />
-                <StatCard label="Reused media" value={(effectivePlan?.coverage.reusedAssetPlacements ?? 0).toString()} />
-                <StatCard label="Cached reviews" value={aiCacheHits.toString()} />
-                <StatCard label="Indexed assets" value={dynamicMetrics.indexedAssets.toString()} />
-                <StatCard label="Profiled assets" value={dynamicMetrics.profiledAssets.toString()} />
-                <StatCard label="Script beats" value={dynamicMetrics.beatCount.toString()} />
-                <StatCard label="Assigned beats" value={dynamicMetrics.assignedBeats.toString()} />
+                <StatCard label="Preview placements" value={(previewPlan?.placements.length ?? 0).toString()} />
+                <StatCard label="Skipped by range" value={(previewPlan?.skippedCount ?? 0).toString()} />
+                <StatCard label="Clipped by range" value={(previewPlan?.clippedCount ?? 0).toString()} />
+                <StatCard label="Covered duration" value={formatSeconds(previewPlan?.coverage.coveredSec ?? 0)} />
+                <StatCard label="Remaining gap" value={`${(previewPlan?.coverage.gapSec ?? 0).toFixed(2)}s`} />
+                <StatCard
+                  label="Edit recipe"
+                  value={`${getOptionLabel(EDIT_GOAL_OPTIONS, editGoal)} / ${getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}`}
+                />
+                {showAdvancedUi ? (
+                  <>
+                    <StatCard label="AI-assisted" value={(previewStats.ai ?? 0).toString()} />
+                    <StatCard label="Generated in plan" value={(previewStats.generated ?? 0).toString()} />
+                    <StatCard label="Low-confidence fallback" value={previewStats.fallback.toString()} />
+                    <StatCard label="Manual overrides" value={previewStats.manual.toString()} />
+                    <StatCard label="Overlap layers" value={previewStats.overlap.toString()} />
+                    <StatCard label="Filled gaps" value={(previewPlan?.coverage.filledGapCount ?? 0).toString()} />
+                    <StatCard label="Removed slivers" value={(previewPlan?.coverage.discardedSliverCount ?? 0).toString()} />
+                    <StatCard label="Reused media" value={(previewPlan?.coverage.reusedAssetPlacements ?? 0).toString()} />
+                    <StatCard label="Cached reviews" value={aiCacheHits.toString()} />
+                    <StatCard label="Indexed assets" value={dynamicMetrics.indexedAssets.toString()} />
+                    <StatCard label="Profiled assets" value={dynamicMetrics.profiledAssets.toString()} />
+                    <StatCard label="Script beats" value={dynamicMetrics.beatCount.toString()} />
+                    <StatCard label="Assigned beats" value={dynamicMetrics.assignedBeats.toString()} />
+                  </>
+                ) : null}
               </div>
               <div className="rounded-3xl border border-border/70 bg-background/60 p-4 text-sm text-muted-foreground">
-                {effectivePlan?.mode === "append"
+                {previewPlan?.mode === "append"
                   ? "Placements will be appended after the current end of the target track."
-                  : effectivePlan?.mode === "sequence_in_out"
-                    ? `Resolved no-gap coverage inside ${formatSeconds(effectivePlan.rangeStartSec)} - ${formatSeconds(effectivePlan.rangeEndSec)}. Premiere receives final times, so it will not trim these clips again.`
-                    : effectivePlan?.mode === "whole_sequence"
+                  : previewPlan?.mode === "sequence_in_out"
+                    ? `Resolved no-gap coverage inside ${formatSeconds(previewPlan.rangeStartSec)} - ${formatSeconds(previewPlan.rangeEndSec)}. Premiere receives final times, so it will not trim these clips again.`
+                    : previewPlan?.mode === "whole_sequence"
                       ? "Whole-sequence fallback is active because sequence In/Out is not being used."
                       : "Set sequence In/Out or enable whole-sequence fallback to make the preview executable."}
               </div>
+              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Missing Asset Plan</p>
+                    <h3 className="mt-2 text-base font-semibold">Prompt Plan</h3>
+                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+                      Draft briefs for weak, blank, or generated-ready moments. Nothing is generated or imported yet.
+                    </p>
+                  </div>
+                  <StatusPill
+                    tone={missingAssetPlan.prompts.length > 0 ? "warning" : "success"}
+                    label={`${missingAssetPlan.prompts.length} prompts`}
+                  />
+                </div>
+                <div className="mt-4 grid gap-3 md:grid-cols-3">
+                  <StatusCard label="Prompt count" value={missingAssetPlan.prompts.length.toString()} />
+                  <StatusCard label="High priority" value={missingAssetPlan.highPriorityCount.toString()} />
+                  <StatusCard
+                    label="Top type"
+                    value={
+                      missingAssetPlan.prompts.length
+                        ? formatTopPromptType(missingAssetPlan)
+                      : "No missing assets"
+                    }
+                  />
+                  <StatusCard
+                    label="Prompt source"
+                    value={
+                      promptRefinementResult?.refinedCount
+                        ? `AI-refined ${promptRefinementResult.refinedCount} via ${formatProviderName(promptRefinementResult.providerUsed)}`
+                        : "Rule-generated"
+                    }
+                  />
+                </div>
+                {missingAssetPlan.prompts.length > 0 ? (
+                  <>
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleRefinePromptPlan()}
+                        disabled={Boolean(promptRefineBusyMessage) || aiMode === "off"}
+                        className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {promptRefineBusyMessage ?? "Refine prompts with AI"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyAllPrompts()}
+                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                      >
+                        Copy all prompts
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleExportPromptBrief("md")}
+                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                      >
+                        Export MD
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleExportPromptBrief("txt")}
+                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                      >
+                        Export TXT
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleExportPromptBrief("json")}
+                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                      >
+                        Export JSON
+                      </button>
+                      {refinedMissingAssetPlan ? (
+                        <button
+                          type="button"
+                          onClick={handleResetAllPrompts}
+                          className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
+                        >
+                          Reset all to rules
+                        </button>
+                      ) : null}
+                    </div>
+                    {aiMode === "off" ? (
+                      <InlineMessage
+                        tone="warning"
+                        message="Turn AI mode to Local or Hybrid to refine prompts. Rule-generated prompts remain available."
+                      />
+                    ) : null}
+                    {promptRefinementResult?.errors.length ? (
+                      <InlineMessage
+                        tone="warning"
+                        message={`Prompt refinement kept safe fallbacks: ${promptRefinementResult.errors.slice(0, 2).join(" | ")}`}
+                      />
+                    ) : null}
+                    <div className="mt-4 max-h-[360px] space-y-3 overflow-auto">
+                      {missingAssetPlan.prompts.map((prompt) => {
+                        const linkedAssets = assetsByPromptId.get(prompt.id) ?? [];
+                        const draft = assetDraftsByPromptId[prompt.id] ?? {
+                          filePath: "",
+                          sourceTool: "Manual",
+                          notes: "",
+                        };
+
+                        return (
+                          <article
+                          key={prompt.id}
+                          className="rounded-2xl border border-border/70 bg-card/60 p-3 text-sm"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <StatusPill
+                              tone={prompt.priority === "high" ? "warning" : "info"}
+                              label={`${prompt.priority} / ${prompt.suggestedAssetType}`}
+                            />
+                            <span className="font-mono text-xs text-muted-foreground">
+                              {formatSeconds(prompt.startSec)} - {formatSeconds(prompt.endSec)}
+                            </span>
+                          </div>
+                          <p className="mt-3 text-sm leading-6 text-foreground">{prompt.transcriptText}</p>
+                          <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                            <SummaryRow label="Need" value={prompt.usage} />
+                            <SummaryRow label="Tool" value={prompt.suggestedToolCategory} />
+                            <SummaryRow label="Role" value={formatEditorialRole(prompt.editorialRole)} />
+                            <SummaryRow label="Mode" value={prompt.visualMode} />
+                          </div>
+                          {linkedAssets.length > 0 ? (
+                            <div className="mt-3 space-y-2 rounded-2xl border border-emerald-500/25 bg-emerald-500/10 p-3 text-xs">
+                              {linkedAssets.map((asset) => (
+                                <div key={asset.id} className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-emerald-100">
+                                    {asset.fileName} / {asset.status} / {asset.sourceTool}
+                                    {appliedGeneratedAssetIdsByPlacementId[asset.linkedPlacementId] === asset.id ? " / in plan" : ""}
+                                  </span>
+                                  <div className="flex flex-wrap gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "approved")}
+                                      className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10"
+                                    >
+                                      Approve
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "rejected")}
+                                      className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10"
+                                    >
+                                      Reject
+                                    </button>
+                                    {appliedGeneratedAssetIdsByPlacementId[asset.linkedPlacementId] === asset.id ? (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRestoreGeneratedAssetPlacement(asset.linkedPlacementId)}
+                                        className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10"
+                                      >
+                                        Remove from plan
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleUseGeneratedAssetInPlan(asset)}
+                                        disabled={asset.status !== "approved"}
+                                        className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10 disabled:opacity-50"
+                                      >
+                                        Use in plan
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                          <p className="mt-3 text-xs leading-5 text-amber-300">{prompt.reason}</p>
+                          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                            Source:{" "}
+                            <span className="text-foreground">
+                              {prompt.aiRefined
+                                ? `AI-refined via ${formatProviderName(prompt.refinementProvider ?? null)}`
+                                : "rule-generated"}
+                            </span>
+                            {prompt.refinementNote ? ` - ${prompt.refinementNote}` : ""}
+                          </p>
+                          <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">
+                            {prompt.promptText}
+                          </p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              type="button"
+                              onClick={() => void handleCopyPrompt(prompt.id)}
+                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                            >
+                              {copiedPromptIds[prompt.id] ? "Copied" : "Copy prompt"}
+                            </button>
+                            {prompt.aiRefined ? (
+                              <button
+                                type="button"
+                                onClick={() => handleResetPrompt(prompt.id)}
+                                className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                              >
+                                Reset to rule prompt
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setActiveAttachPromptId((current) =>
+                                  current === prompt.id ? null : prompt.id,
+                                )
+                              }
+                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                            >
+                              Attach generated asset
+                            </button>
+                          </div>
+                          {activeAttachPromptId === prompt.id ? (
+                            <div className="mt-3 grid gap-3 rounded-2xl border border-border/70 bg-background/50 p-3 text-xs">
+                              <label className="grid gap-1">
+                                <span className="text-muted-foreground">Local file path</span>
+                                <input
+                                  value={draft.filePath}
+                                  onChange={(event) =>
+                                    handleAttachDraftChange(prompt.id, { filePath: event.target.value })
+                                  }
+                                  placeholder="H:\\Generated\\money-dashboard-shot.mp4"
+                                  className="rounded-xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
+                                />
+                              </label>
+                              <div className="grid gap-3 md:grid-cols-2">
+                                <label className="grid gap-1">
+                                  <span className="text-muted-foreground">Source tool / provider</span>
+                                  <input
+                                    value={draft.sourceTool}
+                                    onChange={(event) =>
+                                      handleAttachDraftChange(prompt.id, { sourceTool: event.target.value })
+                                    }
+                                    placeholder="Kling, Seedance, Runway, Manual, Other"
+                                    className="rounded-xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
+                                  />
+                                </label>
+                                <label className="grid gap-1">
+                                  <span className="text-muted-foreground">Notes</span>
+                                  <input
+                                    value={draft.notes}
+                                    onChange={(event) =>
+                                      handleAttachDraftChange(prompt.id, { notes: event.target.value })
+                                    }
+                                    placeholder="Good take, needs review, alpha pass..."
+                                    className="rounded-xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
+                                  />
+                                </label>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleAttachGeneratedAsset(prompt.id)}
+                                disabled={!draft.filePath.trim()}
+                                className="w-fit rounded-full bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                Link asset to prompt
+                              </button>
+                            </div>
+                          ) : null}
+                        </article>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <p className="mt-4 text-sm text-muted-foreground">
+                    No prompt briefs needed for this preview. Strong local matches can go straight to review.
+                  </p>
+                )}
+              </div>
+              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Asset Inbox</p>
+                    <h3 className="mt-2 text-base font-semibold">Generated Asset Inbox</h3>
+                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
+                      Manually link generated files back to prompt ids now; future automation can write the same records.
+                    </p>
+                  </div>
+                  <StatusPill tone={generatedAssets.length > 0 ? "info" : "success"} label={`${generatedAssets.length} assets`} />
+                </div>
+                <div className="mt-4 grid gap-3 md:grid-cols-3">
+                  <StatusCard label="Imported" value={generatedAssets.length.toString()} />
+                  <StatusCard
+                    label="Approved"
+                    value={generatedAssets.filter((asset) => asset.status === "approved").length.toString()}
+                  />
+                  <StatusCard
+                    label="Ready later"
+                    value="Manual linking only"
+                  />
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={handleUseAllApprovedAssetsInPlan}
+                    disabled={!effectivePlan || generatedAssets.every((asset) => asset.status !== "approved")}
+                    className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Use all approved assets in plan
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRestoreAllGeneratedAssetPlacements}
+                    disabled={Object.keys(appliedGeneratedAssetIdsByPlacementId).length === 0}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
+                  >
+                    Restore original placements
+                  </button>
+                  <select
+                    value={assetStatusFilter}
+                    onChange={(event) =>
+                      setAssetStatusFilter(event.target.value as typeof assetStatusFilter)
+                    }
+                    className="rounded-full border border-border/70 bg-card px-3 py-2 text-sm"
+                  >
+                    <option value="all">All statuses</option>
+                    <option value="imported">Imported</option>
+                    <option value="reviewed">Reviewed</option>
+                    <option value="approved">Approved</option>
+                    <option value="rejected">Rejected</option>
+                  </select>
+                  <select
+                    value={assetTypeFilter}
+                    onChange={(event) =>
+                      setAssetTypeFilter(event.target.value as typeof assetTypeFilter)
+                    }
+                    className="rounded-full border border-border/70 bg-card px-3 py-2 text-sm"
+                  >
+                    <option value="all">All types</option>
+                    <option value="image">Image</option>
+                    <option value="video">Video</option>
+                    <option value="audio">Audio</option>
+                    <option value="alpha">Alpha</option>
+                    <option value="other">Other</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => handleExportAssetInbox("json")}
+                    disabled={generatedAssets.length === 0}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
+                  >
+                    Export JSON
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleExportAssetInbox("csv")}
+                    disabled={generatedAssets.length === 0}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
+                  >
+                    Export CSV
+                  </button>
+                </div>
+                {generatedAssetApplySummary ? (
+                  <InlineMessage
+                    tone={generatedAssetApplySummary.skippedCount > 0 ? "warning" : "success"}
+                    message={`Generated asset plan update: ${generatedAssetApplySummary.updatedCount} updated, ${generatedAssetApplySummary.skippedCount} skipped${
+                      generatedAssetApplySummary.skippedReasons.length
+                        ? `. ${generatedAssetApplySummary.skippedReasons.slice(0, 2).join(" | ")}`
+                        : "."
+                    }`}
+                  />
+                ) : null}
+                {filteredGeneratedAssets.length > 0 ? (
+                  <div className="mt-4 max-h-[300px] space-y-3 overflow-auto">
+                    {filteredGeneratedAssets.map((asset) => {
+                      const isApplied = appliedGeneratedAssetIdsByPlacementId[asset.linkedPlacementId] === asset.id;
+
+                      return (
+                        <article key={asset.id} className="rounded-2xl border border-border/70 bg-card/60 p-3 text-sm">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <StatusPill
+                            tone={asset.status === "approved" ? "success" : asset.status === "rejected" ? "warning" : "info"}
+                            label={`${asset.fileType} / ${asset.status}${isApplied ? " / in plan" : ""}`}
+                          />
+                          <span className="font-mono text-xs text-muted-foreground">
+                            {formatSeconds(asset.timestampStartSec)} - {formatSeconds(asset.timestampEndSec)}
+                          </span>
+                        </div>
+                        <p className="mt-3 font-medium text-foreground">{asset.fileName}</p>
+                        <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{asset.filePath}</p>
+                          <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                            <SummaryRow label="Prompt" value={asset.linkedPromptId} />
+                            <SummaryRow label="Source" value={asset.sourceTool} />
+                            <SummaryRow label="Usage" value={asset.intendedUsage} />
+                            <SummaryRow label="Requested" value={asset.requestedAssetType} />
+                            <SummaryRow
+                              label="Duration"
+                              value={
+                                asset.sourceDurationSec
+                                  ? formatSeconds(asset.sourceDurationSec)
+                                  : asset.durationProbeStatus ?? "not probed"
+                              }
+                            />
+                            <SummaryRow label="Probe" value={asset.durationProbeNote ?? "No duration metadata"} />
+                          </div>
+                        {asset.notes ? <p className="mt-3 text-xs text-muted-foreground">{asset.notes}</p> : null}
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyGeneratedAssetPath(asset)}
+                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                          >
+                            Copy path
+                          </button>
+                          {asset.fileType === "video" ? (
+                            <button
+                              type="button"
+                              onClick={() => handleProbeGeneratedAssetDuration(asset.id)}
+                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                            >
+                              Refresh metadata
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "reviewed")}
+                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                          >
+                            Mark reviewed
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "approved")}
+                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                          >
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "rejected")}
+                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                          >
+                            Reject
+                          </button>
+                          {isApplied ? (
+                            <button
+                              type="button"
+                              onClick={() => handleRestoreGeneratedAssetPlacement(asset.linkedPlacementId)}
+                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                            >
+                              Remove from plan
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleUseGeneratedAssetInPlan(asset)}
+                              disabled={asset.status !== "approved"}
+                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent disabled:opacity-50"
+                            >
+                              Use in plan
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleUnlinkGeneratedAsset(asset.id)}
+                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                          >
+                            Unlink
+                          </button>
+                        </div>
+                      </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="mt-4 text-sm text-muted-foreground">
+                    No generated assets match the current filters. Attach one from a prompt card when a file is ready.
+                  </p>
+                )}
+                <InlineMessage
+                  tone="info"
+                  message="Approved generated assets are organized here for future replanning. This phase does not auto-replace timeline placements."
+                />
+              </div>
               <div className="max-h-[460px] space-y-3 overflow-auto">
-                {effectivePlan?.placements.slice(0, 30).map((placement) => (
-                  <article
+                {previewPlan?.placements.slice(0, 30).map((placement) => {
+                  const prompt = promptByPlacementId.get(placement.id);
+                  const linkedAssets = assetsByPlacementId.get(placement.id) ?? [];
+
+                  return (
+                    <article
                     key={placement.id}
                     className="rounded-3xl border border-border/70 bg-background/60 p-4"
                   >
@@ -1620,7 +2815,132 @@ const Index = () => {
                       </span>
                     </div>
                     <p className="mt-3 text-sm leading-6 text-foreground">{placement.text}</p>
-                    <div className="mt-3 flex items-center justify-between gap-4 text-xs text-muted-foreground">
+                    <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                      <SummaryRow
+                        label="Media"
+                        value={placement.mediaName ? `${placement.mediaType ?? "media"} / ${placement.mediaName}` : "blank gap"}
+                      />
+                      <SummaryRow
+                        label="Duration"
+                        value={`${placement.durationSec.toFixed(2)}s${placement.layerIndex > 0 ? ` / overlap V+${placement.layerIndex}` : ""}`}
+                      />
+                      <SummaryRow label="Role" value={formatEditorialRole(placement.editorialRole)} />
+                      <SummaryRow label="Strategy" value={formatPlacementStrategy(placement.strategy, placement.lowConfidence)} />
+                      <SummaryRow label="Provider" value={formatProviderName(placement.aiProvider)} />
+                      <SummaryRow label="Confidence" value={`${Math.round(placement.aiConfidence * 100)}%`} />
+                      <SummaryRow label="Match" value={formatMatchKind(placement.matchKind)} />
+                      <SummaryRow label="Preference" value={placement.mediaPreference ?? "either"} />
+                      {placement.usingGeneratedAsset ? (
+                        <>
+                          <SummaryRow label="Generated" value={placement.generatedAssetSource ?? "approved asset"} />
+                          <SummaryRow label="Original" value={placement.originalMediaName ?? placement.originalStrategy ?? "blank"} />
+                        </>
+                      ) : null}
+                      <SummaryRow
+                        label="Recipe"
+                        value={`${getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)} / ${getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle)}`}
+                      />
+                      <SummaryRow label="Captions" value={getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle)} />
+                      {placement.mediaType === "video" ? (
+                        <>
+                          <SummaryRow
+                            label="Source"
+                            value={
+                              placement.sourceDurationSec
+                                ? `${formatSeconds(placement.sourceDurationSec)} total`
+                                : "duration unknown"
+                            }
+                          />
+                          <SummaryRow
+                            label="Source range"
+                            value={
+                              placement.sourceInSec !== null && placement.sourceOutSec !== null
+                                ? `${formatSeconds(placement.sourceInSec)} - ${formatSeconds(placement.sourceOutSec)}`
+                                : "not trimmed"
+                            }
+                          />
+                        </>
+                      ) : null}
+                    </div>
+                    <div className="mt-3 space-y-2 rounded-2xl border border-border/70 bg-card/60 p-3 text-xs">
+                      {placement.aiRationale ? (
+                        <p className="leading-5 text-muted-foreground">
+                          <span className="text-foreground">Match:</span> {placement.aiRationale}
+                        </p>
+                      ) : null}
+                      {placement.timingRationale ? (
+                        <p className="leading-5 text-muted-foreground">
+                          <span className="text-foreground">Timing:</span> {placement.timingSource} - {placement.timingRationale}
+                        </p>
+                      ) : null}
+                      {placement.aiVisualMatchReason ? (
+                        <p className="leading-5 text-muted-foreground">
+                          <span className="text-foreground">Visual fit:</span> {placement.aiVisualMatchReason}
+                        </p>
+                      ) : null}
+                      {placement.trimNote ? (
+                        <p className="leading-5 text-muted-foreground">
+                          <span className="text-foreground">Trim:</span> {placement.trimNote}
+                        </p>
+                      ) : null}
+                      {placement.fallbackReason ? (
+                        <p className="leading-5 text-amber-300">{placement.fallbackReason}</p>
+                      ) : null}
+                      {placement.usingGeneratedAsset ? (
+                        <p className="leading-5 text-emerald-300">
+                          Using approved generated asset: {placement.generatedAssetRationale}
+                        </p>
+                      ) : null}
+                      {placement.lowConfidence ? (
+                        <p className="leading-5 text-amber-300">
+                          Review this placement before executing; it is below the current confidence threshold.
+                        </p>
+                      ) : null}
+                      {prompt ? (
+                        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
+                          <p className="font-medium text-amber-200">
+                            Prompt recommended: {prompt.suggestedAssetType} / {prompt.priority}
+                          </p>
+                          <p className="mt-1 leading-5 text-amber-100/80">{prompt.reason}</p>
+                          <p className="mt-1 leading-5 text-amber-100/70">
+                            {prompt.aiRefined
+                              ? `AI-refined via ${formatProviderName(prompt.refinementProvider ?? null)}`
+                              : "Rule-generated prompt"}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyPrompt(prompt.id)}
+                            className="mt-2 rounded-full border border-amber-300/30 px-3 py-1 hover:bg-amber-300/10"
+                          >
+                            {copiedPromptIds[prompt.id] ? "Copied prompt" : "Copy prompt"}
+                          </button>
+                        </div>
+                      ) : null}
+                      {linkedAssets.length > 0 ? (
+                        <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs">
+                          <p className="font-medium text-emerald-200">Generated asset linked</p>
+                          <div className="mt-2 space-y-2">
+                            {linkedAssets.map((asset) => (
+                              <div key={asset.id}>
+                                <p className="text-emerald-100">
+                                  {asset.fileName} / {asset.status} / {asset.sourceTool}
+                                </p>
+                                <p className="mt-1 text-emerald-100/70">
+                                  {asset.intendedUsage}
+                                  {asset.sourceDurationSec ? ` / ${formatSeconds(asset.sourceDurationSec)} source` : " / duration unknown"}
+                                  {placement.generatedAssetId === asset.id
+                                    ? " / currently used in plan"
+                                    : asset.status === "approved"
+                                      ? " / ready for generated-asset replanning"
+                                      : ""}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="hidden">
                       <span>
                         {placement.mediaName
                           ? `[${placement.mediaType}] ${placement.mediaName}`
@@ -1632,62 +2952,65 @@ const Index = () => {
                       </span>
                     </div>
                     {placement.aiProvider ? (
-                      <p className="mt-2 text-xs text-muted-foreground">
+                      <p className="hidden">
                         AI {placement.aiProvider} {(placement.aiConfidence * 100).toFixed(0)}%{" "}
                         {placement.aiRationale ? `- ${placement.aiRationale}` : ""}
                       </p>
                     ) : null}
                     {placement.timingRationale ? (
-                      <p className="mt-2 text-xs text-muted-foreground">
+                      <p className="hidden">
                         Timing {placement.timingSource}: {placement.timingRationale}
                       </p>
                     ) : null}
                     {placement.fallbackReason ? (
-                      <p className="mt-2 text-xs text-amber-300">{placement.fallbackReason}</p>
+                      <p className="hidden">{placement.fallbackReason}</p>
                     ) : null}
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setManualOverridesBySegmentId((previous) => ({
-                            ...previous,
-                            [placement.segmentId]: "auto",
-                          }))
-                        }
-                        className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                      >
-                        Auto
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setManualOverridesBySegmentId((previous) => ({
-                            ...previous,
-                            [placement.segmentId]: "blank",
-                          }))
-                        }
-                        className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                      >
-                        Blank
-                      </button>
-                      {aiRankingsBySegmentId[placement.segmentId]?.rankedAssets?.[0] ? (
+                    {showAdvancedUi ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
                         <button
                           type="button"
                           onClick={() =>
                             setManualOverridesBySegmentId((previous) => ({
                               ...previous,
-                              [placement.segmentId]:
-                                aiRankingsBySegmentId[placement.segmentId].rankedAssets[0].candidateId,
+                              [placement.segmentId]: "auto",
                             }))
                           }
                           className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
                         >
-                          Use AI top
+                          Auto
                         </button>
-                      ) : null}
-                    </div>
-                  </article>
-                ))}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setManualOverridesBySegmentId((previous) => ({
+                              ...previous,
+                              [placement.segmentId]: "blank",
+                            }))
+                          }
+                          className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                        >
+                          Blank
+                        </button>
+                        {aiRankingsBySegmentId[placement.segmentId]?.rankedAssets?.[0] ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setManualOverridesBySegmentId((previous) => ({
+                                ...previous,
+                                [placement.segmentId]:
+                                  aiRankingsBySegmentId[placement.segmentId].rankedAssets[0].candidateId,
+                              }))
+                            }
+                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
+                          >
+                            Use AI top
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    </article>
+                  );
+                })}
                 {!effectivePlan ? (
                   <div className="rounded-3xl border border-dashed border-border/70 p-6 text-sm text-muted-foreground">
                     Add a valid script and media folder to build the preview.
@@ -1856,6 +3179,81 @@ function dedupeMediaItems(items: MediaLibraryItem[]): MediaLibraryItem[] {
   });
 }
 
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  document.body.removeChild(textarea);
+}
+
+function downloadTextFile(fileName: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
+}
+
+function generatedAssetPathExists(filePath: string): boolean | null {
+  if (!isNodeEnabled()) {
+    return null;
+  }
+
+  try {
+    const nodeRequire = window.require as (moduleName: string) => unknown;
+    const fs = nodeRequire("fs") as { existsSync: (path: string) => boolean };
+    return fs.existsSync(filePath);
+  } catch {
+    return null;
+  }
+}
+
+function probeGeneratedAssetDurationMetadata(filePath: string): {
+  sourceDurationSec?: number;
+  durationProbeStatus: ImportedGeneratedAsset["durationProbeStatus"];
+  durationProbeNote: string;
+} {
+  const lowered = filePath.toLowerCase();
+  if (!/\.(mp4|mov|m4v|avi|mkv|webm)$/.test(lowered)) {
+    return {
+      durationProbeStatus: "not_probed",
+      durationProbeNote: "Duration probing is only needed for generated video assets.",
+    };
+  }
+
+  const exists = generatedAssetPathExists(filePath);
+  if (exists === false) {
+    return {
+      durationProbeStatus: "failed",
+      durationProbeNote: "File path does not exist; duration was not probed.",
+    };
+  }
+
+  return probeVideoDuration(filePath);
+}
+
+function formatTopPromptType(plan: MissingAssetPlan): string {
+  const [type, count] = Object.entries(plan.byType).sort((left, right) => right[1] - left[1])[0] ?? ["image", 0];
+  return count > 0 ? `${type} (${count})` : "No missing assets";
+}
+
+function getOptionLabel<T extends string>(options: Array<{ value: T; label: string }>, value: T): string {
+  return options.find((option) => option.value === value)?.label ?? value;
+}
+
 function scanLibraryFolder(folderPath: string, mode: MediaLibraryMode, sortMode: MediaSortMode): MediaScanResult {
   try {
     return listMediaFiles(folderPath, mode, sortMode);
@@ -1873,6 +3271,14 @@ function clampDurationInput(value: number, min: number): number {
   }
 
   return Math.max(min, Math.round(value * 100) / 100);
+}
+
+function clampVariationStrength(value: number): number {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_DYNAMIC_EDITOR_SETTINGS.variationStrength;
+  }
+
+  return Math.max(0, Math.min(1, Math.round(value * 1000) / 1000));
 }
 
 function applyWorkingRange(
@@ -1897,15 +3303,97 @@ function applyWorkingRange(
       clippedCount += 1;
     }
 
+    const trimOffsetSec = Math.max(0, nextStart - placement.startSec);
+    const nextDurationSec = Math.max(0, Math.round((nextEnd - nextStart) * 100) / 100);
+    const nextSourceInSec =
+      placement.sourceInSec !== null ? Math.round((placement.sourceInSec + trimOffsetSec) * 100) / 100 : null;
+    const nextSourceOutSec =
+      nextSourceInSec !== null && placement.sourceOutSec !== null
+        ? Math.round(Math.min(placement.sourceOutSec, nextSourceInSec + nextDurationSec) * 100) / 100
+        : placement.sourceOutSec;
+
     result.push({
       ...placement,
       startSec: nextStart,
       endSec: nextEnd,
-      durationSec: Math.max(0, Math.round((nextEnd - nextStart) * 100) / 100),
+      durationSec: nextDurationSec,
+      sourceInSec: nextSourceInSec,
+      sourceOutSec: nextSourceOutSec,
     });
   });
 
   return { placements: result, skippedCount, clippedCount };
+}
+
+function formatProviderName(provider: string | null): string {
+  if (!provider) {
+    return "deterministic";
+  }
+
+  return provider
+    .split("+")
+    .map((name) =>
+      name === "ollama"
+        ? "Gemma/Ollama"
+        : name === "gemini"
+          ? "Gemini fallback"
+          : name === "heuristic"
+            ? "deterministic"
+            : name,
+    )
+    .join(" + ");
+}
+
+function formatPlacementStrategy(
+  strategy: TimelinePlacement["strategy"],
+  lowConfidence: boolean,
+): string {
+  if (lowConfidence) {
+    return "review fallback";
+  }
+
+  if (strategy === "ai") {
+    return "AI selected";
+  }
+
+  if (strategy === "manual") {
+    return "manual";
+  }
+
+  if (strategy === "generated") {
+    return "approved generated";
+  }
+
+  return strategy;
+}
+
+function formatEditorialRole(role: TimelinePlacement["editorialRole"]): string {
+  switch (role) {
+    case "cta":
+      return "CTA";
+    case "hook":
+      return "hook";
+    case "proof":
+      return "proof";
+    case "transition":
+      return "transition";
+    case "explanation":
+      return "explanation";
+    default:
+      return "general";
+  }
+}
+
+function formatMatchKind(kind: TimelinePlacement["matchKind"]): string {
+  if (!kind) {
+    return "not scored";
+  }
+
+  if (kind === "style") {
+    return "style/mood";
+  }
+
+  return kind;
 }
 
 function PanelSection({
@@ -1987,6 +3475,35 @@ function StatusCard({ label, value }: { label: string; value: string }) {
       <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{label}</p>
       <p className="mt-2 text-sm font-medium leading-6 text-foreground">{value}</p>
     </div>
+  );
+}
+
+function DirectionSelect<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: Array<{ value: T; label: string }>;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <label className="text-sm">
+      <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{label}</span>
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value as T)}
+        className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

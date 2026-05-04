@@ -1,5 +1,5 @@
 import { ScriptSegment } from "./script-parser";
-import { AiSegmentRanking, PlacementStrategyMode } from "./ai/types";
+import { AiSegmentRanking, EditorPacingPreset, PlacementStrategyMode } from "./ai/types";
 import { MediaLibraryItem, normalizePath } from "./media";
 
 export interface TimelinePlannerSettings {
@@ -17,6 +17,9 @@ export interface TimelinePlannerSettings {
   rangeEndSec?: number | null;
   targetSecondsPerClip?: number;
   placementStrategyMode?: PlacementStrategyMode;
+  variationStrength?: number;
+  /** Drives minimum readable clip spacing when AI beat windows are absent. */
+  editorPacingPreset?: EditorPacingPreset;
 }
 
 export interface TimelinePlacement {
@@ -28,7 +31,7 @@ export interface TimelinePlacement {
   startSec: number;
   endSec: number;
   durationSec: number;
-  strategy: "ai" | "manual" | "fallback" | "blank";
+  strategy: "ai" | "manual" | "fallback" | "blank" | "generated";
   mediaPath: string | null;
   mediaName: string | null;
   mediaType: MediaLibraryItem["type"] | null;
@@ -36,12 +39,30 @@ export interface TimelinePlacement {
   keywordScore: number;
   aiConfidence: number;
   aiRationale: string | null;
+  aiVisualMatchReason: string | null;
+  matchKind: AiSegmentRanking["rankedAssets"][number]["matchKind"] | null;
+  mediaPreference: AiSegmentRanking["rankedAssets"][number]["mediaPreference"] | null;
   aiProvider: string | null;
   lowConfidence: boolean;
   fallbackReason: string | null;
   timingSource: "ai" | "segment" | "heuristic";
   timingRationale: string | null;
   overlapStyle: "single" | "parallel" | "staggered";
+  editorialRole: "hook" | "explanation" | "proof" | "transition" | "cta" | "general";
+  sourceInSec: number | null;
+  sourceOutSec: number | null;
+  sourceDurationSec: number | null;
+  trimApplied: boolean;
+  trimNote: string | null;
+  generatedAssetId?: string;
+  originalMediaPath?: string | null;
+  originalMediaName?: string | null;
+  originalMediaType?: MediaLibraryItem["type"] | null;
+  originalStrategy?: "ai" | "manual" | "fallback" | "blank";
+  usingGeneratedAsset?: boolean;
+  generatedAssetSource?: string;
+  generatedAssetStatus?: "imported" | "reviewed" | "approved" | "rejected";
+  generatedAssetRationale?: string;
 }
 
 export interface TimelinePlan {
@@ -124,6 +145,7 @@ interface ClipWindow {
   startSec: number;
   durationSec: number;
   text: string;
+  role: TimelinePlacement["editorialRole"];
 }
 
 interface AssetMatch {
@@ -134,6 +156,18 @@ interface AssetMatch {
   provider: string;
   lowConfidence: boolean;
   fallbackReason: string | null;
+  sourceDurationSec?: number;
+  visualMatchReason?: string;
+  matchKind?: AiSegmentRanking["rankedAssets"][number]["matchKind"];
+  mediaPreference?: AiSegmentRanking["rankedAssets"][number]["mediaPreference"];
+}
+
+interface SourceTrimDecision {
+  sourceInSec: number | null;
+  sourceOutSec: number | null;
+  sourceDurationSec: number | null;
+  trimApplied: boolean;
+  trimNote: string | null;
 }
 
 export function buildTimelinePlan(
@@ -153,7 +187,7 @@ export function buildTimelinePlan(
     )
     .map<MediaCandidate>((mediaItem) => ({
       ...mediaItem,
-      tokens: tokenize(mediaItem.name),
+      tokens: tokenize(`${mediaItem.name} ${mediaItem.path}`),
     }));
 
   const assetUsageByIndex = new Map<number, AssetUsage>();
@@ -208,10 +242,14 @@ export function buildTimelinePlan(
       let keywordScore = 0;
       let aiConfidence = 0;
       let aiRationale: string | null = null;
+      let aiVisualMatchReason: string | null = null;
+      let matchKind: TimelinePlacement["matchKind"] = null;
+      let mediaPreference: TimelinePlacement["mediaPreference"] = null;
       let aiProvider: string | null = null;
       let lowConfidence = false;
       let fallbackReason: string | null = null;
       let selectedIndex: number | null = null;
+      let sourceDurationSec: number | undefined;
 
       if (override !== "auto" && override) {
         const overrideIndex = assetIndexByPath.get(normalizePath(override));
@@ -223,6 +261,8 @@ export function buildTimelinePlan(
           mediaType = overrideAsset.type;
           aiConfidence = 1;
           aiRationale = "Manually overridden in review.";
+          aiVisualMatchReason = "Manual selection by editor.";
+          matchKind = "fallback";
           aiProvider = "manual";
           selectedIndex = overrideIndex;
           matchedByAi += 1;
@@ -260,7 +300,7 @@ export function buildTimelinePlan(
       if (orderedFallbackMatch) {
         nextOrderedAssetIndex = orderedFallbackMatch.nextCursor;
       }
-      const genericFallbackMatch = !mediaPath && !keywordMatch && !orderedFallbackMatch && assets.length > 0
+      const genericFallbackMatch = !mediaPath && !keywordMatch && !orderedFallbackMatch && assets.length > 0 && shouldUseGenericFallback(aiRanking)
         ? findReusableAsset(assets, assetUsageByIndex, pathsUsedInSegment, index, clipWindow.startSec)
         : null;
 
@@ -271,6 +311,8 @@ export function buildTimelinePlan(
         mediaType = orderedMatch.asset.type;
         aiConfidence = 1;
         aiRationale = "Strict folder-order mode selected this media by download/creation order.";
+        aiVisualMatchReason = "Folder-order mode bypasses semantic review.";
+        matchKind = "fallback";
         aiProvider = "folder-order";
         selectedIndex = orderedMatch.index;
         matchedByAi += 1;
@@ -281,9 +323,13 @@ export function buildTimelinePlan(
         mediaType = aiMatch.asset.type;
         aiConfidence = aiMatch.confidence;
         aiRationale = aiMatch.rationale;
+        aiVisualMatchReason = aiMatch.visualMatchReason ?? null;
+        matchKind = aiMatch.matchKind ?? null;
+        mediaPreference = aiMatch.mediaPreference ?? null;
         aiProvider = aiMatch.provider;
         lowConfidence = aiMatch.lowConfidence;
         fallbackReason = aiMatch.fallbackReason;
+        sourceDurationSec = aiMatch.sourceDurationSec;
         selectedIndex = aiMatch.index;
         if (aiMatch.lowConfidence) {
           matchedByFallback += 1;
@@ -298,6 +344,9 @@ export function buildTimelinePlan(
         keywordScore = keywordMatch.score;
         aiConfidence = aiRanking?.confidence ?? 0;
         aiRationale = aiRanking?.rationale ?? "No high-confidence semantic match was available, so a lexical hint was used.";
+        aiVisualMatchReason = "Lexical fallback matched transcript intent against filename/folder tokens.";
+        matchKind = "fallback";
+        mediaPreference = prefersVideoFallback(segment.text) ? "video" : "either";
         aiProvider = aiRanking?.provider ?? null;
         lowConfidence = true;
         fallbackReason = "Used lexical fallback because AI confidence was below threshold.";
@@ -310,6 +359,8 @@ export function buildTimelinePlan(
         mediaType = orderedFallbackMatch.asset.type;
         aiConfidence = aiRanking?.confidence ?? 0;
         aiRationale = aiRanking?.rationale ?? "Hybrid mode used folder order because no strong AI match was available.";
+        aiVisualMatchReason = "Hybrid fallback used scanned folder order after semantic match was weak.";
+        matchKind = "fallback";
         aiProvider = aiRanking?.provider ?? "folder-order";
         lowConfidence = true;
         fallbackReason = "Used old-to-new folder order as the fallback placement strategy.";
@@ -322,14 +373,25 @@ export function buildTimelinePlan(
         mediaType = genericFallbackMatch.asset.type;
         aiConfidence = aiRanking?.confidence ?? 0;
         aiRationale = aiRanking?.rationale ?? "No semantic or lexical match was available, so the least-repeated asset was reused to keep the timeline filled.";
+        aiVisualMatchReason = "Least-repeated media fallback; review because semantic relevance is not guaranteed.";
+        matchKind = "fallback";
         aiProvider = aiRanking?.provider ?? null;
         lowConfidence = true;
-        fallbackReason = "Reused available media to avoid leaving this script span blank.";
+        fallbackReason = "Reused least-repeated available media because no stronger semantic match was found; review before executing.";
         selectedIndex = genericFallbackMatch.index;
         matchedByFallback += 1;
       } else if (!mediaPath && settings.blankWhenNoImage) {
         blanks += 1;
       }
+
+      const sourceTrim = selectedIndex !== null && mediaType === "video"
+        ? resolveVideoSourceTrim({
+            clipWindow,
+            settings,
+            sourceDurationSec,
+            previousUsage: assetUsageByIndex.get(selectedIndex),
+          })
+        : createDefaultSourceTrim(mediaType, clipWindow.durationSec);
 
       if (selectedIndex !== null) {
         const previousUsage = assetUsageByIndex.get(selectedIndex);
@@ -357,12 +419,21 @@ export function buildTimelinePlan(
         keywordScore,
         aiConfidence,
         aiRationale,
+        aiVisualMatchReason,
+        matchKind,
+        mediaPreference,
         aiProvider,
         lowConfidence,
         fallbackReason,
         timingSource: durationDecision.source,
         timingRationale: durationDecision.rationale,
         overlapStyle,
+        editorialRole: clipWindow.role,
+        sourceInSec: sourceTrim.sourceInSec,
+        sourceOutSec: sourceTrim.sourceOutSec,
+        sourceDurationSec: sourceTrim.sourceDurationSec,
+        trimApplied: sourceTrim.trimApplied,
+        trimNote: sourceTrim.trimNote,
       });
 
       if (
@@ -474,9 +545,13 @@ function findAiMatch(
       rationale: ranked.rationale || aiRanking.rationale,
       provider: aiRanking.provider,
       lowConfidence: aiRanking.confidence < confidenceThreshold,
+      sourceDurationSec: ranked.sourceDurationSec,
+      visualMatchReason: ranked.visualMatchReason,
+      matchKind: ranked.matchKind,
+      mediaPreference: ranked.mediaPreference,
       fallbackReason:
         aiRanking.confidence < confidenceThreshold
-          ? aiRanking.lowConfidenceReason ?? "AI confidence fell below the review threshold."
+          ? ranked.lowConfidenceReason ?? aiRanking.lowConfidenceReason ?? "AI confidence fell below the review threshold."
           : null,
     };
   }
@@ -492,7 +567,7 @@ function findKeywordMatch(
   segmentIndex: number,
   startSec: number,
 ): { asset: MediaCandidate; index: number; score: number } | null {
-  const textTokens = tokenize(text);
+  const textTokens = tokenize(`${text} ${inferFallbackIntentText(text)}`);
   let bestMatch: { asset: MediaCandidate; index: number; score: number; adjustedScore: number } | null = null;
 
   if (textTokens.size === 0) {
@@ -506,8 +581,11 @@ function findKeywordMatch(
         score += 1;
       }
     });
+    if (prefersVideoFallback(text) && asset.type === "video") {
+      score += 0.75;
+    }
 
-    if (score === 0) {
+    if (score < 1) {
       return;
     }
 
@@ -519,6 +597,28 @@ function findKeywordMatch(
   });
 
   return bestMatch;
+}
+
+function shouldUseGenericFallback(aiRanking: AiSegmentRanking | undefined): boolean {
+  if (!aiRanking) {
+    return true;
+  }
+
+  return aiRanking.confidence >= 0.26;
+}
+
+function inferFallbackIntentText(text: string): string {
+  const lowered = text.toLowerCase();
+  const tokens: string[] = [];
+  if (/\b(money|sales|revenue|profit|income|cash)\b/.test(lowered)) tokens.push("payment dashboard laptop business client finance revenue");
+  if (/\b(travel|airport|plane|cafe|hotel|remote|freedom)\b/.test(lowered)) tokens.push("travel airport cafe remote laptop plane hotel work");
+  if (/\b(client|lead|customer|book|quiz|training|call)\b/.test(lowered)) tokens.push("client lead calendar call form training crm dashboard");
+  if (/\b(step|system|process|how|explain)\b/.test(lowered)) tokens.push("screen hands checklist desk diagram tool workspace");
+  return tokens.join(" ");
+}
+
+function prefersVideoFallback(text: string): boolean {
+  return /\b(travel|walk|move|scroll|dashboard|payment|call|work|show|demonstrate|transition)\b/i.test(text);
 }
 
 function findReusableAsset(
@@ -703,7 +803,16 @@ function deriveSentenceAwareDuration(segment: ScriptSegment): number {
   const cadenceDuration = Math.max(1.25, segment.wordCount / 2.8);
   const punctuationBonus = segment.sentenceComplete ? 0.75 : 0;
   const sentenceBonus = Math.min(1.25, Math.max(0, segment.sentenceCount - 1) * 0.35);
-  return cadenceDuration + punctuationBonus + sentenceBonus;
+  const role = classifyEditorialRole(segment.text, 0);
+  const roleHold =
+    role === "hook" || role === "cta"
+      ? 0.65
+      : role === "proof"
+        ? 0.35
+        : role === "transition"
+          ? -0.25
+          : 0;
+  return cadenceDuration + punctuationBonus + sentenceBonus + roleHold;
 }
 
 function createClipWindows(
@@ -720,6 +829,7 @@ function createClipWindows(
       startSec: roundDuration(beatWindow.startSec),
       durationSec: roundDuration(beatWindow.endSec - beatWindow.startSec),
       text: beatWindow.text || segment.text,
+      role: classifyEditorialRole(beatWindow.text || segment.text, index),
     }));
   }
 
@@ -732,27 +842,206 @@ function createClipWindows(
         startSec: segment.startSec,
         durationSec,
         text: segment.text,
+        role: classifyEditorialRole(segment.text, 0),
       },
     ];
   }
 
   const snippets = splitTextForClips(segment.text, clipCount);
-  const baseDuration = durationSec / clipCount;
+  const clipDurations = distributeClipDurations(snippets, durationSec, settings);
   const windows: ClipWindow[] = [];
+  let cursor = segment.startSec;
 
   for (let clipIndex = 0; clipIndex < clipCount; clipIndex += 1) {
-    const startSec = segment.startSec + baseDuration * clipIndex;
-    const endSec = clipIndex === clipCount - 1 ? segment.startSec + durationSec : startSec + baseDuration;
+    const startSec = cursor;
+    const clipDuration = clipIndex === clipCount - 1
+      ? Math.max(0.3, segment.startSec + durationSec - cursor)
+      : clipDurations[clipIndex] ?? durationSec / clipCount;
     windows.push({
       index: clipIndex,
       count: clipCount,
       startSec: roundDuration(startSec),
-      durationSec: roundDuration(endSec - startSec),
+      durationSec: roundDuration(clipDuration),
       text: snippets[clipIndex] ?? segment.text,
+      role: classifyEditorialRole(snippets[clipIndex] ?? segment.text, clipIndex),
     });
+    cursor = roundDuration(cursor + clipDuration);
   }
 
   return windows;
+}
+
+function distributeClipDurations(
+  snippets: string[],
+  totalDurationSec: number,
+  settings: TimelinePlannerSettings,
+): number[] {
+  const minimum = Math.max(0.3, Math.min(resolveMinReadableClipSec(settings), totalDurationSec / snippets.length));
+  const preset = settings.editorPacingPreset ?? "documentary";
+  const variation = Math.max(0, Math.min(1, settings.variationStrength ?? 0.25));
+  const rawWeights = snippets.map((snippet, index) => {
+    const wordCount = snippet.split(/\s+/).filter(Boolean).length;
+    const role = classifyEditorialRole(snippet, index);
+    const intensity = estimateTextIntensity(snippet);
+    const roleWeight =
+      role === "hook" || role === "cta"
+        ? 1.22
+        : role === "proof"
+          ? 1.12
+          : role === "transition"
+            ? 0.82
+            : 1;
+    const pacingWeight =
+      preset === "social-fast"
+        ? 0.88
+        : preset === "cinematic-slow"
+          ? 1.16
+          : preset === "tutorial"
+            ? 1.08
+            : 1;
+    const naturalWeight = Math.max(0.72, Math.sqrt(Math.max(1, wordCount)) / 2.4);
+    const drift = 1 + variation * Math.sin((index + 1) * 1.618) * 0.22;
+    return Math.max(0.35, naturalWeight * roleWeight * pacingWeight * (1 + intensity * 0.12) * drift);
+  });
+  const totalWeight = rawWeights.reduce((sum, value) => sum + value, 0) || 1;
+  const initial = rawWeights.map((weight) => (weight / totalWeight) * totalDurationSec);
+  const bounded = initial.map((value) => Math.max(minimum, value));
+  const boundedSum = bounded.reduce((sum, value) => sum + value, 0);
+  const scaled = boundedSum > totalDurationSec
+    ? bounded.map((value) => (value / boundedSum) * totalDurationSec)
+    : bounded;
+  const scaledSum = scaled.reduce((sum, value) => sum + value, 0);
+  if (scaled.length > 0) {
+    scaled[scaled.length - 1] += totalDurationSec - scaledSum;
+  }
+  return scaled.map(roundDuration);
+}
+
+function classifyEditorialRole(text: string, index: number): TimelinePlacement["editorialRole"] {
+  const lowered = text.toLowerCase();
+  if (index === 0 && /(\?|stop|wait|mistake|secret|truth|nobody|why|how|this is)/.test(lowered)) {
+    return "hook";
+  }
+  if (/\b(comment|dm|click|subscribe|follow|book|buy|send|link|cta|call to action)\b/.test(lowered)) {
+    return "cta";
+  }
+  if (/\b(proof|result|case study|because|data|numbers|client|testimonial|evidence)\b/.test(lowered)) {
+    return "proof";
+  }
+  if (/\b(but|however|meanwhile|then|next|now|so)\b/.test(lowered) && text.split(/\s+/).length < 16) {
+    return "transition";
+  }
+  if (/\b(how|why|step|process|explain|learn|because)\b/.test(lowered)) {
+    return "explanation";
+  }
+  return "general";
+}
+
+function estimateTextIntensity(text: string): number {
+  const urgentWords = (text.match(/\b(now|never|mistake|risk|secret|truth|win|lose|money|urgent|fast|stop)\b/gi) ?? []).length;
+  const punctuation = (text.match(/[!?]/g) ?? []).length;
+  return Math.min(1, urgentWords * 0.18 + punctuation * 0.14);
+}
+
+function createDefaultSourceTrim(
+  mediaType: MediaLibraryItem["type"] | null,
+  placementDurationSec: number,
+): SourceTrimDecision {
+  if (mediaType === "image") {
+    return {
+      sourceInSec: null,
+      sourceOutSec: null,
+      sourceDurationSec: null,
+      trimApplied: false,
+      trimNote: "Image duration varies with transcript role and pacing so stills feel less static.",
+    };
+  }
+
+  if (mediaType === "video") {
+    return {
+      sourceInSec: 0,
+      sourceOutSec: roundDuration(placementDurationSec),
+      sourceDurationSec: null,
+      trimApplied: true,
+      trimNote: "Using opening section because source duration is unknown.",
+    };
+  }
+
+  return {
+    sourceInSec: null,
+    sourceOutSec: null,
+    sourceDurationSec: null,
+    trimApplied: false,
+    trimNote: null,
+  };
+}
+
+function resolveVideoSourceTrim({
+  clipWindow,
+  previousUsage,
+  settings,
+  sourceDurationSec,
+}: {
+  clipWindow: ClipWindow;
+  settings: TimelinePlannerSettings;
+  sourceDurationSec?: number;
+  previousUsage?: AssetUsage;
+}): SourceTrimDecision {
+  const placementDurationSec = Math.max(0.3, clipWindow.durationSec);
+  if (!sourceDurationSec || !Number.isFinite(sourceDurationSec) || sourceDurationSec <= placementDurationSec + 0.25) {
+    return {
+      sourceInSec: 0,
+      sourceOutSec: roundDuration(placementDurationSec),
+      sourceDurationSec: sourceDurationSec ?? null,
+      trimApplied: true,
+      trimNote: "Using opening section because source duration is unknown or too short for alternate trimming.",
+    };
+  }
+
+  const safeTailSec = Math.min(1.2, Math.max(0.25, sourceDurationSec * 0.08));
+  const latestStartSec = Math.max(0, sourceDurationSec - placementDurationSec - safeTailSec);
+  const variation = Math.max(0, Math.min(1, settings.variationStrength ?? 0.25));
+  const roleAnchor =
+    clipWindow.role === "hook"
+      ? 0.08
+      : clipWindow.role === "cta"
+        ? 0.68
+        : clipWindow.role === "proof"
+          ? 0.48
+          : clipWindow.role === "transition"
+            ? 0.36
+            : 0.52;
+  const pacingShift =
+    settings.editorPacingPreset === "social-fast"
+      ? -0.08
+      : settings.editorPacingPreset === "cinematic-slow"
+        ? 0.1
+        : 0;
+  const reuseShift = previousUsage ? 0.23 + Math.min(0.21, previousUsage.count * 0.07) : 0;
+  const drift = Math.sin((clipWindow.index + 1) * 2.414 + placementDurationSec) * 0.12 * variation;
+  const anchor = wrap01(roleAnchor + pacingShift + reuseShift + drift);
+  const sourceInSec = roundDuration(Math.max(0, Math.min(latestStartSec, latestStartSec * anchor)));
+  const sourceOutSec = roundDuration(Math.min(sourceDurationSec - 0.05, sourceInSec + placementDurationSec));
+  const note = previousUsage
+    ? "Using alternate range to reduce repeated footage."
+    : clipWindow.role === "hook"
+      ? "Trimmed to match short hook segment."
+      : sourceInSec > sourceDurationSec * 0.25
+        ? "Using middle section for variation."
+        : "Using early section with enough tail safety.";
+
+  return {
+    sourceInSec,
+    sourceOutSec,
+    sourceDurationSec: roundDuration(sourceDurationSec),
+    trimApplied: true,
+    trimNote: note,
+  };
+}
+
+function wrap01(value: number): number {
+  const wrapped = value % 1;
+  return wrapped < 0 ? wrapped + 1 : wrapped;
 }
 
 function resolveClipCount(
@@ -762,17 +1051,26 @@ function resolveClipCount(
   aiRanking?: AiSegmentRanking,
 ): number {
   const minReadableClipSec = resolveMinReadableClipSec(settings);
-  const targetSecondsPerClip = resolveTargetSecondsPerClip(settings);
   const maxByReadableLength = Math.max(1, Math.floor(durationSec / minReadableClipSec));
+  const targetSecondsPerClip = resolveTargetSecondsPerClip(settings);
+  const preset = settings.editorPacingPreset ?? "documentary";
+  const isFast = preset === "social-fast";
+  const wordDivisor = isFast ? 26 : 46;
+  const wordDensityClipEstimate = Math.ceil((segment.wordCount || 0) / wordDivisor);
+  const sentenceCeiling = Math.min(segment.sentenceCount || 1, isFast ? 8 : 3);
+  const durationBased = Math.ceil(durationSec / targetSecondsPerClip);
   const deterministicCount = Math.max(
-    Math.ceil(durationSec / targetSecondsPerClip),
-    Math.ceil((segment.wordCount || 0) / 24),
-    Math.max(1, Math.min(segment.sentenceCount || 1, Math.ceil(durationSec / minReadableClipSec))),
+    durationBased,
+    Math.min(wordDensityClipEstimate, maxByReadableLength),
+    Math.min(sentenceCeiling, maxByReadableLength),
   );
+
   const aiClipCount = aiRanking?.suggestedClipCount;
-  if (aiClipCount && aiClipCount > 0) {
-    const boundedAiCount = Math.max(deterministicCount - 1, Math.min(deterministicCount + 1, Math.round(aiClipCount)));
-    return clampClipCount(boundedAiCount, maxByReadableLength);
+  const threshold = settings.aiConfidenceThreshold ?? 0.42;
+  if (aiClipCount && aiClipCount > 0 && (aiRanking?.confidence ?? 0) >= threshold) {
+    const roundedAi = Math.round(aiClipCount);
+    const blended = Math.max(durationBased, Math.min(maxByReadableLength, roundedAi));
+    return clampClipCount(blended, maxByReadableLength);
   }
 
   return clampClipCount(deterministicCount, maxByReadableLength);
@@ -788,7 +1086,16 @@ function resolveTargetSecondsPerClip(settings: TimelinePlannerSettings): number 
 }
 
 function resolveMinReadableClipSec(settings: TimelinePlannerSettings): number {
-  return Math.max(1.25, Math.min(4, settings.minDurationSec));
+  const preset = settings.editorPacingPreset ?? "documentary";
+  const configured = settings.minDurationSec;
+  const baseMin = Math.max(1.35, Math.min(5, configured * 1.05));
+  if (preset === "social-fast") {
+    return Math.max(1.08, Math.min(3.2, configured));
+  }
+  if (preset === "cinematic-slow") {
+    return Math.max(2.15, Math.min(6, baseMin));
+  }
+  return Math.max(1.5, Math.min(4.8, baseMin));
 }
 
 function clampClipCount(value: number, maxByReadableLength = 64): number {
@@ -867,7 +1174,14 @@ export function resolveTimelineCoverage(
   placements: TimelinePlacement[],
   settings: Pick<
     TimelinePlannerSettings,
-    "frameRate" | "minDurationSec" | "maxDurationSec" | "rangeStartSec" | "rangeEndSec" | "targetSecondsPerClip"
+    | "frameRate"
+    | "minDurationSec"
+    | "maxDurationSec"
+    | "rangeStartSec"
+    | "rangeEndSec"
+    | "targetSecondsPerClip"
+    | "variationStrength"
+    | "editorPacingPreset"
   >,
 ): { placements: TimelinePlacement[]; summary: Omit<TimelineCoverageSummary, "reusedAssetPlacements"> } {
   const frameRate = Math.max(1, settings.frameRate ?? 30);
@@ -875,6 +1189,8 @@ export function resolveTimelineCoverage(
     minDurationSec: settings.minDurationSec,
     maxDurationSec: settings.maxDurationSec,
     blankWhenNoImage: true,
+    variationStrength: settings.variationStrength,
+    editorPacingPreset: settings.editorPacingPreset,
   });
   const primaryPlacements = placements
     .filter((placement) => placement.trackOffset === 0)
@@ -950,11 +1266,13 @@ export function resolveTimelineCoverage(
       filledGapCount += 1;
     }
 
+    const durationSec = roundDuration(Math.max(1 / frameRate, endSec - startSec));
     resolvedPrimary.push({
       ...placement,
       startSec,
       endSec,
-      durationSec: roundDuration(Math.max(1 / frameRate, endSec - startSec)),
+      durationSec,
+      sourceOutSec: alignSourceOutToDuration(placement, durationSec),
       fallbackReason:
         placement.fallbackReason ??
         (adjustedPlacementCount > 0 ? "Adjusted by no-gap resolver to keep transcript coverage continuous." : null),
@@ -994,12 +1312,27 @@ function quantizePlacements(placements: TimelinePlacement[], frameRate: number):
 function quantizePlacement(placement: TimelinePlacement, frameRate: number): TimelinePlacement {
   const startSec = quantizeToFrame(placement.startSec, frameRate);
   const endSec = quantizeToFrame(Math.max(startSec + 1 / frameRate, placement.endSec), frameRate);
+  const durationSec = roundDuration(endSec - startSec);
   return {
     ...placement,
     startSec,
     endSec,
-    durationSec: roundDuration(endSec - startSec),
+    durationSec,
+    sourceOutSec: alignSourceOutToDuration(placement, durationSec),
   };
+}
+
+function alignSourceOutToDuration(placement: TimelinePlacement, durationSec: number): number | null {
+  if (placement.mediaType !== "video" || placement.sourceInSec === null) {
+    return placement.sourceOutSec;
+  }
+
+  const desiredOut = roundDuration(placement.sourceInSec + durationSec);
+  if (placement.sourceDurationSec && Number.isFinite(placement.sourceDurationSec)) {
+    return roundDuration(Math.min(Math.max(placement.sourceInSec, placement.sourceDurationSec - 0.05), desiredOut));
+  }
+
+  return desiredOut;
 }
 
 function quantizeToFrame(seconds: number, frameRate: number): number {
@@ -1076,12 +1409,21 @@ function createBlankPlacement(input: {
     keywordScore: 0,
     aiConfidence: 0,
     aiRationale: input.rationale,
+    aiVisualMatchReason: null,
+    matchKind: null,
+    mediaPreference: null,
     aiProvider: null,
     lowConfidence: false,
     fallbackReason: null,
     timingSource: input.durationDecision.source,
     timingRationale: input.durationDecision.rationale,
     overlapStyle: input.overlapStyle,
+    editorialRole: input.clipWindow.role,
+    sourceInSec: null,
+    sourceOutSec: null,
+    sourceDurationSec: null,
+    trimApplied: false,
+    trimNote: null,
   };
 }
 
@@ -1124,12 +1466,25 @@ function createOverlapPlacement(input: {
     keywordScore: 0,
     aiConfidence: input.match.confidence,
     aiRationale: input.match.rationale || input.baseRationale,
+    aiVisualMatchReason: input.match.rationale,
+    matchKind: "style",
+    mediaPreference: input.match.asset.type,
     aiProvider: input.provider,
     lowConfidence: input.lowConfidence,
     fallbackReason: input.fallbackReason,
     timingSource: input.timingSource,
     timingRationale: input.timingRationale,
     overlapStyle: input.overlapStyle,
+    editorialRole: input.clipWindow.role,
+    sourceInSec: input.match.asset.type === "video" ? 0 : null,
+    sourceOutSec: input.match.asset.type === "video" ? roundDuration(overlapDuration) : null,
+    sourceDurationSec: null,
+    trimApplied: input.match.asset.type === "video",
+    trimNote:
+      input.match.asset.type === "video"
+        ? `Overlay video trims source from 0s to ${roundDuration(overlapDuration).toFixed(2)}s in the current host workflow.`
+        : input.match.asset.type === "image"
+          ? "Overlay still duration follows the active overlap style."
+          : null,
   };
 }
-

@@ -15,6 +15,7 @@ export interface AiAssetCandidate {
   name: string;
   mediaType: MediaType;
   descriptor?: string;
+  folderKeywords?: string[];
   durationSec?: number;
   sampleTimestampsSec?: number[];
   visualPaths?: string[];
@@ -33,6 +34,8 @@ export interface AssetSemanticProfile {
   shotScale: "wide" | "medium" | "close" | "detail" | "unknown";
   motionEnergy: "static" | "gentle" | "active" | "high" | "unknown";
   useCases: string[];
+  roleTags?: Array<"hook" | "explanation" | "proof" | "transition" | "cta" | "general">;
+  visualStyle?: "literal" | "metaphorical" | "background" | "overlay" | "texture" | "unknown";
   searchText: string;
   confidence: number;
   provider: string;
@@ -48,6 +51,10 @@ export interface ScriptBeat {
   text: string;
   boundary: CutBoundaryMode;
   emotionalTone: string;
+  visualIntent: string;
+  editorialRole: "hook" | "explanation" | "proof" | "transition" | "cta" | "general";
+  visualMode: "literal" | "metaphorical" | "style" | "face-time";
+  preferVideo: boolean;
   keywords: string[];
   pacing: "slow" | "medium" | "fast";
   matchStyle: MatchStyle;
@@ -65,8 +72,17 @@ export interface DynamicEditorSettings {
   candidatePoolSize: number;
   rerankDepth: number;
   averageShotLengthSec: number;
+  /** 0 = proportional beats only; 1 = strongest bounded jitter inside the transcript window. */
+  variationStrength: number;
   minClipDurationSec: number;
   maxClipDurationSec: number;
+  editGoal?: string;
+  editStyle?: string;
+  brollStyle?: string;
+  captionStyle?: string;
+  ctaContext?: string;
+  creativeDirection?: string;
+  brandNotes?: string;
 }
 
 export interface DynamicAssignment {
@@ -118,6 +134,11 @@ export interface AiRankedAsset {
   candidateId: string;
   score: number;
   rationale: string;
+  sourceDurationSec?: number;
+  visualMatchReason?: string;
+  lowConfidenceReason?: string;
+  matchKind?: "literal" | "metaphorical" | "style" | "duration" | "fallback";
+  mediaPreference?: MediaType | "either";
 }
 
 export interface AiSegmentRanking {
@@ -163,7 +184,97 @@ export interface AiScoringContext {
   ffmpegAvailable?: boolean;
   ffprobeAvailable?: boolean;
   customInstructions?: string;
+  editGoal?: string;
+  editStyle?: string;
+  brollStyle?: string;
+  captionStyle?: string;
+  ctaContext?: string;
+  creativeDirection?: string;
+  brandNotes?: string;
   fullScriptContext?: string;
+}
+
+export type MissingAssetType =
+  | "image"
+  | "video"
+  | "background"
+  | "overlay"
+  | "texture"
+  | "thumbnail"
+  | "music"
+  | "sfx"
+  | "rotoscope";
+
+export type MissingAssetToolCategory =
+  | "image generator"
+  | "video generator"
+  | "music generator"
+  | "SFX library"
+  | "rotoscope tool";
+
+export interface MissingAssetPrompt {
+  id: string;
+  segmentId: string;
+  placementId: string;
+  startSec: number;
+  endSec: number;
+  transcriptText: string;
+  editorialRole: ScriptBeat["editorialRole"];
+  visualIntent: string;
+  visualMode: ScriptBeat["visualMode"];
+  reason: string;
+  suggestedAssetType: MissingAssetType;
+  suggestedToolCategory: MissingAssetToolCategory;
+  promptText: string;
+  negativePrompt?: string;
+  styleNotes: string;
+  ctaContext?: string;
+  brandNotes?: string;
+  priority: "high" | "medium" | "low";
+  status: "draft" | "copied" | "imported later";
+  usage: "replace blank" | "replace fallback" | "enhance existing media";
+  aiRefined?: boolean;
+  refinementProvider?: string;
+  refinementNote?: string;
+  originalPromptText?: string;
+  originalNegativePrompt?: string;
+  originalStyleNotes?: string;
+  originalReason?: string;
+  originalUsage?: "replace blank" | "replace fallback" | "enhance existing media";
+  refinedAt?: string;
+}
+
+export interface MissingAssetPlan {
+  prompts: MissingAssetPrompt[];
+  highPriorityCount: number;
+  byType: Record<MissingAssetType, number>;
+  generatedAt: string;
+}
+
+export interface ImportedGeneratedAsset {
+  id: string;
+  filePath: string;
+  fileName: string;
+  fileType: "image" | "video" | "audio" | "alpha" | "other";
+  linkedPromptId: string;
+  linkedPlacementId: string;
+  linkedSegmentId: string;
+  timestampStartSec: number;
+  timestampEndSec: number;
+  sourceTool: string;
+  status: "imported" | "reviewed" | "approved" | "rejected";
+  notes: string;
+  importedAt: string;
+  intendedUsage: MissingAssetPrompt["usage"];
+  requestedAssetType: MissingAssetPrompt["suggestedAssetType"];
+  replaceOrEnhance: MissingAssetPrompt["usage"];
+  sourceDurationSec?: number;
+  durationProbeStatus?: "not_probed" | "available" | "failed" | "unavailable";
+  durationProbeNote?: string;
+}
+
+export interface AssetInboxState {
+  assets: ImportedGeneratedAsset[];
 }
 
 export interface AiBatchResult {

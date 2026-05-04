@@ -59,6 +59,8 @@ export interface ExecuteTimelineJobInput {
     startSec: number;
     endSec: number;
     durationSec: number;
+    sourceInSec?: number | null;
+    sourceOutSec?: number | null;
     mediaPath: string | null;
     strategy: TimelinePlacement["strategy"];
     text: string;
@@ -132,10 +134,16 @@ type NodeRequire = (moduleName: string) => unknown;
 
 interface NodeModules {
   fs: {
-    readdirSync: (path: string, options?: { withFileTypes?: boolean }) => Array<{
-      isDirectory: () => boolean;
-      name: string;
-    }>;
+    existsSync: (path: string) => boolean;
+    readdirSync: (
+      path: string,
+      options?: { withFileTypes?: boolean },
+    ) => Array<
+      string | {
+        isDirectory: () => boolean;
+        name: string;
+      }
+    >;
     readFileSync: (path: string, encoding: string) => string;
     statSync: (path: string) => { birthtimeMs?: number; ctimeMs?: number; mtimeMs?: number };
     writeFileSync: (path: string, data: string, encoding?: string) => void;
@@ -166,6 +174,7 @@ interface NodeModules {
 }
 
 let hostLoaded = false;
+let cachedSilenceBinary: string | null | undefined;
 
 export function isCepEnvironment(): boolean {
   return Boolean(window.__adobe_cep__?.evalScript);
@@ -429,14 +438,23 @@ function detectSilenceSpans(
   clips: PremiereAudioClipInfo[],
   input: SilencePreviewInput,
 ): SilencePreviewResult {
-  const { childProcess } = getNodeModules();
+  const { childProcess, fs, os, path } = getNodeModules();
+  const ffmpegBinary = resolveFfmpegBinary(childProcess.execFileSync, fs, path, os);
+  if (!ffmpegBinary) {
+    return {
+      ok: false,
+      message: "FFmpeg was not found. Install FFmpeg and reopen Premiere/Cursor.",
+      spans: [],
+      details: [],
+    };
+  }
   const spans: SilenceSpan[] = [];
   const details: string[] = [];
 
   clips.forEach((clip) => {
     try {
       const result = childProcess.spawnSync(
-        "ffmpeg",
+        ffmpegBinary,
         [
           "-hide_banner",
           "-nostats",
@@ -476,6 +494,90 @@ function detectSilenceSpans(
     spans: sortedSpans,
     details,
   };
+}
+
+function resolveFfmpegBinary(
+  execFileSync: NodeModules["childProcess"]["execFileSync"],
+  fs: NodeModules["fs"],
+  path: NodeModules["path"],
+  os: NodeModules["os"],
+): string | null {
+  if (cachedSilenceBinary !== undefined) {
+    return cachedSilenceBinary;
+  }
+
+  if (commandExists(execFileSync, "ffmpeg")) {
+    cachedSilenceBinary = "ffmpeg";
+    return cachedSilenceBinary;
+  }
+
+  const localAppData = processEnv("LOCALAPPDATA") ?? path.join(os.tmpdir(), "..", "..");
+  const packagesRoot = path.join(localAppData, "Microsoft", "WinGet", "Packages");
+  if (!fs.existsSync(packagesRoot)) {
+    cachedSilenceBinary = null;
+    return cachedSilenceBinary;
+  }
+
+  let packageFolders: string[] = [];
+  try {
+    packageFolders = readDirectoryNames(fs, packagesRoot);
+  } catch {
+    cachedSilenceBinary = null;
+    return cachedSilenceBinary;
+  }
+
+  const gyanFolders = packageFolders
+    .filter((folder) => /^Gyan\.FFmpeg_/i.test(folder))
+    .sort((left, right) => right.localeCompare(left));
+
+  for (const folder of gyanFolders) {
+    const packageRoot = path.join(packagesRoot, folder);
+    let builds: string[] = [];
+    try {
+      builds = readDirectoryNames(fs, packageRoot);
+    } catch {
+      continue;
+    }
+
+    const buildFolders = builds.filter((entry) => /^ffmpeg-/i.test(entry)).sort((left, right) => right.localeCompare(left));
+    for (const buildFolder of buildFolders) {
+      const binary = path.join(packageRoot, buildFolder, "bin", "ffmpeg.exe");
+      if (fs.existsSync(binary)) {
+        cachedSilenceBinary = normalizePath(binary);
+        return cachedSilenceBinary;
+      }
+    }
+  }
+
+  cachedSilenceBinary = null;
+  return cachedSilenceBinary;
+}
+
+function commandExists(
+  execFileSync: NodeModules["childProcess"]["execFileSync"],
+  command: string,
+): boolean {
+  try {
+    execFileSync(command, ["-version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function processEnv(name: string): string | undefined {
+  try {
+    const nodeRequire = window.require as NodeRequire;
+    const processModule = nodeRequire("process") as { env?: Record<string, string | undefined> };
+    return processModule.env?.[name];
+  } catch {
+    return undefined;
+  }
+}
+
+function readDirectoryNames(fs: NodeModules["fs"], targetPath: string): string[] {
+  const entries = fs.readdirSync(targetPath);
+  return entries.map((entry) => (typeof entry === "string" ? entry : entry.name));
 }
 
 function parseSilenceDetectOutput(

@@ -455,6 +455,9 @@ var weaveEdit = (function () {
       var requestedEndSec = appendOffsetSec + Number(currentPlacement.endSec || (currentPlacement.startSec + durationSec));
       var startSec = requestedStartSec;
       var endSec = requestedEndSec;
+      var sourceInSec = isFinite(Number(currentPlacement.sourceInSec))
+        ? Math.max(0, Number(currentPlacement.sourceInSec))
+        : 0;
 
       if (useSequenceInOut && range.hasMeaningfulInOut) {
         if (requestedEndSec <= workingRangeStartSec || requestedStartSec >= workingRangeEndSec) {
@@ -471,6 +474,8 @@ var weaveEdit = (function () {
           clippedCount += 1;
         }
       }
+
+      sourceInSec = Math.max(0, sourceInSec + Math.max(0, startSec - requestedStartSec));
 
       if (trackOffset > 0 && hasTrackCollision(resolvedTrack, startSec, endSec)) {
         details.push("Skipped " + currentPlacement.id + " because overlap track V" + (resolvedTrackIndex + 1) + " already has media in that range.");
@@ -490,12 +495,20 @@ var weaveEdit = (function () {
       }
 
       try {
+        var sourceOutSec = isFinite(Number(currentPlacement.sourceOutSec)) && Number(currentPlacement.sourceOutSec) > sourceInSec
+          ? Number(currentPlacement.sourceOutSec)
+          : sourceInSec + durationSec;
+
+        if (sourceOutSec - sourceInSec < durationSec - 0.001) {
+          sourceOutSec = sourceInSec + durationSec;
+        }
+
         if (projectItem.setInPoint) {
-          projectItem.setInPoint(0, 4);
+          projectItem.setInPoint(sourceInSec, 4);
         }
 
         if (projectItem.setOutPoint) {
-          projectItem.setOutPoint(durationSec, 4);
+          projectItem.setOutPoint(sourceOutSec, 4);
         }
 
         resolvedTrack.overwriteClip(projectItem, secondsToTicks(startSec));

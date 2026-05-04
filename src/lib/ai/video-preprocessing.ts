@@ -16,6 +16,7 @@ interface NodeModules {
   fs: {
     existsSync: (path: string) => boolean;
     mkdirSync: (path: string, options?: { recursive?: boolean }) => void;
+    readdirSync: (path: string) => string[];
   };
   os: {
     tmpdir: () => string;
@@ -28,6 +29,12 @@ interface NodeModules {
 export interface VideoToolingStatus {
   ffmpegAvailable: boolean;
   ffprobeAvailable: boolean;
+}
+
+export interface VideoDurationProbeResult {
+  sourceDurationSec?: number;
+  durationProbeStatus: "not_probed" | "available" | "failed" | "unavailable";
+  durationProbeNote: string;
 }
 
 export interface HydrateCandidatesResult {
@@ -47,18 +54,50 @@ interface CachedHydration {
 }
 
 const hydrationCache = new Map<string, CachedHydration>();
+let cachedVideoBinaries: { ffmpeg: string | null; ffprobe: string | null } | null = null;
 
 export function detectVideoTooling(): VideoToolingStatus {
   if (!isNodeEnabled()) {
     return { ffmpegAvailable: false, ffprobeAvailable: false };
   }
 
-  const { childProcess } = getNodeModules();
+  const binaries = resolveVideoBinaries();
 
   return {
-    ffmpegAvailable: commandExists(childProcess.execFileSync, "ffmpeg"),
-    ffprobeAvailable: commandExists(childProcess.execFileSync, "ffprobe"),
+    ffmpegAvailable: Boolean(binaries.ffmpeg),
+    ffprobeAvailable: Boolean(binaries.ffprobe),
   };
+}
+
+export function probeVideoDuration(filePath: string): VideoDurationProbeResult {
+  if (!isNodeEnabled()) {
+    return {
+      durationProbeStatus: "unavailable",
+      durationProbeNote: "Node/CEP file access is unavailable; duration was not probed.",
+    };
+  }
+
+  const tooling = detectVideoTooling();
+  if (!tooling.ffprobeAvailable) {
+    return {
+      durationProbeStatus: "unavailable",
+      durationProbeNote: "ffprobe is unavailable; generated video duration is unknown.",
+    };
+  }
+
+  try {
+    const sourceDurationSec = getVideoDuration(filePath);
+    return {
+      sourceDurationSec,
+      durationProbeStatus: "available",
+      durationProbeNote: `Detected generated video duration: ${sourceDurationSec.toFixed(2)} seconds.`,
+    };
+  } catch (error) {
+    return {
+      durationProbeStatus: "failed",
+      durationProbeNote: `Duration probe failed: ${String(error)}`,
+    };
+  }
 }
 
 export async function hydrateAiCandidates(
@@ -126,6 +165,7 @@ export async function indexMediaLibraryForAi(
     path: item.path,
     name: getFileName(item.path),
     mediaType: item.type,
+    folderKeywords: buildFolderKeywords(item.path),
   }));
   const hydrated: AiAssetCandidate[] = [];
   const warnings: string[] = [];
@@ -199,7 +239,11 @@ function hydrateVideoCandidate(
 }
 
 function buildFilenameDescriptor(candidate: AiAssetCandidate): string {
-  return `Filename: ${getFileName(candidate.path)}. Media type: ${candidate.mediaType}.`;
+  return [
+    `Filename: ${getFileName(candidate.path)}.`,
+    `Media type: ${candidate.mediaType}.`,
+    candidate.folderKeywords?.length ? `Folder context: ${candidate.folderKeywords.join(", ")}.` : "",
+  ].filter(Boolean).join(" ");
 }
 
 function buildVideoDescriptor(
@@ -210,6 +254,7 @@ function buildVideoDescriptor(
   const parts = [
     `Filename: ${getFileName(candidate.path)}.`,
     "Media type: video.",
+    candidate.folderKeywords?.length ? `Folder context: ${candidate.folderKeywords.join(", ")}.` : "",
   ];
 
   if (typeof durationSec === "number" && Number.isFinite(durationSec)) {
@@ -221,6 +266,21 @@ function buildVideoDescriptor(
   }
 
   return parts.join(" ");
+}
+
+function buildFolderKeywords(filePath: string): string[] {
+  const normalized = normalizePath(filePath);
+  const parts = normalized.split("/").slice(-4, -1);
+  const tokens = new Set<string>();
+  parts.forEach((part) => {
+    part
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length > 2)
+      .forEach((token) => tokens.add(token));
+  });
+  return Array.from(tokens).slice(0, 16);
 }
 
 function buildSampleTimestamps(durationSec?: number): number[] {
@@ -235,9 +295,13 @@ function buildSampleTimestamps(durationSec?: number): number[] {
 }
 
 function getVideoDuration(filePath: string): number {
+  const binaries = resolveVideoBinaries();
+  if (!binaries.ffprobe) {
+    throw new Error("ffprobe is not available. Install FFmpeg or refresh PATH.");
+  }
   const { childProcess } = getNodeModules();
   const output = childProcess.execFileSync(
-    "ffprobe",
+    binaries.ffprobe,
     [
       "-v",
       "error",
@@ -259,6 +323,10 @@ function getVideoDuration(filePath: string): number {
 }
 
 function extractFrames(filePath: string, timestampsSec: number[]): string[] {
+  const binaries = resolveVideoBinaries();
+  if (!binaries.ffmpeg) {
+    throw new Error("ffmpeg is not available. Install FFmpeg or refresh PATH.");
+  }
   const { childProcess, fs, os, path } = getNodeModules();
   const targetDirectory = path.join(os.tmpdir(), "weave-edit-video-frames");
   fs.mkdirSync(targetDirectory, { recursive: true });
@@ -272,7 +340,7 @@ function extractFrames(filePath: string, timestampsSec: number[]): string[] {
     );
 
     childProcess.execFileSync(
-      "ffmpeg",
+      binaries.ffmpeg,
       [
         "-y",
         "-ss",
@@ -303,6 +371,89 @@ function commandExists(
     return true;
   } catch {
     return false;
+  }
+}
+
+function resolveVideoBinaries(): { ffmpeg: string | null; ffprobe: string | null } {
+  if (cachedVideoBinaries) {
+    return cachedVideoBinaries;
+  }
+
+  const { childProcess, fs, os, path } = getNodeModules();
+
+  const ffmpeg =
+    resolveExecutableFromPath(childProcess.execFileSync, "ffmpeg") ??
+    resolveExecutableFromWinget(fs, path, os, "ffmpeg");
+  const ffprobe =
+    resolveExecutableFromPath(childProcess.execFileSync, "ffprobe") ??
+    resolveExecutableFromWinget(fs, path, os, "ffprobe");
+
+  cachedVideoBinaries = { ffmpeg, ffprobe };
+  return cachedVideoBinaries;
+}
+
+function resolveExecutableFromPath(
+  execFileSync: NodeModules["childProcess"]["execFileSync"],
+  command: string,
+): string | null {
+  if (!commandExists(execFileSync, command)) {
+    return null;
+  }
+  return command;
+}
+
+function resolveExecutableFromWinget(
+  fs: NodeModules["fs"],
+  path: NodeModules["path"],
+  os: NodeModules["os"],
+  command: "ffmpeg" | "ffprobe",
+): string | null {
+  const localAppData = processEnv("LOCALAPPDATA") ?? path.join(os.tmpdir(), "..", "..");
+  const packagesRoot = path.join(localAppData, "Microsoft", "WinGet", "Packages");
+
+  if (!fs.existsSync(packagesRoot)) {
+    return null;
+  }
+
+  let packageFolders: string[] = [];
+  try {
+    packageFolders = fs.readdirSync(packagesRoot);
+  } catch {
+    return null;
+  }
+
+  const candidates = packageFolders
+    .filter((folder) => /^Gyan\.FFmpeg_/i.test(folder))
+    .sort((left, right) => right.localeCompare(left));
+
+  for (const folder of candidates) {
+    const packageRoot = path.join(packagesRoot, folder);
+    let subFolders: string[] = [];
+    try {
+      subFolders = fs.readdirSync(packageRoot);
+    } catch {
+      continue;
+    }
+
+    const builds = subFolders.filter((entry) => /^ffmpeg-/i.test(entry)).sort((left, right) => right.localeCompare(left));
+    for (const buildFolder of builds) {
+      const executablePath = path.join(packageRoot, buildFolder, "bin", `${command}.exe`);
+      if (fs.existsSync(executablePath)) {
+        return normalizePath(executablePath);
+      }
+    }
+  }
+
+  return null;
+}
+
+function processEnv(name: string): string | undefined {
+  try {
+    const nodeRequire = window.require as NodeRequire;
+    const processModule = nodeRequire("process") as { env?: Record<string, string | undefined> };
+    return processModule.env?.[name];
+  } catch {
+    return undefined;
   }
 }
 

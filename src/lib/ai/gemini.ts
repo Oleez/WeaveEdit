@@ -111,7 +111,7 @@ export class GeminiAiProvider implements AiProvider {
       throw new Error("Missing GEMINI_API_KEY in environment.");
     }
 
-    const parts: GeminiPart[] = [{ text: createAssetProfilePrompt(candidate) }, ...createInlineImageParts(candidate)];
+    const parts: GeminiPart[] = [{ text: createAssetProfilePrompt(candidate, context) }, ...createInlineImageParts(candidate)];
     const text = await this.generate(context, parts);
     const parsed = parseAssetProfileResponse(text);
 
@@ -128,14 +128,19 @@ export class GeminiAiProvider implements AiProvider {
       shotScale: parsed.shotScale,
       motionEnergy: parsed.motionEnergy,
       useCases: parsed.useCases,
+      roleTags: parsed.roleTags,
+      visualStyle: parsed.visualStyle,
       searchText: [
         candidate.name,
+        candidate.folderKeywords?.join(" "),
         candidate.descriptor,
         parsed.caption,
         parsed.tags.join(" "),
         parsed.moodTags.join(" "),
         parsed.entities.join(" "),
         parsed.useCases.join(" "),
+        parsed.roleTags.join(" "),
+        parsed.visualStyle,
       ].filter(Boolean).join(" "),
       confidence: parsed.confidence,
       provider: this.providerName,
@@ -147,16 +152,21 @@ export class GeminiAiProvider implements AiProvider {
     request: AiSegmentRequest,
     context: AiScoringContext,
   ): Promise<AiSegmentRanking["rankedAssets"][number]> {
-    const parts: GeminiPart[] = [{ text: createCandidatePrompt(request, candidate) }, ...createInlineImageParts(candidate)];
+    const parts: GeminiPart[] = [{ text: createCandidatePrompt(request, candidate, context) }, ...createInlineImageParts(candidate)];
     const text = await this.generate(context, parts);
     const parsed = parseCandidateResponse(text);
 
-    return {
-      candidateId: candidate.id,
-      score: clampScore(parsed.score),
-      rationale: parsed.rationale,
-    };
-  }
+  return {
+    candidateId: candidate.id,
+    score: clampScore(parsed.score),
+    rationale: parsed.rationale,
+    sourceDurationSec: candidate.durationSec,
+    visualMatchReason: parsed.visualMatchReason,
+    lowConfidenceReason: parsed.lowConfidenceReason,
+    matchKind: parsed.matchKind,
+    mediaPreference: parsed.mediaPreference,
+  };
+}
 
   private async suggestEditPlan(
     request: AiSegmentRequest,
@@ -165,7 +175,7 @@ export class GeminiAiProvider implements AiProvider {
   ) {
     const text = await this.generate(context, [
       {
-        text: createEditPlanPrompt(request, rankedAssets),
+        text: createEditPlanPrompt(request, rankedAssets, context),
       },
     ]);
     const parsed = parseEditPlanResponse(text, request);
@@ -214,10 +224,15 @@ interface GeminiPart {
   };
 }
 
-function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCandidate): string {
+function createCandidatePrompt(
+  request: AiSegmentRequest,
+  candidate: AiAssetCandidate,
+  context: AiScoringContext,
+): string {
   return [
     "You are scoring one visual asset for one script segment in a Premiere editing workflow.",
-    'Return strict JSON only with shape: {"score":0.0,"rationale":"short sentence"}',
+    'Return strict JSON only with shape: {"score":0.0,"rationale":"short sentence","visualMatchReason":"short sentence","matchKind":"literal|metaphorical|style|duration|fallback","mediaPreference":"image|video|either","lowConfidenceReason":"optional short sentence"}',
+    ...formatDirectionContext(context),
     `Segment text: "${request.text}"`,
     `Segment position: ${(request.segmentIndex ?? 0) + 1}/${request.segmentTotal ?? 1}`,
     request.previousText ? `Previous segment: "${request.previousText}"` : "",
@@ -227,8 +242,11 @@ function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCand
     `Candidate id: ${candidate.id}`,
     `Candidate name: ${candidate.name}`,
     `Candidate type: ${candidate.mediaType}`,
+    candidate.folderKeywords?.length ? `Candidate folder context: ${candidate.folderKeywords.join(", ")}` : "",
     `Candidate descriptor: ${candidate.descriptor ?? candidate.name}`,
     request.customInstructions ? `Custom instructions: ${request.customInstructions}` : "",
+    "Prioritize semantic relevance, visual usefulness, variety, pacing fit, source duration fit, and style match to the edit recipe.",
+    "Prefer practical B-roll over generic symbols. For money + travel ideas, prefer remote-work, airport/cafe laptop, dashboard/payment, client-result visuals over random cash imagery.",
     candidate.durationSec ? `Candidate duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
     candidate.sampleTimestampsSec?.length
       ? `Candidate sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
@@ -241,6 +259,7 @@ function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCand
 function createEditPlanPrompt(
   request: AiSegmentRequest,
   rankedAssets: AiSegmentRanking["rankedAssets"],
+  context: AiScoringContext,
 ): string {
   return [
     "You are deciding editorial timing for one transcript segment.",
@@ -250,6 +269,7 @@ function createEditPlanPrompt(
     request.previousText ? `Previous segment: "${request.previousText}"` : "",
     request.nextText ? `Next segment: "${request.nextText}"` : "",
     request.fullScriptContext ? `Whole-script context: ${request.fullScriptContext}` : "",
+    ...formatDirectionContext(context),
     `Sentence complete: ${request.sentenceComplete ? "yes" : "no"}`,
     `Word count: ${request.wordCount ?? 0}`,
     `Sentence count: ${request.sentenceCount ?? 0}`,
@@ -270,13 +290,15 @@ function createEditPlanPrompt(
     .join("\n");
 }
 
-function createAssetProfilePrompt(candidate: AiAssetCandidate): string {
+function createAssetProfilePrompt(candidate: AiAssetCandidate, context: AiScoringContext): string {
   return [
     "You are profiling a media asset for an automated B-roll video editor.",
-    'Return strict JSON only with shape: {"caption":"one sentence","tags":["..."],"moodTags":["..."],"entities":["..."],"shotScale":"wide|medium|close|detail|unknown","motionEnergy":"static|gentle|active|high|unknown","useCases":["..."],"confidence":0.0}',
+    'Return strict JSON only with shape: {"caption":"one sentence","tags":["..."],"moodTags":["..."],"entities":["..."],"shotScale":"wide|medium|close|detail|unknown","motionEnergy":"static|gentle|active|high|unknown","useCases":["..."],"roleTags":["hook|explanation|proof|transition|cta|general"],"visualStyle":"literal|metaphorical|background|overlay|texture|unknown","confidence":0.0}',
+    ...formatDirectionContext(context),
     `Asset id: ${candidate.id}`,
     `Asset name: ${candidate.name}`,
     `Asset type: ${candidate.mediaType}`,
+    candidate.folderKeywords?.length ? `Folder context: ${candidate.folderKeywords.join(", ")}` : "",
     candidate.descriptor ? `Technical descriptor: ${candidate.descriptor}` : "",
     candidate.durationSec ? `Duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
     candidate.sampleTimestampsSec?.length
@@ -288,13 +310,29 @@ function createAssetProfilePrompt(candidate: AiAssetCandidate): string {
     .join("\n");
 }
 
+function formatDirectionContext(context: AiScoringContext): string[] {
+  return [
+    context.editGoal ? `Edit goal: ${context.editGoal}` : "",
+    context.editStyle ? `Edit style: ${context.editStyle}` : "",
+    context.brollStyle ? `B-roll style: ${context.brollStyle}` : "",
+    context.captionStyle ? `Caption style: ${context.captionStyle}` : "",
+    context.ctaContext ? `CTA / offer context: ${context.ctaContext}` : "",
+    context.creativeDirection ? `Creative direction: ${context.creativeDirection}` : "",
+    context.brandNotes ? `Brand notes: ${context.brandNotes}` : "",
+  ].filter(Boolean);
+}
+
 function parseCandidateResponse(
   raw: string,
-): { score: number; rationale: string } {
+): Pick<AiSegmentRanking["rankedAssets"][number], "score" | "rationale" | "visualMatchReason" | "lowConfidenceReason" | "matchKind" | "mediaPreference"> {
   const parsed = safeJsonParse(extractJsonObject(raw)) as
     | {
         score?: number;
         rationale?: string;
+        visualMatchReason?: string;
+        lowConfidenceReason?: string;
+        matchKind?: AiSegmentRanking["rankedAssets"][number]["matchKind"];
+        mediaPreference?: AiSegmentRanking["rankedAssets"][number]["mediaPreference"];
       }
     | null;
 
@@ -308,6 +346,10 @@ function parseCandidateResponse(
   return {
     score: Number(parsed.score ?? 0),
     rationale: String(parsed.rationale ?? "Ranked by Gemini fallback."),
+    visualMatchReason: parsed.visualMatchReason ? String(parsed.visualMatchReason) : undefined,
+    lowConfidenceReason: parsed.lowConfidenceReason ? String(parsed.lowConfidenceReason) : undefined,
+    matchKind: normalizeMatchKind(parsed.matchKind),
+    mediaPreference: normalizeMediaPreference(parsed.mediaPreference),
   };
 }
 
@@ -365,6 +407,8 @@ function parseAssetProfileResponse(raw: string): Omit<AssetSemanticProfile, "id"
         shotScale?: AssetSemanticProfile["shotScale"];
         motionEnergy?: AssetSemanticProfile["motionEnergy"];
         useCases?: string[];
+        roleTags?: AssetSemanticProfile["roleTags"];
+        visualStyle?: AssetSemanticProfile["visualStyle"];
         confidence?: number;
       }
     | null;
@@ -377,8 +421,34 @@ function parseAssetProfileResponse(raw: string): Omit<AssetSemanticProfile, "id"
     shotScale: normalizeShotScale(parsed?.shotScale),
     motionEnergy: normalizeMotionEnergy(parsed?.motionEnergy),
     useCases: normalizeStringArray(parsed?.useCases, 8),
+    roleTags: normalizeRoleTags(parsed?.roleTags),
+    visualStyle: normalizeVisualStyle(parsed?.visualStyle),
     confidence: clampScore(Number(parsed?.confidence ?? 0.6)),
   };
+}
+
+function normalizeRoleTags(value: unknown): NonNullable<AssetSemanticProfile["roleTags"]> {
+  const allowed = new Set(["hook", "explanation", "proof", "transition", "cta", "general"]);
+  const tags = Array.isArray(value)
+    ? value.map((entry) => String(entry).trim()).filter((entry) => allowed.has(entry))
+    : [];
+  return tags.length ? tags as NonNullable<AssetSemanticProfile["roleTags"]> : ["general"];
+}
+
+function normalizeVisualStyle(value: unknown): NonNullable<AssetSemanticProfile["visualStyle"]> {
+  return value === "literal" || value === "metaphorical" || value === "background" || value === "overlay" || value === "texture"
+    ? value
+    : "unknown";
+}
+
+function normalizeMatchKind(value: unknown): AiSegmentRanking["rankedAssets"][number]["matchKind"] {
+  return value === "literal" || value === "metaphorical" || value === "style" || value === "duration" || value === "fallback"
+    ? value
+    : undefined;
+}
+
+function normalizeMediaPreference(value: unknown): AiSegmentRanking["rankedAssets"][number]["mediaPreference"] {
+  return value === "image" || value === "video" || value === "either" ? value : undefined;
 }
 
 function normalizeStringArray(value: unknown, limit: number): string[] {

@@ -111,7 +111,7 @@ export class OllamaAiProvider implements AiProvider {
     context: AiScoringContext,
   ): Promise<AssetSemanticProfile> {
     const timeoutMs = context.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const prompt = createAssetProfilePrompt(candidate);
+    const prompt = createAssetProfilePrompt(candidate, context);
     const images = readVisualInputs(candidate.visualPaths);
     const response = await fetchWithTimeout(
       `${normalizeBaseUrl(context.ollamaBaseUrl)}/api/generate`,
@@ -149,14 +149,19 @@ export class OllamaAiProvider implements AiProvider {
       shotScale: parsed.shotScale,
       motionEnergy: parsed.motionEnergy,
       useCases: parsed.useCases,
+      roleTags: parsed.roleTags,
+      visualStyle: parsed.visualStyle,
       searchText: [
         candidate.name,
+        candidate.folderKeywords?.join(" "),
         candidate.descriptor,
         parsed.caption,
         parsed.tags.join(" "),
         parsed.moodTags.join(" "),
         parsed.entities.join(" "),
         parsed.useCases.join(" "),
+        parsed.roleTags.join(" "),
+        parsed.visualStyle,
       ].filter(Boolean).join(" "),
       confidence: parsed.confidence,
       provider: this.providerName,
@@ -170,7 +175,7 @@ async function scoreCandidate(
   context: AiScoringContext,
   timeoutMs: number,
 ): Promise<AiSegmentRanking["rankedAssets"][number]> {
-  const prompt = createCandidatePrompt(request, candidate);
+  const prompt = createCandidatePrompt(request, candidate, context);
   const images = readVisualInputs(candidate.visualPaths);
   let responseText = "";
 
@@ -213,14 +218,24 @@ async function scoreCandidate(
     candidateId: candidate.id,
     score: clampScore(parsed.score),
     rationale: parsed.rationale,
+    sourceDurationSec: candidate.durationSec,
+    visualMatchReason: parsed.visualMatchReason,
+    lowConfidenceReason: parsed.lowConfidenceReason,
+    matchKind: parsed.matchKind,
+    mediaPreference: parsed.mediaPreference,
   };
 }
 
-function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCandidate): string {
+function createCandidatePrompt(
+  request: AiSegmentRequest,
+  candidate: AiAssetCandidate,
+  context: AiScoringContext,
+): string {
   return [
-    "You are scoring one visual asset for one script segment in a Premiere editing workflow.",
-    "Use the script meaning, timing, and any attached image frames.",
-    'Return strict JSON only with shape: {"score":0.0,"rationale":"short sentence"}',
+    "You are scoring one local media asset for one transcript segment in a Premiere B-roll workflow.",
+    "Act like a senior short-form editor. Use script meaning, emotional tone, editorial role, filename/folder context, source duration, and attached frames.",
+    'Return strict JSON only with shape: {"score":0.0,"rationale":"short sentence","visualMatchReason":"short sentence","matchKind":"literal|metaphorical|style|duration|fallback","mediaPreference":"image|video|either","lowConfidenceReason":"optional short sentence"}',
+    ...formatDirectionContext(context),
     `Segment text: "${request.text}"`,
     `Segment position: ${(request.segmentIndex ?? 0) + 1}/${request.segmentTotal ?? 1}`,
     request.previousText ? `Previous segment: "${request.previousText}"` : "",
@@ -230,28 +245,36 @@ function createCandidatePrompt(request: AiSegmentRequest, candidate: AiAssetCand
     `Candidate id: ${candidate.id}`,
     `Candidate name: ${candidate.name}`,
     `Candidate type: ${candidate.mediaType}`,
+    candidate.folderKeywords?.length ? `Candidate folder context: ${candidate.folderKeywords.join(", ")}` : "",
     `Candidate descriptor: ${candidate.descriptor ?? candidate.name}`,
     request.customInstructions ? `Custom instructions: ${request.customInstructions}` : "",
     candidate.durationSec ? `Candidate duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
     candidate.sampleTimestampsSec?.length
       ? `Candidate sample timestamps: ${candidate.sampleTimestampsSec.map((value) => value.toFixed(2)).join(", ")}`
       : "",
-    "Score guidelines:",
-    "1.0 = excellent semantic and visual fit, 0.0 = unrelated.",
-    "Prefer assets whose meaning and mood match the segment text.",
+    "Scoring priority:",
+    "1. Semantic relevance to the spoken idea.",
+    "2. Visual usefulness for retention and clarity.",
+    "3. Variety and non-randomness.",
+    "4. Pacing/source duration fit.",
+    "5. Style match to the edit recipe, brand notes, and custom instructions.",
+    "Prefer practical B-roll over generic symbols. For money + travel ideas, prefer remote-work, airport/cafe laptop, dashboard/payment, client-result visuals over random cash imagery.",
+    "If the asset would hurt the edit, score below 0.35 and explain the low confidence.",
   ]
     .filter(Boolean)
     .join("\n");
 }
 
-function createAssetProfilePrompt(candidate: AiAssetCandidate): string {
+function createAssetProfilePrompt(candidate: AiAssetCandidate, context: AiScoringContext): string {
   return [
     "You are profiling a media asset for an automated B-roll video editor.",
     "Use attached frames when available. Identify what a human editor would use this for.",
-    'Return strict JSON only with shape: {"caption":"one sentence","tags":["..."],"moodTags":["..."],"entities":["..."],"shotScale":"wide|medium|close|detail|unknown","motionEnergy":"static|gentle|active|high|unknown","useCases":["..."],"confidence":0.0}',
+    'Return strict JSON only with shape: {"caption":"one sentence","tags":["..."],"moodTags":["..."],"entities":["..."],"shotScale":"wide|medium|close|detail|unknown","motionEnergy":"static|gentle|active|high|unknown","useCases":["..."],"roleTags":["hook|explanation|proof|transition|cta|general"],"visualStyle":"literal|metaphorical|background|overlay|texture|unknown","confidence":0.0}',
+    ...formatDirectionContext(context),
     `Asset id: ${candidate.id}`,
     `Asset name: ${candidate.name}`,
     `Asset type: ${candidate.mediaType}`,
+    candidate.folderKeywords?.length ? `Folder context: ${candidate.folderKeywords.join(", ")}` : "",
     candidate.descriptor ? `Technical descriptor: ${candidate.descriptor}` : "",
     candidate.durationSec ? `Duration: ${candidate.durationSec.toFixed(2)} seconds` : "",
     candidate.sampleTimestampsSec?.length
@@ -262,11 +285,27 @@ function createAssetProfilePrompt(candidate: AiAssetCandidate): string {
     .join("\n");
 }
 
-function parseCandidateResponse(raw: string): { score: number; rationale: string } {
+function formatDirectionContext(context: AiScoringContext): string[] {
+  return [
+    context.editGoal ? `Edit goal: ${context.editGoal}` : "",
+    context.editStyle ? `Edit style: ${context.editStyle}` : "",
+    context.brollStyle ? `B-roll style: ${context.brollStyle}` : "",
+    context.captionStyle ? `Caption style: ${context.captionStyle}` : "",
+    context.ctaContext ? `CTA / offer context: ${context.ctaContext}` : "",
+    context.creativeDirection ? `Creative direction: ${context.creativeDirection}` : "",
+    context.brandNotes ? `Brand notes: ${context.brandNotes}` : "",
+  ].filter(Boolean);
+}
+
+function parseCandidateResponse(raw: string): Pick<AiSegmentRanking["rankedAssets"][number], "score" | "rationale" | "visualMatchReason" | "lowConfidenceReason" | "matchKind" | "mediaPreference"> {
   const parsed = safeJsonParse(extractJsonObject(raw)) as
     | {
         score?: number;
         rationale?: string;
+        visualMatchReason?: string;
+        lowConfidenceReason?: string;
+        matchKind?: AiSegmentRanking["rankedAssets"][number]["matchKind"];
+        mediaPreference?: AiSegmentRanking["rankedAssets"][number]["mediaPreference"];
       }
     | null;
 
@@ -280,6 +319,10 @@ function parseCandidateResponse(raw: string): { score: number; rationale: string
   return {
     score: Number(parsed.score ?? 0),
     rationale: String(parsed.rationale ?? "Relevant to script context."),
+    visualMatchReason: parsed.visualMatchReason ? String(parsed.visualMatchReason) : undefined,
+    lowConfidenceReason: parsed.lowConfidenceReason ? String(parsed.lowConfidenceReason) : undefined,
+    matchKind: normalizeMatchKind(parsed.matchKind),
+    mediaPreference: normalizeMediaPreference(parsed.mediaPreference),
   };
 }
 
@@ -293,6 +336,8 @@ function parseAssetProfileResponse(raw: string): Omit<AssetSemanticProfile, "id"
         shotScale?: AssetSemanticProfile["shotScale"];
         motionEnergy?: AssetSemanticProfile["motionEnergy"];
         useCases?: string[];
+        roleTags?: AssetSemanticProfile["roleTags"];
+        visualStyle?: AssetSemanticProfile["visualStyle"];
         confidence?: number;
       }
     | null;
@@ -305,8 +350,34 @@ function parseAssetProfileResponse(raw: string): Omit<AssetSemanticProfile, "id"
     shotScale: normalizeShotScale(parsed?.shotScale),
     motionEnergy: normalizeMotionEnergy(parsed?.motionEnergy),
     useCases: normalizeStringArray(parsed?.useCases, 8),
+    roleTags: normalizeRoleTags(parsed?.roleTags),
+    visualStyle: normalizeVisualStyle(parsed?.visualStyle),
     confidence: clampScore(Number(parsed?.confidence ?? 0.6)),
   };
+}
+
+function normalizeRoleTags(value: unknown): NonNullable<AssetSemanticProfile["roleTags"]> {
+  const allowed = new Set(["hook", "explanation", "proof", "transition", "cta", "general"]);
+  const tags = Array.isArray(value)
+    ? value.map((entry) => String(entry).trim()).filter((entry) => allowed.has(entry))
+    : [];
+  return tags.length ? tags as NonNullable<AssetSemanticProfile["roleTags"]> : ["general"];
+}
+
+function normalizeVisualStyle(value: unknown): NonNullable<AssetSemanticProfile["visualStyle"]> {
+  return value === "literal" || value === "metaphorical" || value === "background" || value === "overlay" || value === "texture"
+    ? value
+    : "unknown";
+}
+
+function normalizeMatchKind(value: unknown): AiSegmentRanking["rankedAssets"][number]["matchKind"] {
+  return value === "literal" || value === "metaphorical" || value === "style" || value === "duration" || value === "fallback"
+    ? value
+    : undefined;
+}
+
+function normalizeMediaPreference(value: unknown): AiSegmentRanking["rankedAssets"][number]["mediaPreference"] {
+  return value === "image" || value === "video" || value === "either" ? value : undefined;
 }
 
 function normalizeStringArray(value: unknown, limit: number): string[] {
@@ -346,6 +417,7 @@ async function suggestEditPlan(
     request.fullScriptContext ? `Whole-script context: ${request.fullScriptContext}` : "",
     `Segment start: ${request.startSec.toFixed(2)}`,
     `Segment end: ${request.endSec ?? "unknown"}`,
+    ...formatDirectionContext(context),
     `Sentence complete: ${request.sentenceComplete ? "yes" : "no"}`,
     `Word count: ${request.wordCount ?? 0}`,
     `Sentence count: ${request.sentenceCount ?? 0}`,
