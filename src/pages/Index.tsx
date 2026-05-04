@@ -883,73 +883,6 @@ const Index = () => {
       missingAssetPlan,
     ],
   );
-  const workflowQaInput = useMemo<WorkflowQaReportInput>(
-    () => ({
-      projectName: hostStatus?.projectName,
-      sequenceName: hostStatus?.sequenceName,
-      providerStatus:
-        aiMode === "off"
-          ? "AI off"
-          : aiHealth.find((provider) => provider.ok)?.message ??
-            aiHealth[0]?.message ??
-            "Provider health has not been checked.",
-      directorControls: {
-        editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
-        editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
-        brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
-        captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
-        ctaContext,
-        creativeDirection,
-        brandNotes,
-      },
-      transcriptCount: parsedScriptState.result?.segments.length ?? 0,
-      mediaCount: mediaItems.length,
-      previewPlacements: previewPlan?.placements ?? [],
-      missingAssetPlan,
-      agentHandoffPackage,
-      generatedAssets,
-      generatedAssetSuggestions: generatedAssetRerankResult,
-      premiereReady: canExecute,
-      warnings: [
-        ...scanWarnings.slice(0, 4),
-        ...aiErrors.slice(0, 4),
-        ...(executeReason ? [executeReason] : []),
-      ],
-    }),
-    [
-      agentHandoffPackage,
-      aiErrors,
-      aiHealth,
-      aiMode,
-      brandNotes,
-      brollStyle,
-      canExecute,
-      captionStyle,
-      creativeDirection,
-      ctaContext,
-      editGoal,
-      editStyle,
-      executeReason,
-      generatedAssetRerankResult,
-      generatedAssets,
-      hostStatus?.projectName,
-      hostStatus?.sequenceName,
-      mediaItems.length,
-      missingAssetPlan,
-      previewPlan?.placements,
-      scanWarnings,
-      parsedScriptState.result,
-    ],
-  );
-  const workflowQaChecklist = useMemo(
-    () => buildWorkflowQaChecklist(workflowQaInput),
-    [workflowQaInput],
-  );
-  const workflowQaReport = useMemo(
-    () => buildWorkflowQaReport(workflowQaInput),
-    [workflowQaInput],
-  );
-
   useEffect(() => {
     setRefinedMissingAssetPlan(null);
     setPromptRefinementResult(null);
@@ -1008,6 +941,72 @@ const Index = () => {
   const geminiApiKey = getEnvironmentVariable("GEMINI_API_KEY");
   const videoTooling = useMemo(() => detectVideoTooling(), []);
   const canChooseFolder = hasNativeFolderPicker();
+  const workflowQaInput = useMemo<WorkflowQaReportInput>(
+    () => ({
+      projectName: hostStatus?.projectName,
+      sequenceName: hostStatus?.sequenceName,
+      providerStatus:
+        aiMode === "off"
+          ? "AI off"
+          : aiHealth.find((provider) => provider.ok)?.message ??
+            aiHealth[0]?.message ??
+            "Provider health has not been checked.",
+      directorControls: {
+        editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
+        editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
+        brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
+        captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
+        ctaContext,
+        creativeDirection,
+        brandNotes,
+      },
+      transcriptCount: parsedScriptState.result?.segments.length ?? 0,
+      mediaCount: mediaItems.length,
+      previewPlacements: previewPlan?.placements ?? [],
+      missingAssetPlan,
+      agentHandoffPackage,
+      generatedAssets,
+      generatedAssetSuggestions: generatedAssetRerankResult,
+      premiereReady: canExecute,
+      warnings: [
+        ...scanWarnings.slice(0, 4),
+        ...aiErrors.slice(0, 4),
+        ...(executeReason ? [executeReason] : []),
+      ],
+    }),
+    [
+      agentHandoffPackage,
+      aiErrors,
+      aiHealth,
+      aiMode,
+      brandNotes,
+      brollStyle,
+      canExecute,
+      captionStyle,
+      creativeDirection,
+      ctaContext,
+      editGoal,
+      editStyle,
+      executeReason,
+      generatedAssetRerankResult,
+      generatedAssets,
+      hostStatus?.projectName,
+      hostStatus?.sequenceName,
+      mediaItems.length,
+      missingAssetPlan,
+      parsedScriptState.result,
+      previewPlan?.placements,
+      scanWarnings,
+    ],
+  );
+  const workflowQaChecklist = useMemo(
+    () => buildWorkflowQaChecklist(workflowQaInput),
+    [workflowQaInput],
+  );
+  const workflowQaReport = useMemo(
+    () => buildWorkflowQaReport(workflowQaInput),
+    [workflowQaInput],
+  );
   const aiContext = useMemo<AiScoringContext>(
     () => ({
       ollamaBaseUrl,
