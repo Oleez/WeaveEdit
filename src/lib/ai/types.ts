@@ -271,10 +271,110 @@ export interface ImportedGeneratedAsset {
   sourceDurationSec?: number;
   durationProbeStatus?: "not_probed" | "available" | "failed" | "unavailable";
   durationProbeNote?: string;
-}
+  visualSummary?: string;
+  visualKeywords?: string[];
+  visualStyle?: string[];
+  moodTags?: string[];
+  likelyUseCases?: string[];
+  editorialRoleFit?: Array<"hook" | "explanation" | "proof" | "transition" | "cta" | "general">;
+  matchKind?: "literal" | "metaphorical" | "background" | "overlay" | "texture" | "unknown";
+  analysisStatus?: "not_analyzed" | "available" | "failed" | "unavailable";
+  analysisProvider?: string;
+  analysisNote?: string;
+  analyzedAt?: string;
+  }
 
 export interface AssetInboxState {
-  assets: ImportedGeneratedAsset[];
+    assets: ImportedGeneratedAsset[];
+  }
+
+export interface GeneratedAssetMatchSuggestion {
+  id: string;
+  placementId: string;
+  generatedAssetId: string;
+  startSec: number;
+  endSec: number;
+  transcriptText: string;
+  confidence: number;
+  matchReason: string;
+  matchKind: "literal" | "metaphorical" | "background" | "overlay" | "texture" | "unknown";
+  replaces: "blank" | "fallback" | "low-confidence" | "prompt-recommended" | "generated-ready";
+  sourceTool: string;
+  assetFileName: string;
+  assetVisualSummary?: string;
+  applyStatus: "suggested" | "applied" | "skipped";
+}
+
+export interface GeneratedAssetRerankResult {
+  suggestions: GeneratedAssetMatchSuggestion[];
+  highConfidenceCount: number;
+  skippedCount: number;
+  skippedReasons: string[];
+  generatedAt: string;
+}
+
+export interface AgentHandoffPackage {
+  packageVersion: "1.0";
+  packageId: string;
+  projectId?: string;
+  sessionId?: string;
+  createdAt: string;
+  editRecipe: {
+    editGoal: string;
+    editStyle: string;
+    brollStyle: string;
+    captionStyle: string;
+    ctaContext?: string;
+    creativeDirection?: string;
+    brandNotes?: string;
+  };
+  safetyNotes: string[];
+  items: AgentHandoffItem[];
+  resultContract: {
+    packageVersion: "1.0";
+    results: AgentGeneratedAssetResult[];
+  };
+}
+
+export interface AgentHandoffItem {
+  id: string;
+  promptId: string;
+  placementId: string;
+  segmentId: string;
+  startSec: number;
+  endSec: number;
+  transcriptText: string;
+  priority: MissingAssetPrompt["priority"];
+  assetType: MissingAssetPrompt["suggestedAssetType"];
+  toolCategory: MissingAssetPrompt["suggestedToolCategory"];
+  promptText: string;
+  negativePrompt?: string;
+  styleNotes: string;
+  intendedUsage: MissingAssetPrompt["usage"];
+  outputFolderSuggestion: string;
+  aspectRatioSuggestion: string;
+  durationSuggestionSec?: number;
+  namingConvention: string;
+  replaceOrEnhance: MissingAssetPrompt["usage"];
+  linkedExistingAssetContext?: string[];
+}
+
+export interface AgentGeneratedAssetResult {
+  promptId: string;
+  placementId: string;
+  filePath: string;
+  sourceTool: string;
+  assetType: "image" | "video" | "audio" | "alpha" | "other";
+  status: "completed" | "failed" | "skipped";
+  notes?: string;
+  durationSec?: number;
+  error?: string | null;
+}
+
+export interface AgentResultImportSummary {
+  imported: number;
+  skipped: number;
+  errors: string[];
 }
 
 export interface AiBatchResult {

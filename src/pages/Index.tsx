@@ -31,6 +31,7 @@ import {
   applyGeneratedAssetsToPlacements,
   buildApprovedGeneratedAssetMap,
 } from "@/lib/ai/generated-asset-planner";
+import { analyzeImportedGeneratedAsset } from "@/lib/ai/generated-asset-analysis";
 import {
   AssetAttachDraft,
   createImportedGeneratedAsset,
@@ -41,11 +42,34 @@ import {
   refineMissingAssetPlanWithAi,
   resetPromptRefinement,
 } from "@/lib/ai/prompt-plan-refiner";
+import { AssetInboxCard, AssetStatusFilter, AssetTypeFilter } from "@/features/weave-edit/components/AssetInboxCard";
+import { AgentHandoffCard } from "@/features/weave-edit/components/AgentHandoffCard";
+import { DirectorControlsCard } from "@/features/weave-edit/components/DirectorControlsCard";
+import { GeneratedAssetSuggestionsCard } from "@/features/weave-edit/components/GeneratedAssetSuggestionsCard";
+import { MissingAssetPlanCard } from "@/features/weave-edit/components/MissingAssetPlanCard";
+import { PreviewPlacementCard } from "@/features/weave-edit/components/PreviewPlacementCard";
+import { WorkflowQaCard } from "@/features/weave-edit/components/WorkflowQaCard";
+import { InlineMessage, StatusCard, StatusPill, SummaryRow } from "@/features/weave-edit/components/ui";
+import { rerankGeneratedAssetsForPlacements } from "@/lib/ai/generated-asset-reranker";
+import {
+  buildAgentHandoffPackage,
+  exportAgentHandoffJson,
+  exportAgentHandoffMarkdown,
+  formatAgentResultContract,
+  parseAgentResultJson,
+} from "@/lib/ai/agent-handoff";
 import {
   DEFAULT_DYNAMIC_EDITOR_SETTINGS,
   buildDynamicEditorResult,
   createFallbackAssetProfile,
 } from "@/lib/ai/dynamic-editor";
+import {
+  buildDemoAgentResultJson,
+  buildWorkflowQaChecklist,
+  buildWorkflowQaReport,
+  exportWorkflowQaMarkdown,
+  WorkflowQaReportInput,
+} from "@/lib/ai/workflow-qa";
 import {
   AnalysisDepth,
   AssetReusePolicy,
@@ -56,6 +80,9 @@ import {
   AiSegmentRanking,
   DynamicEditorSettings,
   EditorPacingPreset,
+  GeneratedAssetMatchSuggestion,
+  GeneratedAssetRerankResult,
+  AgentResultImportSummary,
   ImportedGeneratedAsset,
   MatchStyle,
   MissingAssetPlan,
@@ -73,8 +100,6 @@ import { MediaLibraryItem, MediaLibraryMode, MediaSortMode, getFileName, normali
 
 const STORAGE_KEY = "weave-edit-settings";
 const LEGACY_STORAGE_KEY = "sora-genie-settings";
-const statusPillBase =
-  "inline-flex rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]";
 
 type EditGoal =
   | "views-retention"
@@ -317,12 +342,21 @@ const Index = () => {
   const [generatedAssets, setGeneratedAssets] = useState<ImportedGeneratedAsset[]>(defaultSettings.generatedAssets);
   const [activeAttachPromptId, setActiveAttachPromptId] = useState<string | null>(null);
   const [assetDraftsByPromptId, setAssetDraftsByPromptId] = useState<Record<string, AssetAttachDraft>>({});
-  const [assetStatusFilter, setAssetStatusFilter] = useState<"all" | ImportedGeneratedAsset["status"]>("all");
-  const [assetTypeFilter, setAssetTypeFilter] = useState<"all" | ImportedGeneratedAsset["fileType"]>("all");
+  const [assetStatusFilter, setAssetStatusFilter] = useState<AssetStatusFilter>("all");
+  const [assetTypeFilter, setAssetTypeFilter] = useState<AssetTypeFilter>("all");
+  const [assetAnalysisBusyIds, setAssetAnalysisBusyIds] = useState<Record<string, boolean>>({});
+  const [assetAnalysisBusyMessage, setAssetAnalysisBusyMessage] = useState<string | null>(null);
   const [appliedGeneratedAssetIdsByPlacementId, setAppliedGeneratedAssetIdsByPlacementId] =
     useState<AppliedGeneratedAssetMap>({});
   const [generatedAssetApplySummary, setGeneratedAssetApplySummary] =
     useState<GeneratedAssetApplySummary | null>(null);
+  const [generatedAssetRerankResult, setGeneratedAssetRerankResult] =
+    useState<GeneratedAssetRerankResult | null>(null);
+  const [allowReplacingStrongGeneratedMatches, setAllowReplacingStrongGeneratedMatches] = useState(false);
+  const [agentHandoffHighPriorityOnly, setAgentHandoffHighPriorityOnly] = useState(false);
+  const [agentResultJson, setAgentResultJson] = useState("");
+  const [agentResultImportSummary, setAgentResultImportSummary] =
+    useState<AgentResultImportSummary | null>(null);
 
   const dynamicEditorSettings = useMemo<DynamicEditorSettings>(
     () => ({
@@ -808,6 +842,113 @@ const Index = () => {
       ),
     [assetStatusFilter, assetTypeFilter, generatedAssets],
   );
+  const generatedAssetSuggestionByPlacementId = useMemo(
+    () =>
+      new Map(
+        (generatedAssetRerankResult?.suggestions ?? []).map((suggestion) => [
+          suggestion.placementId,
+          suggestion,
+        ]),
+      ),
+    [generatedAssetRerankResult],
+  );
+  const agentHandoffPackage = useMemo(
+    () =>
+      buildAgentHandoffPackage({
+        missingAssetPlan,
+        generatedAssets,
+        editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
+        editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
+        brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
+        captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
+        ctaContext,
+        creativeDirection,
+        brandNotes,
+        projectId: hostStatus?.projectName,
+        sessionId: hostStatus?.sequenceName,
+        highPriorityOnly: agentHandoffHighPriorityOnly,
+      }),
+    [
+      agentHandoffHighPriorityOnly,
+      brandNotes,
+      brollStyle,
+      captionStyle,
+      creativeDirection,
+      ctaContext,
+      editGoal,
+      editStyle,
+      generatedAssets,
+      hostStatus?.projectName,
+      hostStatus?.sequenceName,
+      missingAssetPlan,
+    ],
+  );
+  const workflowQaInput = useMemo<WorkflowQaReportInput>(
+    () => ({
+      projectName: hostStatus?.projectName,
+      sequenceName: hostStatus?.sequenceName,
+      providerStatus:
+        aiMode === "off"
+          ? "AI off"
+          : aiHealth.find((provider) => provider.ok)?.message ??
+            aiHealth[0]?.message ??
+            "Provider health has not been checked.",
+      directorControls: {
+        editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
+        editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
+        brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
+        captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
+        ctaContext,
+        creativeDirection,
+        brandNotes,
+      },
+      transcriptCount: parsedScriptState.result?.segments.length ?? 0,
+      mediaCount: mediaItems.length,
+      previewPlacements: previewPlan?.placements ?? [],
+      missingAssetPlan,
+      agentHandoffPackage,
+      generatedAssets,
+      generatedAssetSuggestions: generatedAssetRerankResult,
+      premiereReady: canExecute,
+      warnings: [
+        ...scanWarnings.slice(0, 4),
+        ...aiErrors.slice(0, 4),
+        ...(executeReason ? [executeReason] : []),
+      ],
+    }),
+    [
+      agentHandoffPackage,
+      aiErrors,
+      aiHealth,
+      aiMode,
+      brandNotes,
+      brollStyle,
+      canExecute,
+      captionStyle,
+      creativeDirection,
+      ctaContext,
+      editGoal,
+      editStyle,
+      executeReason,
+      generatedAssetRerankResult,
+      generatedAssets,
+      hostStatus?.projectName,
+      hostStatus?.sequenceName,
+      mediaItems.length,
+      missingAssetPlan,
+      previewPlan?.placements,
+      scanWarnings,
+      parsedScriptState.result,
+    ],
+  );
+  const workflowQaChecklist = useMemo(
+    () => buildWorkflowQaChecklist(workflowQaInput),
+    [workflowQaInput],
+  );
+  const workflowQaReport = useMemo(
+    () => buildWorkflowQaReport(workflowQaInput),
+    [workflowQaInput],
+  );
 
   useEffect(() => {
     setRefinedMissingAssetPlan(null);
@@ -1206,6 +1347,9 @@ const Index = () => {
       [promptId]: { filePath: "", sourceTool: "Manual", notes: "" },
     }));
     setActiveAttachPromptId(null);
+    if (aiMode !== "off" && (asset.fileType === "image" || asset.fileType === "video")) {
+      void runGeneratedAssetAnalysis(asset, false);
+    }
   }
 
   function handleUpdateGeneratedAssetStatus(
@@ -1235,6 +1379,135 @@ const Index = () => {
     await copyText(asset.filePath);
   }
 
+  async function handleCopyAgentHandoffJson() {
+    await copyText(exportAgentHandoffJson(agentHandoffPackage));
+  }
+
+  function handleExportAgentHandoffJson() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadTextFile(
+      `weave-edit-agent-handoff-${timestamp}.json`,
+      exportAgentHandoffJson(agentHandoffPackage),
+      "application/json",
+    );
+  }
+
+  function handleExportAgentHandoffMarkdown() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadTextFile(
+      `weave-edit-agent-handoff-${timestamp}.md`,
+      exportAgentHandoffMarkdown(agentHandoffPackage),
+      "text/markdown",
+    );
+  }
+
+  async function handleCopyAgentResultContract() {
+    await copyText(formatAgentResultContract());
+  }
+
+  function handleImportAgentResultJson() {
+    const summary: AgentResultImportSummary = { imported: 0, skipped: 0, errors: [] };
+    let parsed;
+    try {
+      parsed = parseAgentResultJson(agentResultJson);
+    } catch (error) {
+      setAgentResultImportSummary({
+        imported: 0,
+        skipped: 0,
+        errors: [String(error)],
+      });
+      return;
+    }
+
+    const nextAssets: ImportedGeneratedAsset[] = [];
+    parsed.results.forEach((result) => {
+      if (result.status !== "completed") {
+        summary.skipped += 1;
+        if (result.error) {
+          summary.errors.push(`${result.promptId}: ${result.error}`);
+        }
+        return;
+      }
+
+      const prompt = missingAssetPlan.prompts.find((item) => item.id === result.promptId);
+      if (!prompt) {
+        summary.skipped += 1;
+        summary.errors.push(`${result.promptId}: prompt not found in current Missing Asset Plan.`);
+        return;
+      }
+
+      const durationMetadata =
+        result.assetType === "video" && result.durationSec
+          ? {
+              sourceDurationSec: result.durationSec,
+              durationProbeStatus: "available" as const,
+              durationProbeNote: `Duration supplied by agent result: ${result.durationSec.toFixed(2)} seconds.`,
+            }
+          : probeGeneratedAssetDurationMetadata(result.filePath);
+      nextAssets.push(
+        createImportedGeneratedAsset(
+          prompt,
+          {
+            filePath: result.filePath,
+            sourceTool: result.sourceTool,
+            notes: result.notes ?? "Imported from Agent Result JSON.",
+          },
+          durationMetadata,
+        ),
+      );
+      summary.imported += 1;
+    });
+
+    if (nextAssets.length > 0) {
+      setGeneratedAssets((previous) => [...nextAssets, ...previous]);
+      nextAssets.forEach((asset) => {
+        if (aiMode !== "off" && (asset.fileType === "image" || asset.fileType === "video")) {
+          void runGeneratedAssetAnalysis(asset, false);
+        }
+      });
+    }
+    setAgentResultImportSummary(summary);
+  }
+
+  function handleLoadDemoDirectorControls() {
+    setEditGoal("views-retention");
+    setEditStyle("premium-business");
+    setBrollStyle("generated-asset-ready");
+    setCaptionStyle("clean-bold");
+    setCtaContext("Comment MONEY and I'll send you the quiz + training link.");
+    setCreativeDirection("Demo: premium money mentor reel. Clean, sharp, high-end visuals. Avoid cheesy stock imagery.");
+    setBrandNotes("Demo: dark premium look, yellow highlight words, confident tone, no emojis.");
+  }
+
+  function handleGenerateDemoAgentResultJson() {
+    setAgentResultJson(buildDemoAgentResultJson(agentHandoffPackage));
+    setAgentResultImportSummary({
+      imported: 0,
+      skipped: 0,
+      errors: [
+        "Demo JSON uses placeholder paths. Replace them with real generated local files before importing for real use.",
+      ],
+    });
+  }
+
+  function handleExportWorkflowQaMarkdown() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadTextFile(
+      `weave-edit-workflow-qa-${timestamp}.md`,
+      exportWorkflowQaMarkdown(workflowQaReport, workflowQaInput),
+      "text/markdown",
+    );
+  }
+
+  function handleExportWorkflowQaJson() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadTextFile(
+      `weave-edit-workflow-qa-${timestamp}.json`,
+      JSON.stringify(workflowQaReport, null, 2),
+      "application/json",
+    );
+  }
+
   function handleProbeGeneratedAssetDuration(assetId: string) {
     setGeneratedAssets((previous) =>
       previous.map((asset) =>
@@ -1247,6 +1520,75 @@ const Index = () => {
       ),
     );
     setGeneratedAssetApplySummary(null);
+  }
+
+  async function runGeneratedAssetAnalysis(asset: ImportedGeneratedAsset, force: boolean) {
+    if (asset.fileType !== "image" && asset.fileType !== "video") {
+      setGeneratedAssets((previous) =>
+        previous.map((item) =>
+          item.id === asset.id
+            ? {
+                ...item,
+                analysisStatus: "unavailable",
+                analysisNote: "Visual analysis is only available for generated image and video assets.",
+                analyzedAt: new Date().toISOString(),
+              }
+            : item,
+        ),
+      );
+      return;
+    }
+
+    setAssetAnalysisBusyIds((previous) => ({ ...previous, [asset.id]: true }));
+    try {
+      const result = await analyzeImportedGeneratedAsset(asset, aiMode, aiContext, force);
+      setGeneratedAssets((previous) =>
+        previous.map((item) => (item.id === asset.id ? result.asset : item)),
+      );
+      if (result.warnings.length > 0) {
+        setGeneratedAssetApplySummary((previous) =>
+          previous
+            ? {
+                ...previous,
+                skippedReasons: [
+                  ...previous.skippedReasons,
+                  `Asset analysis warning for ${asset.fileName}: ${result.warnings.slice(0, 1).join(" ")}`,
+                ].slice(-6),
+              }
+            : previous,
+        );
+      }
+    } finally {
+      setAssetAnalysisBusyIds((previous) => {
+        const next = { ...previous };
+        delete next[asset.id];
+        return next;
+      });
+    }
+  }
+
+  function handleAnalyzeGeneratedAsset(asset: ImportedGeneratedAsset) {
+    void runGeneratedAssetAnalysis(asset, true);
+  }
+
+  async function handleAnalyzeAllGeneratedAssets() {
+    const analyzableAssets = generatedAssets.filter(
+      (asset) =>
+        (asset.fileType === "image" || asset.fileType === "video") &&
+        asset.analysisStatus !== "available",
+    );
+    if (analyzableAssets.length === 0) {
+      return;
+    }
+
+    setAssetAnalysisBusyMessage(`Analyzing ${analyzableAssets.length} generated assets`);
+    try {
+      for (const asset of analyzableAssets) {
+        await runGeneratedAssetAnalysis(asset, false);
+      }
+    } finally {
+      setAssetAnalysisBusyMessage(null);
+    }
   }
 
   function handleExportAssetInbox(format: "json" | "csv") {
@@ -1301,6 +1643,89 @@ const Index = () => {
     );
     setAppliedGeneratedAssetIdsByPlacementId(result.appliedAssetIdsByPlacementId);
     setGeneratedAssetApplySummary(result.summary);
+  }
+
+  function handleBuildGeneratedAssetSuggestions() {
+    const placements = previewPlan?.placements ?? effectivePlan?.placements ?? [];
+    const result = rerankGeneratedAssetsForPlacements({
+      placements,
+      assets: generatedAssets,
+      promptRecommendedPlacementIds,
+      appliedAssetIdsByPlacementId: appliedGeneratedAssetIdsByPlacementId,
+      allowReplacingStrongMatches: allowReplacingStrongGeneratedMatches,
+      fileExists: generatedAssetPathExists,
+      editGoal: getOptionLabel(EDIT_GOAL_OPTIONS, editGoal),
+      editStyle: getOptionLabel(EDIT_STYLE_OPTIONS, editStyle),
+      brollStyle: getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle),
+      captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
+      creativeDirection,
+      brandNotes,
+    });
+    setGeneratedAssetRerankResult(result);
+  }
+
+  function handleApplyGeneratedAssetSuggestion(suggestion: GeneratedAssetMatchSuggestion) {
+    setAppliedGeneratedAssetIdsByPlacementId((previous) => ({
+      ...previous,
+      [suggestion.placementId]: suggestion.generatedAssetId,
+    }));
+    setGeneratedAssetRerankResult((previous) =>
+      previous
+        ? {
+            ...previous,
+            suggestions: previous.suggestions.map((item) =>
+              item.id === suggestion.id ? { ...item, applyStatus: "applied" } : item,
+            ),
+          }
+        : previous,
+    );
+    setGeneratedAssetApplySummary({
+      updatedCount: 1,
+      skippedCount: 0,
+      skippedReasons: [`Applied generated asset suggestion for ${suggestion.placementId}.`],
+    });
+  }
+
+  function handleApplyAllGeneratedAssetSuggestions() {
+    const suggestions = generatedAssetRerankResult?.suggestions ?? [];
+    if (suggestions.length === 0) {
+      return;
+    }
+
+    setAppliedGeneratedAssetIdsByPlacementId((previous) => {
+      const next = { ...previous };
+      suggestions.forEach((suggestion) => {
+        next[suggestion.placementId] = suggestion.generatedAssetId;
+      });
+      return next;
+    });
+    setGeneratedAssetRerankResult((previous) =>
+      previous
+        ? {
+            ...previous,
+            suggestions: previous.suggestions.map((suggestion) => ({
+              ...suggestion,
+              applyStatus: "applied",
+            })),
+          }
+        : previous,
+    );
+    setGeneratedAssetApplySummary({
+      updatedCount: suggestions.length,
+      skippedCount: 0,
+      skippedReasons: ["Applied safe generated asset rerank suggestions."],
+    });
+  }
+
+  function handleDismissGeneratedAssetSuggestion(suggestionId: string) {
+    setGeneratedAssetRerankResult((previous) =>
+      previous
+        ? {
+            ...previous,
+            suggestions: previous.suggestions.filter((suggestion) => suggestion.id !== suggestionId),
+          }
+        : previous,
+    );
   }
 
   function handleRestoreGeneratedAssetPlacement(placementId: string) {
@@ -1725,77 +2150,27 @@ const Index = () => {
                 </div>
               </div>
 
-              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Director Controls</p>
-                    <h3 className="mt-2 text-base font-semibold">Edit Recipe</h3>
-                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-                      Steer the AI like an editor: goal, style, caption feel, and the offer context.
-                    </p>
-                  </div>
-                  <StatusPill tone="info" label={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)} />
-                </div>
-                <div className="mt-4 grid gap-3 md:grid-cols-2">
-                  <DirectionSelect
-                    label="Edit goal"
-                    value={editGoal}
-                    options={EDIT_GOAL_OPTIONS}
-                    onChange={(value) => setEditGoal(value as EditGoal)}
-                  />
-                  <DirectionSelect
-                    label="Edit style"
-                    value={editStyle}
-                    options={EDIT_STYLE_OPTIONS}
-                    onChange={(value) => setEditStyle(value as EditStyle)}
-                  />
-                  <DirectionSelect
-                    label="B-roll style"
-                    value={brollStyle}
-                    options={BROLL_STYLE_OPTIONS}
-                    onChange={(value) => setBrollStyle(value as BrollStyle)}
-                  />
-                  <DirectionSelect
-                    label="Caption style"
-                    value={captionStyle}
-                    options={CAPTION_STYLE_OPTIONS}
-                    onChange={(value) => setCaptionStyle(value as CaptionStyle)}
-                  />
-                </div>
-                <label className="mt-4 block text-sm">
-                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                    CTA / offer context
-                  </span>
-                  <input
-                    value={ctaContext}
-                    onChange={(event) => setCtaContext(event.target.value)}
-                    placeholder="Comment MONEY and I will DM you the quiz + webinar link."
-                    className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
-                  />
-                </label>
-                <label className="mt-4 block text-sm">
-                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                    Custom creative direction
-                  </span>
-                  <textarea
-                    value={creativeDirection}
-                    onChange={(event) => setCreativeDirection(event.target.value)}
-                    placeholder="Make this feel like a premium money mentor reel. Avoid cheesy stock visuals."
-                    className="mt-2 min-h-[82px] w-full rounded-2xl border border-border/70 bg-card px-3 py-3 outline-none transition focus:border-primary"
-                  />
-                </label>
-                <label className="mt-4 block text-sm">
-                  <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                    Brand notes
-                  </span>
-                  <textarea
-                    value={brandNotes}
-                    onChange={(event) => setBrandNotes(event.target.value)}
-                    placeholder="Dark premium look, yellow highlight words, no emojis, confident tone."
-                    className="mt-2 min-h-[70px] w-full rounded-2xl border border-border/70 bg-card px-3 py-3 outline-none transition focus:border-primary"
-                  />
-                </label>
-              </div>
+              <DirectorControlsCard
+                editGoal={editGoal}
+                editStyle={editStyle}
+                brollStyle={brollStyle}
+                captionStyle={captionStyle}
+                ctaContext={ctaContext}
+                creativeDirection={creativeDirection}
+                brandNotes={brandNotes}
+                editGoalOptions={EDIT_GOAL_OPTIONS}
+                editStyleOptions={EDIT_STYLE_OPTIONS}
+                brollStyleOptions={BROLL_STYLE_OPTIONS}
+                captionStyleOptions={CAPTION_STYLE_OPTIONS}
+                editStyleLabel={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}
+                onEditGoalChange={setEditGoal}
+                onEditStyleChange={setEditStyle}
+                onBrollStyleChange={setBrollStyle}
+                onCaptionStyleChange={setCaptionStyle}
+                onCtaContextChange={setCtaContext}
+                onCreativeDirectionChange={setCreativeDirection}
+                onBrandNotesChange={setBrandNotes}
+              />
 
               {showAdvancedUi ? (
                 <>
@@ -2305,710 +2680,121 @@ const Index = () => {
                       ? "Whole-sequence fallback is active because sequence In/Out is not being used."
                       : "Set sequence In/Out or enable whole-sequence fallback to make the preview executable."}
               </div>
-              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Missing Asset Plan</p>
-                    <h3 className="mt-2 text-base font-semibold">Prompt Plan</h3>
-                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-                      Draft briefs for weak, blank, or generated-ready moments. Nothing is generated or imported yet.
-                    </p>
-                  </div>
-                  <StatusPill
-                    tone={missingAssetPlan.prompts.length > 0 ? "warning" : "success"}
-                    label={`${missingAssetPlan.prompts.length} prompts`}
-                  />
-                </div>
-                <div className="mt-4 grid gap-3 md:grid-cols-3">
-                  <StatusCard label="Prompt count" value={missingAssetPlan.prompts.length.toString()} />
-                  <StatusCard label="High priority" value={missingAssetPlan.highPriorityCount.toString()} />
-                  <StatusCard
-                    label="Top type"
-                    value={
-                      missingAssetPlan.prompts.length
-                        ? formatTopPromptType(missingAssetPlan)
-                      : "No missing assets"
-                    }
-                  />
-                  <StatusCard
-                    label="Prompt source"
-                    value={
-                      promptRefinementResult?.refinedCount
-                        ? `AI-refined ${promptRefinementResult.refinedCount} via ${formatProviderName(promptRefinementResult.providerUsed)}`
-                        : "Rule-generated"
-                    }
-                  />
-                </div>
-                {missingAssetPlan.prompts.length > 0 ? (
-                  <>
-                    <div className="mt-4 flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => void handleRefinePromptPlan()}
-                        disabled={Boolean(promptRefineBusyMessage) || aiMode === "off"}
-                        className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {promptRefineBusyMessage ?? "Refine prompts with AI"}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleCopyAllPrompts()}
-                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
-                      >
-                        Copy all prompts
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleExportPromptBrief("md")}
-                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
-                      >
-                        Export MD
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleExportPromptBrief("txt")}
-                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
-                      >
-                        Export TXT
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleExportPromptBrief("json")}
-                        className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
-                      >
-                        Export JSON
-                      </button>
-                      {refinedMissingAssetPlan ? (
-                        <button
-                          type="button"
-                          onClick={handleResetAllPrompts}
-                          className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent"
-                        >
-                          Reset all to rules
-                        </button>
-                      ) : null}
-                    </div>
-                    {aiMode === "off" ? (
-                      <InlineMessage
-                        tone="warning"
-                        message="Turn AI mode to Local or Hybrid to refine prompts. Rule-generated prompts remain available."
-                      />
-                    ) : null}
-                    {promptRefinementResult?.errors.length ? (
-                      <InlineMessage
-                        tone="warning"
-                        message={`Prompt refinement kept safe fallbacks: ${promptRefinementResult.errors.slice(0, 2).join(" | ")}`}
-                      />
-                    ) : null}
-                    <div className="mt-4 max-h-[360px] space-y-3 overflow-auto">
-                      {missingAssetPlan.prompts.map((prompt) => {
-                        const linkedAssets = assetsByPromptId.get(prompt.id) ?? [];
-                        const draft = assetDraftsByPromptId[prompt.id] ?? {
-                          filePath: "",
-                          sourceTool: "Manual",
-                          notes: "",
-                        };
-
-                        return (
-                          <article
-                          key={prompt.id}
-                          className="rounded-2xl border border-border/70 bg-card/60 p-3 text-sm"
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <StatusPill
-                              tone={prompt.priority === "high" ? "warning" : "info"}
-                              label={`${prompt.priority} / ${prompt.suggestedAssetType}`}
-                            />
-                            <span className="font-mono text-xs text-muted-foreground">
-                              {formatSeconds(prompt.startSec)} - {formatSeconds(prompt.endSec)}
-                            </span>
-                          </div>
-                          <p className="mt-3 text-sm leading-6 text-foreground">{prompt.transcriptText}</p>
-                          <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
-                            <SummaryRow label="Need" value={prompt.usage} />
-                            <SummaryRow label="Tool" value={prompt.suggestedToolCategory} />
-                            <SummaryRow label="Role" value={formatEditorialRole(prompt.editorialRole)} />
-                            <SummaryRow label="Mode" value={prompt.visualMode} />
-                          </div>
-                          {linkedAssets.length > 0 ? (
-                            <div className="mt-3 space-y-2 rounded-2xl border border-emerald-500/25 bg-emerald-500/10 p-3 text-xs">
-                              {linkedAssets.map((asset) => (
-                                <div key={asset.id} className="flex flex-wrap items-center justify-between gap-2">
-                                  <span className="text-emerald-100">
-                                    {asset.fileName} / {asset.status} / {asset.sourceTool}
-                                    {appliedGeneratedAssetIdsByPlacementId[asset.linkedPlacementId] === asset.id ? " / in plan" : ""}
-                                  </span>
-                                  <div className="flex flex-wrap gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "approved")}
-                                      className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10"
-                                    >
-                                      Approve
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "rejected")}
-                                      className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10"
-                                    >
-                                      Reject
-                                    </button>
-                                    {appliedGeneratedAssetIdsByPlacementId[asset.linkedPlacementId] === asset.id ? (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleRestoreGeneratedAssetPlacement(asset.linkedPlacementId)}
-                                        className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10"
-                                      >
-                                        Remove from plan
-                                      </button>
-                                    ) : (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleUseGeneratedAssetInPlan(asset)}
-                                        disabled={asset.status !== "approved"}
-                                        className="rounded-full border border-emerald-300/30 px-2 py-1 hover:bg-emerald-300/10 disabled:opacity-50"
-                                      >
-                                        Use in plan
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          ) : null}
-                          <p className="mt-3 text-xs leading-5 text-amber-300">{prompt.reason}</p>
-                          <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                            Source:{" "}
-                            <span className="text-foreground">
-                              {prompt.aiRefined
-                                ? `AI-refined via ${formatProviderName(prompt.refinementProvider ?? null)}`
-                                : "rule-generated"}
-                            </span>
-                            {prompt.refinementNote ? ` - ${prompt.refinementNote}` : ""}
-                          </p>
-                          <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted-foreground">
-                            {prompt.promptText}
-                          </p>
-                          <div className="mt-3 flex flex-wrap gap-2">
-                            <button
-                              type="button"
-                              onClick={() => void handleCopyPrompt(prompt.id)}
-                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                            >
-                              {copiedPromptIds[prompt.id] ? "Copied" : "Copy prompt"}
-                            </button>
-                            {prompt.aiRefined ? (
-                              <button
-                                type="button"
-                                onClick={() => handleResetPrompt(prompt.id)}
-                                className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                              >
-                                Reset to rule prompt
-                              </button>
-                            ) : null}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setActiveAttachPromptId((current) =>
-                                  current === prompt.id ? null : prompt.id,
-                                )
-                              }
-                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                            >
-                              Attach generated asset
-                            </button>
-                          </div>
-                          {activeAttachPromptId === prompt.id ? (
-                            <div className="mt-3 grid gap-3 rounded-2xl border border-border/70 bg-background/50 p-3 text-xs">
-                              <label className="grid gap-1">
-                                <span className="text-muted-foreground">Local file path</span>
-                                <input
-                                  value={draft.filePath}
-                                  onChange={(event) =>
-                                    handleAttachDraftChange(prompt.id, { filePath: event.target.value })
-                                  }
-                                  placeholder="H:\\Generated\\money-dashboard-shot.mp4"
-                                  className="rounded-xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
-                                />
-                              </label>
-                              <div className="grid gap-3 md:grid-cols-2">
-                                <label className="grid gap-1">
-                                  <span className="text-muted-foreground">Source tool / provider</span>
-                                  <input
-                                    value={draft.sourceTool}
-                                    onChange={(event) =>
-                                      handleAttachDraftChange(prompt.id, { sourceTool: event.target.value })
-                                    }
-                                    placeholder="Kling, Seedance, Runway, Manual, Other"
-                                    className="rounded-xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
-                                  />
-                                </label>
-                                <label className="grid gap-1">
-                                  <span className="text-muted-foreground">Notes</span>
-                                  <input
-                                    value={draft.notes}
-                                    onChange={(event) =>
-                                      handleAttachDraftChange(prompt.id, { notes: event.target.value })
-                                    }
-                                    placeholder="Good take, needs review, alpha pass..."
-                                    className="rounded-xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
-                                  />
-                                </label>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => handleAttachGeneratedAsset(prompt.id)}
-                                disabled={!draft.filePath.trim()}
-                                className="w-fit rounded-full bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                Link asset to prompt
-                              </button>
-                            </div>
-                          ) : null}
-                        </article>
-                        );
-                      })}
-                    </div>
-                  </>
-                ) : (
-                  <p className="mt-4 text-sm text-muted-foreground">
-                    No prompt briefs needed for this preview. Strong local matches can go straight to review.
-                  </p>
-                )}
-              </div>
-              <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Asset Inbox</p>
-                    <h3 className="mt-2 text-base font-semibold">Generated Asset Inbox</h3>
-                    <p className="mt-1 max-w-2xl text-sm leading-6 text-muted-foreground">
-                      Manually link generated files back to prompt ids now; future automation can write the same records.
-                    </p>
-                  </div>
-                  <StatusPill tone={generatedAssets.length > 0 ? "info" : "success"} label={`${generatedAssets.length} assets`} />
-                </div>
-                <div className="mt-4 grid gap-3 md:grid-cols-3">
-                  <StatusCard label="Imported" value={generatedAssets.length.toString()} />
-                  <StatusCard
-                    label="Approved"
-                    value={generatedAssets.filter((asset) => asset.status === "approved").length.toString()}
-                  />
-                  <StatusCard
-                    label="Ready later"
-                    value="Manual linking only"
-                  />
-                </div>
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={handleUseAllApprovedAssetsInPlan}
-                    disabled={!effectivePlan || generatedAssets.every((asset) => asset.status !== "approved")}
-                    className="rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    Use all approved assets in plan
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleRestoreAllGeneratedAssetPlacements}
-                    disabled={Object.keys(appliedGeneratedAssetIdsByPlacementId).length === 0}
-                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
-                  >
-                    Restore original placements
-                  </button>
-                  <select
-                    value={assetStatusFilter}
-                    onChange={(event) =>
-                      setAssetStatusFilter(event.target.value as typeof assetStatusFilter)
-                    }
-                    className="rounded-full border border-border/70 bg-card px-3 py-2 text-sm"
-                  >
-                    <option value="all">All statuses</option>
-                    <option value="imported">Imported</option>
-                    <option value="reviewed">Reviewed</option>
-                    <option value="approved">Approved</option>
-                    <option value="rejected">Rejected</option>
-                  </select>
-                  <select
-                    value={assetTypeFilter}
-                    onChange={(event) =>
-                      setAssetTypeFilter(event.target.value as typeof assetTypeFilter)
-                    }
-                    className="rounded-full border border-border/70 bg-card px-3 py-2 text-sm"
-                  >
-                    <option value="all">All types</option>
-                    <option value="image">Image</option>
-                    <option value="video">Video</option>
-                    <option value="audio">Audio</option>
-                    <option value="alpha">Alpha</option>
-                    <option value="other">Other</option>
-                  </select>
-                  <button
-                    type="button"
-                    onClick={() => handleExportAssetInbox("json")}
-                    disabled={generatedAssets.length === 0}
-                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
-                  >
-                    Export JSON
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleExportAssetInbox("csv")}
-                    disabled={generatedAssets.length === 0}
-                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
-                  >
-                    Export CSV
-                  </button>
-                </div>
-                {generatedAssetApplySummary ? (
-                  <InlineMessage
-                    tone={generatedAssetApplySummary.skippedCount > 0 ? "warning" : "success"}
-                    message={`Generated asset plan update: ${generatedAssetApplySummary.updatedCount} updated, ${generatedAssetApplySummary.skippedCount} skipped${
-                      generatedAssetApplySummary.skippedReasons.length
-                        ? `. ${generatedAssetApplySummary.skippedReasons.slice(0, 2).join(" | ")}`
-                        : "."
-                    }`}
-                  />
-                ) : null}
-                {filteredGeneratedAssets.length > 0 ? (
-                  <div className="mt-4 max-h-[300px] space-y-3 overflow-auto">
-                    {filteredGeneratedAssets.map((asset) => {
-                      const isApplied = appliedGeneratedAssetIdsByPlacementId[asset.linkedPlacementId] === asset.id;
-
-                      return (
-                        <article key={asset.id} className="rounded-2xl border border-border/70 bg-card/60 p-3 text-sm">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <StatusPill
-                            tone={asset.status === "approved" ? "success" : asset.status === "rejected" ? "warning" : "info"}
-                            label={`${asset.fileType} / ${asset.status}${isApplied ? " / in plan" : ""}`}
-                          />
-                          <span className="font-mono text-xs text-muted-foreground">
-                            {formatSeconds(asset.timestampStartSec)} - {formatSeconds(asset.timestampEndSec)}
-                          </span>
-                        </div>
-                        <p className="mt-3 font-medium text-foreground">{asset.fileName}</p>
-                        <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{asset.filePath}</p>
-                          <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
-                            <SummaryRow label="Prompt" value={asset.linkedPromptId} />
-                            <SummaryRow label="Source" value={asset.sourceTool} />
-                            <SummaryRow label="Usage" value={asset.intendedUsage} />
-                            <SummaryRow label="Requested" value={asset.requestedAssetType} />
-                            <SummaryRow
-                              label="Duration"
-                              value={
-                                asset.sourceDurationSec
-                                  ? formatSeconds(asset.sourceDurationSec)
-                                  : asset.durationProbeStatus ?? "not probed"
-                              }
-                            />
-                            <SummaryRow label="Probe" value={asset.durationProbeNote ?? "No duration metadata"} />
-                          </div>
-                        {asset.notes ? <p className="mt-3 text-xs text-muted-foreground">{asset.notes}</p> : null}
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <button
-                            type="button"
-                            onClick={() => void handleCopyGeneratedAssetPath(asset)}
-                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                          >
-                            Copy path
-                          </button>
-                          {asset.fileType === "video" ? (
-                            <button
-                              type="button"
-                              onClick={() => handleProbeGeneratedAssetDuration(asset.id)}
-                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                            >
-                              Refresh metadata
-                            </button>
-                          ) : null}
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "reviewed")}
-                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                          >
-                            Mark reviewed
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "approved")}
-                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                          >
-                            Approve
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleUpdateGeneratedAssetStatus(asset.id, "rejected")}
-                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                          >
-                            Reject
-                          </button>
-                          {isApplied ? (
-                            <button
-                              type="button"
-                              onClick={() => handleRestoreGeneratedAssetPlacement(asset.linkedPlacementId)}
-                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                            >
-                              Remove from plan
-                            </button>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => handleUseGeneratedAssetInPlan(asset)}
-                              disabled={asset.status !== "approved"}
-                              className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent disabled:opacity-50"
-                            >
-                              Use in plan
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => handleUnlinkGeneratedAsset(asset.id)}
-                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                          >
-                            Unlink
-                          </button>
-                        </div>
-                      </article>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="mt-4 text-sm text-muted-foreground">
-                    No generated assets match the current filters. Attach one from a prompt card when a file is ready.
-                  </p>
-                )}
-                <InlineMessage
-                  tone="info"
-                  message="Approved generated assets are organized here for future replanning. This phase does not auto-replace timeline placements."
-                />
-              </div>
+              <WorkflowQaCard
+                checklist={workflowQaChecklist}
+                report={workflowQaReport}
+                onLoadDemoDirectorControls={handleLoadDemoDirectorControls}
+                onGenerateDemoAgentResultJson={handleGenerateDemoAgentResultJson}
+                onExportReportMarkdown={handleExportWorkflowQaMarkdown}
+                onExportReportJson={handleExportWorkflowQaJson}
+              />
+              <MissingAssetPlanCard
+                missingAssetPlan={missingAssetPlan}
+                promptRefinementResult={promptRefinementResult}
+                promptRefineBusyMessage={promptRefineBusyMessage}
+                refinedMissingAssetPlan={refinedMissingAssetPlan}
+                aiMode={aiMode}
+                assetsByPromptId={assetsByPromptId}
+                assetDraftsByPromptId={assetDraftsByPromptId}
+                activeAttachPromptId={activeAttachPromptId}
+                copiedPromptIds={copiedPromptIds}
+                appliedGeneratedAssetIdsByPlacementId={appliedGeneratedAssetIdsByPlacementId}
+                onRefinePromptPlan={handleRefinePromptPlan}
+                onCopyAllPrompts={handleCopyAllPrompts}
+                onExportPromptBrief={handleExportPromptBrief}
+                onResetAllPrompts={handleResetAllPrompts}
+                onCopyPrompt={handleCopyPrompt}
+                onResetPrompt={handleResetPrompt}
+                onToggleAttachPrompt={(promptId) =>
+                  setActiveAttachPromptId((current) => (current === promptId ? null : promptId))
+                }
+                onAttachDraftChange={handleAttachDraftChange}
+                onAttachGeneratedAsset={handleAttachGeneratedAsset}
+                onUpdateGeneratedAssetStatus={handleUpdateGeneratedAssetStatus}
+                onUseGeneratedAssetInPlan={handleUseGeneratedAssetInPlan}
+                onRestoreGeneratedAssetPlacement={handleRestoreGeneratedAssetPlacement}
+                formatTopPromptType={formatTopPromptType}
+                formatProviderName={formatProviderName}
+                formatEditorialRole={formatEditorialRole}
+              />
+              <AgentHandoffCard
+                promptCount={agentHandoffPackage.items.length}
+                highPriorityOnly={agentHandoffHighPriorityOnly}
+                resultJson={agentResultJson}
+                importSummary={agentResultImportSummary}
+                onHighPriorityOnlyChange={setAgentHandoffHighPriorityOnly}
+                onCopyHandoffJson={handleCopyAgentHandoffJson}
+                onExportHandoffJson={handleExportAgentHandoffJson}
+                onExportHandoffMarkdown={handleExportAgentHandoffMarkdown}
+                onCopyResultContract={handleCopyAgentResultContract}
+                onResultJsonChange={setAgentResultJson}
+                onImportResultJson={handleImportAgentResultJson}
+              />
+              <AssetInboxCard
+                generatedAssets={generatedAssets}
+                filteredGeneratedAssets={filteredGeneratedAssets}
+                assetStatusFilter={assetStatusFilter}
+                assetTypeFilter={assetTypeFilter}
+                assetAnalysisBusyIds={assetAnalysisBusyIds}
+                assetAnalysisBusyMessage={assetAnalysisBusyMessage}
+                generatedAssetApplySummary={generatedAssetApplySummary}
+                appliedGeneratedAssetIdsByPlacementId={appliedGeneratedAssetIdsByPlacementId}
+                canUseApprovedAssets={Boolean(effectivePlan) && generatedAssets.some((asset) => asset.status === "approved")}
+                canAnalyzeAssets={aiMode !== "off" && generatedAssets.some((asset) => (asset.fileType === "image" || asset.fileType === "video") && asset.analysisStatus !== "available")}
+                onAnalyzeAllGeneratedAssets={handleAnalyzeAllGeneratedAssets}
+                onUseAllApprovedAssetsInPlan={handleUseAllApprovedAssetsInPlan}
+                onRestoreAllGeneratedAssetPlacements={handleRestoreAllGeneratedAssetPlacements}
+                onStatusFilterChange={setAssetStatusFilter}
+                onTypeFilterChange={setAssetTypeFilter}
+                onExportAssetInbox={handleExportAssetInbox}
+                onCopyGeneratedAssetPath={handleCopyGeneratedAssetPath}
+                onProbeGeneratedAssetDuration={handleProbeGeneratedAssetDuration}
+                onAnalyzeGeneratedAsset={handleAnalyzeGeneratedAsset}
+                onUpdateGeneratedAssetStatus={handleUpdateGeneratedAssetStatus}
+                onUseGeneratedAssetInPlan={handleUseGeneratedAssetInPlan}
+                onRestoreGeneratedAssetPlacement={handleRestoreGeneratedAssetPlacement}
+                onUnlinkGeneratedAsset={handleUnlinkGeneratedAsset}
+              />
+              <GeneratedAssetSuggestionsCard
+                rerankResult={generatedAssetRerankResult}
+                allowReplacingStrongMatches={allowReplacingStrongGeneratedMatches}
+                onAllowReplacingStrongMatchesChange={setAllowReplacingStrongGeneratedMatches}
+                onBuildSuggestions={handleBuildGeneratedAssetSuggestions}
+                onApplySuggestion={handleApplyGeneratedAssetSuggestion}
+                onApplyAllSafeSuggestions={handleApplyAllGeneratedAssetSuggestions}
+                onDismissSuggestion={handleDismissGeneratedAssetSuggestion}
+              />
               <div className="max-h-[460px] space-y-3 overflow-auto">
                 {previewPlan?.placements.slice(0, 30).map((placement) => {
                   const prompt = promptByPlacementId.get(placement.id);
                   const linkedAssets = assetsByPlacementId.get(placement.id) ?? [];
+                  const aiTopCandidateId = aiRankingsBySegmentId[placement.segmentId]?.rankedAssets?.[0]?.candidateId;
+                  const generatedAssetSuggestion = generatedAssetSuggestionByPlacementId.get(placement.id);
 
                   return (
-                    <article
-                    key={placement.id}
-                    className="rounded-3xl border border-border/70 bg-background/60 p-4"
-                  >
-                    <div className="flex items-center justify-between gap-4">
-                      <StatusPill
-                        tone={
-                          placement.strategy === "ai"
-                            ? "info"
-                            : placement.strategy === "manual"
-                              ? "success"
-                              : placement.strategy === "fallback"
-                                ? "warning"
-                              : "warning"
-                        }
-                        label={
-                          placement.lowConfidence
-                            ? "low-confidence fallback"
-                            : placement.strategy === "manual"
-                              ? "manual"
-                              : placement.strategy
-                        }
-                      />
-                      <span className="font-mono text-xs text-muted-foreground">
-                        {formatSeconds(placement.startSec)} - {formatSeconds(placement.endSec)}
-                      </span>
-                    </div>
-                    <p className="mt-3 text-sm leading-6 text-foreground">{placement.text}</p>
-                    <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
-                      <SummaryRow
-                        label="Media"
-                        value={placement.mediaName ? `${placement.mediaType ?? "media"} / ${placement.mediaName}` : "blank gap"}
-                      />
-                      <SummaryRow
-                        label="Duration"
-                        value={`${placement.durationSec.toFixed(2)}s${placement.layerIndex > 0 ? ` / overlap V+${placement.layerIndex}` : ""}`}
-                      />
-                      <SummaryRow label="Role" value={formatEditorialRole(placement.editorialRole)} />
-                      <SummaryRow label="Strategy" value={formatPlacementStrategy(placement.strategy, placement.lowConfidence)} />
-                      <SummaryRow label="Provider" value={formatProviderName(placement.aiProvider)} />
-                      <SummaryRow label="Confidence" value={`${Math.round(placement.aiConfidence * 100)}%`} />
-                      <SummaryRow label="Match" value={formatMatchKind(placement.matchKind)} />
-                      <SummaryRow label="Preference" value={placement.mediaPreference ?? "either"} />
-                      {placement.usingGeneratedAsset ? (
-                        <>
-                          <SummaryRow label="Generated" value={placement.generatedAssetSource ?? "approved asset"} />
-                          <SummaryRow label="Original" value={placement.originalMediaName ?? placement.originalStrategy ?? "blank"} />
-                        </>
-                      ) : null}
-                      <SummaryRow
-                        label="Recipe"
-                        value={`${getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)} / ${getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle)}`}
-                      />
-                      <SummaryRow label="Captions" value={getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle)} />
-                      {placement.mediaType === "video" ? (
-                        <>
-                          <SummaryRow
-                            label="Source"
-                            value={
-                              placement.sourceDurationSec
-                                ? `${formatSeconds(placement.sourceDurationSec)} total`
-                                : "duration unknown"
-                            }
-                          />
-                          <SummaryRow
-                            label="Source range"
-                            value={
-                              placement.sourceInSec !== null && placement.sourceOutSec !== null
-                                ? `${formatSeconds(placement.sourceInSec)} - ${formatSeconds(placement.sourceOutSec)}`
-                                : "not trimmed"
-                            }
-                          />
-                        </>
-                      ) : null}
-                    </div>
-                    <div className="mt-3 space-y-2 rounded-2xl border border-border/70 bg-card/60 p-3 text-xs">
-                      {placement.aiRationale ? (
-                        <p className="leading-5 text-muted-foreground">
-                          <span className="text-foreground">Match:</span> {placement.aiRationale}
-                        </p>
-                      ) : null}
-                      {placement.timingRationale ? (
-                        <p className="leading-5 text-muted-foreground">
-                          <span className="text-foreground">Timing:</span> {placement.timingSource} - {placement.timingRationale}
-                        </p>
-                      ) : null}
-                      {placement.aiVisualMatchReason ? (
-                        <p className="leading-5 text-muted-foreground">
-                          <span className="text-foreground">Visual fit:</span> {placement.aiVisualMatchReason}
-                        </p>
-                      ) : null}
-                      {placement.trimNote ? (
-                        <p className="leading-5 text-muted-foreground">
-                          <span className="text-foreground">Trim:</span> {placement.trimNote}
-                        </p>
-                      ) : null}
-                      {placement.fallbackReason ? (
-                        <p className="leading-5 text-amber-300">{placement.fallbackReason}</p>
-                      ) : null}
-                      {placement.usingGeneratedAsset ? (
-                        <p className="leading-5 text-emerald-300">
-                          Using approved generated asset: {placement.generatedAssetRationale}
-                        </p>
-                      ) : null}
-                      {placement.lowConfidence ? (
-                        <p className="leading-5 text-amber-300">
-                          Review this placement before executing; it is below the current confidence threshold.
-                        </p>
-                      ) : null}
-                      {prompt ? (
-                        <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
-                          <p className="font-medium text-amber-200">
-                            Prompt recommended: {prompt.suggestedAssetType} / {prompt.priority}
-                          </p>
-                          <p className="mt-1 leading-5 text-amber-100/80">{prompt.reason}</p>
-                          <p className="mt-1 leading-5 text-amber-100/70">
-                            {prompt.aiRefined
-                              ? `AI-refined via ${formatProviderName(prompt.refinementProvider ?? null)}`
-                              : "Rule-generated prompt"}
-                          </p>
-                          <button
-                            type="button"
-                            onClick={() => void handleCopyPrompt(prompt.id)}
-                            className="mt-2 rounded-full border border-amber-300/30 px-3 py-1 hover:bg-amber-300/10"
-                          >
-                            {copiedPromptIds[prompt.id] ? "Copied prompt" : "Copy prompt"}
-                          </button>
-                        </div>
-                      ) : null}
-                      {linkedAssets.length > 0 ? (
-                        <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs">
-                          <p className="font-medium text-emerald-200">Generated asset linked</p>
-                          <div className="mt-2 space-y-2">
-                            {linkedAssets.map((asset) => (
-                              <div key={asset.id}>
-                                <p className="text-emerald-100">
-                                  {asset.fileName} / {asset.status} / {asset.sourceTool}
-                                </p>
-                                <p className="mt-1 text-emerald-100/70">
-                                  {asset.intendedUsage}
-                                  {asset.sourceDurationSec ? ` / ${formatSeconds(asset.sourceDurationSec)} source` : " / duration unknown"}
-                                  {placement.generatedAssetId === asset.id
-                                    ? " / currently used in plan"
-                                    : asset.status === "approved"
-                                      ? " / ready for generated-asset replanning"
-                                      : ""}
-                                </p>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ) : null}
-                    </div>
-                    <div className="hidden">
-                      <span>
-                        {placement.mediaName
-                          ? `[${placement.mediaType}] ${placement.mediaName}`
-                          : "blank gap"}
-                      </span>
-                      <span>
-                        {placement.durationSec.toFixed(2)}s
-                        {placement.layerIndex > 0 ? ` • overlap layer ${placement.layerIndex + 1}` : ""}
-                      </span>
-                    </div>
-                    {placement.aiProvider ? (
-                      <p className="hidden">
-                        AI {placement.aiProvider} {(placement.aiConfidence * 100).toFixed(0)}%{" "}
-                        {placement.aiRationale ? `- ${placement.aiRationale}` : ""}
-                      </p>
-                    ) : null}
-                    {placement.timingRationale ? (
-                      <p className="hidden">
-                        Timing {placement.timingSource}: {placement.timingRationale}
-                      </p>
-                    ) : null}
-                    {placement.fallbackReason ? (
-                      <p className="hidden">{placement.fallbackReason}</p>
-                    ) : null}
-                    {showAdvancedUi ? (
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setManualOverridesBySegmentId((previous) => ({
-                              ...previous,
-                              [placement.segmentId]: "auto",
-                            }))
-                          }
-                          className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                        >
-                          Auto
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setManualOverridesBySegmentId((previous) => ({
-                              ...previous,
-                              [placement.segmentId]: "blank",
-                            }))
-                          }
-                          className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                        >
-                          Blank
-                        </button>
-                        {aiRankingsBySegmentId[placement.segmentId]?.rankedAssets?.[0] ? (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setManualOverridesBySegmentId((previous) => ({
-                                ...previous,
-                                [placement.segmentId]:
-                                  aiRankingsBySegmentId[placement.segmentId].rankedAssets[0].candidateId,
-                              }))
-                            }
-                            className="rounded-full border border-border/70 px-3 py-1 text-xs hover:bg-accent"
-                          >
-                            Use AI top
-                          </button>
-                        ) : null}
-                      </div>
-                    ) : null}
-                    </article>
+                    <PreviewPlacementCard
+                      key={placement.id}
+                      placement={placement}
+                      prompt={prompt}
+                      linkedAssets={linkedAssets}
+                      generatedAssetSuggestion={generatedAssetSuggestion}
+                      copiedPromptIds={copiedPromptIds}
+                      showAdvancedUi={showAdvancedUi}
+                      recipeLabel={`${getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)} / ${getOptionLabel(BROLL_STYLE_OPTIONS, brollStyle)}`}
+                      captionStyleLabel={getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle)}
+                      hasAiTopCandidate={Boolean(aiTopCandidateId)}
+                      onCopyPrompt={handleCopyPrompt}
+                      onSetManualOverride={(segmentId, value) =>
+                        setManualOverridesBySegmentId((previous) => ({
+                          ...previous,
+                          [segmentId]: value === "ai-top" ? aiTopCandidateId ?? "auto" : value,
+                        }))
+                      }
+                      formatProviderName={formatProviderName}
+                      formatPlacementStrategy={formatPlacementStrategy}
+                      formatEditorialRole={formatEditorialRole}
+                      formatMatchKind={formatMatchKind}
+                    />
                   );
                 })}
                 {!effectivePlan ? (
@@ -3426,84 +3212,12 @@ function PanelSection({
   );
 }
 
-function StatusPill({
-  label,
-  tone,
-}: {
-  label: string;
-  tone: "success" | "warning" | "info";
-}) {
-  const toneClass =
-    tone === "success"
-      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
-      : tone === "info"
-        ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
-        : "border-amber-500/30 bg-amber-500/10 text-amber-300";
-
-  return <span className={`${statusPillBase} ${toneClass}`}>{label}</span>;
-}
-
-function InlineMessage({
-  message,
-  tone,
-}: {
-  message: string;
-  tone: "error" | "warning" | "neutral";
-}) {
-  const toneClass =
-    tone === "error"
-      ? "border-destructive/40 bg-destructive/10 text-destructive"
-      : tone === "warning"
-        ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
-        : "border-border/70 bg-background/50 text-muted-foreground";
-
-  return <div className={`rounded-2xl border px-4 py-3 text-sm ${toneClass}`}>{message}</div>;
-}
-
 function StatCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
       <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{label}</p>
       <p className="mt-2 text-2xl font-semibold">{value}</p>
     </div>
-  );
-}
-
-function StatusCard({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-3xl border border-border/70 bg-background/60 p-4">
-      <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{label}</p>
-      <p className="mt-2 text-sm font-medium leading-6 text-foreground">{value}</p>
-    </div>
-  );
-}
-
-function DirectionSelect<T extends string>({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: T;
-  options: Array<{ value: T; label: string }>;
-  onChange: (value: T) => void;
-}) {
-  return (
-    <label className="text-sm">
-      <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{label}</span>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value as T)}
-        className="mt-2 w-full rounded-2xl border border-border/70 bg-card px-3 py-2 outline-none transition focus:border-primary"
-      >
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
   );
 }
 
@@ -3608,15 +3322,6 @@ function ToggleRow({
         <span className="mt-1 block leading-6 text-muted-foreground">{description}</span>
       </span>
     </label>
-  );
-}
-
-function SummaryRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-center justify-between gap-4 text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      <span className="text-right font-medium text-foreground">{value}</span>
-    </div>
   );
 }
 

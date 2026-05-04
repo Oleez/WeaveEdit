@@ -40,6 +40,8 @@ export function createImportedGeneratedAsset(
     sourceDurationSec: durationMetadata.sourceDurationSec,
     durationProbeStatus: durationMetadata.durationProbeStatus ?? "not_probed",
     durationProbeNote: durationMetadata.durationProbeNote,
+    analysisStatus: "not_analyzed",
+    analysisNote: "Visual analysis has not been run yet.",
   };
 }
 
@@ -80,6 +82,16 @@ export function formatAssetInboxCsv(assets: ImportedGeneratedAsset[]): string {
       "sourceDurationSec",
       "durationProbeStatus",
       "durationProbeNote",
+      "analysisStatus",
+      "analysisProvider",
+      "visualSummary",
+      "visualKeywords",
+      "visualStyle",
+      "moodTags",
+      "likelyUseCases",
+      "editorialRoleFit",
+      "matchKind",
+      "analysisNote",
       "notes",
     ],
     ...assets.map((asset) => [
@@ -98,6 +110,16 @@ export function formatAssetInboxCsv(assets: ImportedGeneratedAsset[]): string {
       asset.sourceDurationSec?.toFixed(2) ?? "",
       asset.durationProbeStatus ?? "not_probed",
       asset.durationProbeNote ?? "",
+      asset.analysisStatus ?? "not_analyzed",
+      asset.analysisProvider ?? "",
+      asset.visualSummary ?? "",
+      asset.visualKeywords?.join("; ") ?? "",
+      asset.visualStyle?.join("; ") ?? "",
+      asset.moodTags?.join("; ") ?? "",
+      asset.likelyUseCases?.join("; ") ?? "",
+      asset.editorialRoleFit?.join("; ") ?? "",
+      asset.matchKind ?? "",
+      asset.analysisNote ?? "",
       asset.notes,
     ]),
   ];
