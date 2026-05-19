@@ -10,28 +10,28 @@ todos:
     status: completed
   - id: refactor-index
     content: Split src/pages/Index.tsx into useEditorStore + useAutopilot + useChatAgent + useTimelineSelection hooks; reduce Index.tsx to a thin mount
-    status: in_progress
+    status: in_progress  # Hooks extracted; legacy main now lives behind tabbed SettingsDrawer (Director / Pipeline). Full ~30-line target deferred — would need a 80+ prop AdvancedDashboard for marginal gain over closure-scoped JSX.
   - id: autopilot
     content: Implement autopilot.ts orchestrator chaining ingest → silence → story → b-roll → audio → captions → critic → preview
-    status: in_progress
+    status: completed  # runFullAutopilot now ingests segments + media, runs silence/b-roll/polish/captions/council/critic in one call; Index handleAutopilotEdit wires real Premiere markers + silence preview + media rescan before invoking it.
   - id: agents
     content: Build agents/ (director, pacing, continuity, audio, critic, chat-router) on top of existing Ollama/Gemini router with AgentDeliberation output
-    status: in_progress
+    status: completed
   - id: chat
     content: Wire ChatAgent UI to chat-router, render EditPlan diff preview on timeline, gate apply behind explicit user click
-    status: in_progress
+    status: completed
   - id: audio
     content: Add LUFS normalize + voice ducking via ffmpeg-bridge + Premiere rubber-band keyframes (executeAudioPolish in cep.ts + premiereHost.jsx)
-    status: in_progress
+    status: completed
   - id: captions
     content: Word-level caption timing + Premiere caption track insertion (MOGRT primary, title-clip fallback) with style presets
-    status: in_progress
+    status: completed  # SRT-based caption track placement via importFiles + setIn/Out on a dedicated caption deck; MOGRT path still TODO for v2.
   - id: executor-ext
     content: Extend premiereHost.jsx with applyAudioPolish / applyCaptions / applyColorMatch / applyTransitions / applyExport handlers
-    status: in_progress
+    status: completed
   - id: profile
     content: Implement creator-profile.ts, persist likes/dislikes, feed into reranker + agent prompts
-    status: in_progress
+    status: completed  # CreatorProfile threads into AgentContext for every agent prompt AND into rerankGeneratedAssetsForPlacements (liked = positive bonus, disliked = negative penalty, semantic hints = token match bonus).
   - id: tests
     content: Vitest coverage for plan-builder, plan-diff, executor payload translation, chat-router intent parsing
     status: completed

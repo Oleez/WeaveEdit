@@ -5,6 +5,7 @@ import {
   PremiereTranscriptSegment,
   PremiereRunResult,
   SilencePreviewResult,
+  SilenceSpan,
   PremiereStatus,
   executeTimelineJob,
   executeSilenceCleanup,
@@ -323,6 +324,8 @@ const Index = () => {
   const [silencePreview, setSilencePreview] = useState<SilencePreviewResult | null>(null);
   const [silenceBusyMessage, setSilenceBusyMessage] = useState<string | null>(null);
   const [creatorProfile, setCreatorProfile] = useState(() => loadCreatorProfile());
+  const [executionResult, setExecutionResult] = useState<PremiereRunResult | null>(null);
+  const [executionBusy, setExecutionBusy] = useState(false);
   const [showAdvancedUi, setShowAdvancedUi] = useState(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [folderError, setFolderError] = useState<string | null>(null);
@@ -1708,6 +1711,7 @@ const Index = () => {
       captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
       creativeDirection,
       brandNotes,
+      creatorProfile,
     });
     setGeneratedAssetRerankResult(result);
   }
@@ -1876,10 +1880,33 @@ const Index = () => {
         : "No In/Out";
 
   async function handleAutopilotEdit() {
-    if (editorPlacements.length === 0) {
+    const agentContext = {
+      enabled: aiMode !== "off",
+      ollamaBaseUrl,
+      ollamaModel,
+      creatorProfile,
+      customInstructions,
+    };
+
+    // 1. Ingest transcript: prefer fresh Premiere markers when running inside the panel.
+    let workingScript = scriptText;
+    if (isCepEnvironment() && transcriptSourceMode === "premiere-markers") {
+      try {
+        const markerSegments = await getPremiereTranscriptSegments();
+        if (markerSegments.length > 0) {
+          workingScript = formatMarkerTranscript(markerSegments);
+          setScriptText(workingScript);
+          setScriptSourceName(`Premiere markers (${markerSegments.length})`);
+        }
+      } catch {
+        // Fall back to whatever script text is already in the textarea.
+      }
+    }
+
+    if (!workingScript.trim()) {
       setExecutionResult({
         ok: false,
-        message: "Build a preview plan first by loading transcript/media or scanning the folder.",
+        message: "Add a transcript (paste, upload, or load Premiere markers) before running Autopilot.",
         placedCount: 0,
         blankCount: 0,
         importedCount: 0,
@@ -1892,18 +1919,92 @@ const Index = () => {
       return;
     }
 
-    const plan = await autopilot.buildAutopilotPlan({
-      placements: editorPlacements,
+    let parsedSegments: ScriptSegment[];
+    try {
+      parsedSegments = parseTimestampScript(workingScript, { fps: hostStatus?.frameRate }).segments;
+    } catch (error) {
+      setExecutionResult({
+        ok: false,
+        message: `Could not parse transcript: ${String(error)}`,
+        placedCount: 0,
+        blankCount: 0,
+        importedCount: 0,
+        appendOffsetSec: 0,
+        skippedCount: 0,
+        clippedCount: 0,
+        workingRangeStartSec: 0,
+        workingRangeEndSec: 0,
+      });
+      return;
+    }
+
+    // 2. Media scan: rescan if the folder field is populated and node access is enabled,
+    //    otherwise reuse whatever the user already scanned manually.
+    let workingMedia = mediaItems;
+    if (imageFolderPath && isNodeEnabled()) {
+      try {
+        const scan = scanLibraryFolder(imageFolderPath, libraryMode, mediaSortMode);
+        workingMedia = scan.items;
+        setMediaItems(scan.items);
+        setScanWarnings(scan.warnings);
+      } catch {
+        // keep current media library
+      }
+    }
+
+    // 3. Silence preview: opportunistic; only runs when CEP + ffmpeg are available.
+    let workingSilenceSpans: SilenceSpan[] = silencePreview?.spans ?? [];
+    if (isCepEnvironment() && hostStatus?.ok) {
+      try {
+        const preview = await previewSilenceCleanup({
+          targetAudioTrackIndex: Math.max(0, targetAudioTrack - 1),
+          silenceThresholdDb,
+          minSilenceSec: clampDurationInput(minSilenceSec, 0.05),
+          keepSilenceSec: clampDurationInput(keepSilenceSec, 0),
+        });
+        if (preview.ok) {
+          workingSilenceSpans = preview.spans;
+          setSilencePreview(preview);
+        }
+      } catch {
+        // silence preview is best-effort; pipeline continues without it
+      }
+    }
+
+    const result = await autopilot.buildFullPipelinePlan({
+      segments: parsedSegments,
+      mediaItems: workingMedia,
+      silenceSpans: workingSilenceSpans,
       targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
       targetAudioTrackIndex: Math.max(0, targetAudioTrack - 1),
       targetLufs: captionStyle === "documentary-lower-third" ? -16 : -14,
-      creatorProfileSummary: creatorProfile.semanticHints.join(", ") || "No learned creator preferences yet.",
+      agentContext,
+      aiRankingsBySegmentId,
+      manualOverridesBySegmentId,
+      aiConfidenceThreshold,
+      pacingPreset,
+      placementStrategyMode,
+      variationStrength,
+      averageShotLengthSec,
+      minClipDurationSec: minDurationSec,
+      maxClipDurationSec: maxDurationSec,
+      frameRate: hostStatus?.frameRate ?? 30,
+      sequenceEndSec: hostStatus?.range.sequenceEndSec,
+      rangeStartSec: hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.inSec : null,
+      rangeEndSec: hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.outSec : null,
     });
-    editorStore.setPreviewPlan(plan);
+    editorStore.setPreviewPlan(result.plan);
   }
 
   async function handleSendTimelineChat() {
-    const nextPlan = await chatAgent.previewChatEdit(editorStore.activePlan);
+    const agentContext = {
+      enabled: aiMode !== "off",
+      ollamaBaseUrl,
+      ollamaModel,
+      creatorProfile,
+      customInstructions,
+    };
+    const nextPlan = await chatAgent.previewChatEdit(editorStore.activePlan, agentContext);
     if (nextPlan) {
       editorStore.setPreviewPlan(nextPlan);
     }
@@ -1987,46 +2088,59 @@ const Index = () => {
         onPlacementPreference={(placement, preference) =>
           setCreatorProfile((profile) => recordPlacementPreference(profile, placement, preference))
         }
-        settings={
-          <div className="space-y-6">
-            <WorkflowModeCard
-              activeMode={workflowMode}
-              providerLabel={activeProviderLabel}
-              modelLabel={ollamaModel}
-              fallbackLabel={fallbackLabel}
-              indexedAssets={dynamicMetrics.indexedAssets}
-              profiledAssets={dynamicMetrics.profiledAssets}
-              confidenceThreshold={aiConfidenceThreshold}
-              canAnalyze={canRunAiAnalysis}
-              aiBusyMessage={aiBusyMessage}
-              onModeChange={handleWorkflowModeChange}
-              onCheckProviders={runAiHealthCheck}
-              onAnalyzeWithAi={runAiRanking}
-            />
-            <DirectorControlsCard
-              editGoal={editGoal}
-              editStyle={editStyle}
-              brollStyle={brollStyle}
-              captionStyle={captionStyle}
-              ctaContext={ctaContext}
-              creativeDirection={creativeDirection}
-              brandNotes={brandNotes}
-              editGoalOptions={EDIT_GOAL_OPTIONS}
-              editStyleOptions={EDIT_STYLE_OPTIONS}
-              brollStyleOptions={BROLL_STYLE_OPTIONS}
-              captionStyleOptions={CAPTION_STYLE_OPTIONS}
-              editStyleLabel={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}
-              onEditGoalChange={setEditGoal}
-              onEditStyleChange={setEditStyle}
-              onBrollStyleChange={setBrollStyle}
-              onCaptionStyleChange={setCaptionStyle}
-              onCtaContextChange={setCtaContext}
-              onCreativeDirectionChange={setCreativeDirection}
-              onBrandNotesChange={setBrandNotes}
-            />
-            <p className="rounded-md border border-border/70 bg-card p-4 text-sm text-muted-foreground">
-              Advanced workflow controls now live in this drawer. Close Advanced to return to the focused Stage, Timeline, and Chat workspace.
-            </p>
+        settingsTabs={[
+          {
+            id: "director",
+            label: "Director",
+            description: "Goal, style, B-roll vibe, captions, and provider posture.",
+            content: (
+              <div className="space-y-6">
+                <WorkflowModeCard
+                  activeMode={workflowMode}
+                  providerLabel={activeProviderLabel}
+                  modelLabel={ollamaModel}
+                  fallbackLabel={fallbackLabel}
+                  indexedAssets={dynamicMetrics.indexedAssets}
+                  profiledAssets={dynamicMetrics.profiledAssets}
+                  confidenceThreshold={aiConfidenceThreshold}
+                  canAnalyze={canRunAiAnalysis}
+                  aiBusyMessage={aiBusyMessage}
+                  onModeChange={handleWorkflowModeChange}
+                  onCheckProviders={runAiHealthCheck}
+                  onAnalyzeWithAi={runAiRanking}
+                />
+                <DirectorControlsCard
+                  editGoal={editGoal}
+                  editStyle={editStyle}
+                  brollStyle={brollStyle}
+                  captionStyle={captionStyle}
+                  ctaContext={ctaContext}
+                  creativeDirection={creativeDirection}
+                  brandNotes={brandNotes}
+                  editGoalOptions={EDIT_GOAL_OPTIONS}
+                  editStyleOptions={EDIT_STYLE_OPTIONS}
+                  brollStyleOptions={BROLL_STYLE_OPTIONS}
+                  captionStyleOptions={CAPTION_STYLE_OPTIONS}
+                  editStyleLabel={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}
+                  onEditGoalChange={(value) => setEditGoal(value)}
+                  onEditStyleChange={(value) => setEditStyle(value)}
+                  onBrollStyleChange={(value) => setBrollStyle(value)}
+                  onCaptionStyleChange={(value) => setCaptionStyle(value)}
+                  onCtaContextChange={setCtaContext}
+                  onCreativeDirectionChange={setCreativeDirection}
+                  onBrandNotesChange={setBrandNotes}
+                />
+                <p className="rounded-md border border-border/70 bg-card p-4 text-sm text-muted-foreground">
+                  Quick-tune the council. The Pipeline tab holds full ingest, planning, silence, and handoff controls.
+                </p>
+              </div>
+            ),
+          },
+          {
+            id: "pipeline",
+            label: "Pipeline",
+            description: "Transcript ingest, media library, planning, silence, preview, and export handoff.",
+            content: (
             <main className="dark bg-background text-foreground">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
         <section className="rounded-[28px] border border-border/70 bg-card/95 p-6 shadow-2xl shadow-black/20">
@@ -2408,10 +2522,10 @@ const Index = () => {
                 brollStyleOptions={BROLL_STYLE_OPTIONS}
                 captionStyleOptions={CAPTION_STYLE_OPTIONS}
                 editStyleLabel={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}
-                onEditGoalChange={setEditGoal}
-                onEditStyleChange={setEditStyle}
-                onBrollStyleChange={setBrollStyle}
-                onCaptionStyleChange={setCaptionStyle}
+                onEditGoalChange={(value) => setEditGoal(value)}
+                onEditStyleChange={(value) => setEditStyle(value)}
+                onBrollStyleChange={(value) => setBrollStyle(value)}
+                onCaptionStyleChange={(value) => setCaptionStyle(value)}
                 onCtaContextChange={setCtaContext}
                 onCreativeDirectionChange={setCreativeDirection}
                 onBrandNotesChange={setBrandNotes}
@@ -3132,8 +3246,9 @@ const Index = () => {
         </section>
       </div>
             </main>
-          </div>
-        }
+            ),
+          },
+        ]}
       />
     </>
   );

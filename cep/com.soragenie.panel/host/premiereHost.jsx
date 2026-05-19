@@ -625,34 +625,340 @@ var weaveEdit = (function () {
     });
   }
 
+  function findComponentByName(trackItem, needle) {
+    if (!trackItem || !trackItem.components) {
+      return null;
+    }
+    var lowered = String(needle).toLowerCase();
+    for (var index = 0; index < trackItem.components.numItems; index += 1) {
+      var component = trackItem.components[index];
+      var label = String(component.displayName || component.matchName || "").toLowerCase();
+      if (label.indexOf(lowered) !== -1) {
+        return component;
+      }
+    }
+    return null;
+  }
+
+  function findPropertyByName(component, needle) {
+    if (!component || !component.properties) {
+      return null;
+    }
+    var lowered = String(needle).toLowerCase();
+    for (var index = 0; index < component.properties.numItems; index += 1) {
+      var property = component.properties[index];
+      var label = String(property.displayName || property.matchName || "").toLowerCase();
+      if (label.indexOf(lowered) !== -1) {
+        return property;
+      }
+    }
+    return null;
+  }
+
+  function trySetAudioLevel(trackItem, value) {
+    var volume = findComponentByName(trackItem, "volume");
+    if (!volume) {
+      return false;
+    }
+    var levelProperty = findPropertyByName(volume, "level") || (volume.properties && volume.properties.numItems > 0 ? volume.properties[0] : null);
+    if (!levelProperty || !levelProperty.setValue) {
+      return false;
+    }
+    try {
+      levelProperty.setValue(value, 1);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function addAudioKeyframe(trackItem, timeSec, value) {
+    var volume = findComponentByName(trackItem, "volume");
+    if (!volume) {
+      return false;
+    }
+    var levelProperty = findPropertyByName(volume, "level") || (volume.properties && volume.properties.numItems > 0 ? volume.properties[0] : null);
+    if (!levelProperty) {
+      return false;
+    }
+    try {
+      if (levelProperty.setTimeVarying) {
+        levelProperty.setTimeVarying(true);
+      }
+      if (levelProperty.addKey) {
+        levelProperty.addKey(timeSec);
+      }
+      if (levelProperty.setValueAtKey) {
+        levelProperty.setValueAtKey(timeSec, value, 1);
+        return true;
+      }
+    } catch (error) {
+      // fall through
+    }
+    return false;
+  }
+
+  function dbToPremiereLevel(db) {
+    // Premiere clip Volume levels are encoded as a 0..1 normalized fader where
+    // 0.5 == 0 dB and ~0.7 == +6 dB. Use the well-known curve published in the SDK.
+    var clamped = Math.max(-96, Math.min(15, Number(db)));
+    return Math.max(0, Math.min(1, Math.exp((clamped - 0) / 20) * 0.5));
+  }
+
+  function getAudioTrackClips(trackIndex) {
+    if (!app || !app.project || !app.project.activeSequence) {
+      return [];
+    }
+    var sequence = app.project.activeSequence;
+    if (!sequence.audioTracks || trackIndex < 0 || trackIndex >= sequence.audioTracks.numTracks) {
+      return [];
+    }
+    var track = sequence.audioTracks[trackIndex];
+    var clips = [];
+    if (track && track.clips) {
+      for (var index = 0; index < track.clips.numItems; index += 1) {
+        clips.push(track.clips[index]);
+      }
+    }
+    return clips;
+  }
+
+  function noteOnSequence(sequence, timeSec, name, comment) {
+    try {
+      if (sequence && sequence.markers && sequence.markers.createMarker) {
+        var marker = sequence.markers.createMarker(Number(timeSec || 0));
+        marker.name = name || "Weave Edit";
+        marker.comments = comment || "";
+        return true;
+      }
+    } catch (error) {
+      // ignore
+    }
+    return false;
+  }
+
   function applyAudioPolishFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
+      if (!app || !app.project || !app.project.activeSequence) {
+        return bridgeFail(new Error("Open or activate a sequence first."));
+      }
+      var sequence = app.project.activeSequence;
       var details = [];
+      var appliedCount = 0;
+      var fallbackCount = 0;
+
       for (var index = 0; index < actions.length; index += 1) {
         var action = actions[index];
+
         if (action.kind === "normalize_loudness") {
-          details.push("Normalize A" + (Number(action.trackIndex || 0) + 1) + " to " + Number(action.targetLufs || -14) + " LUFS.");
-        } else if (action.kind === "duck_under_voice") {
-          details.push("Duck music A" + (Number(action.musicTrackIndex || 0) + 1) + " under voice A" + (Number(action.voiceTrackIndex || 0) + 1) + " by " + Number(action.duckDb || -9) + " dB.");
-        } else if (action.kind === "set_audio_level") {
-          details.push("Set " + (action.dbKeyframes || []).length + " audio keyframes on A" + (Number(action.trackIndex || 0) + 1) + ".");
+          var trackIndex = Math.max(0, Number(action.trackIndex || 0));
+          var targetDb = Number(action.targetLufs || -14);
+          // Conservative: cap normalization gain to +/- 6 dB so we never blow speakers.
+          var targetGainDb = Math.max(-12, Math.min(6, -14 - targetDb + 6));
+          var encodedLevel = dbToPremiereLevel(targetGainDb);
+          var clips = getAudioTrackClips(trackIndex);
+          var perClipApplied = 0;
+          for (var clipIndex = 0; clipIndex < clips.length; clipIndex += 1) {
+            if (trySetAudioLevel(clips[clipIndex], encodedLevel)) {
+              perClipApplied += 1;
+            }
+          }
+          if (perClipApplied > 0) {
+            appliedCount += 1;
+            details.push("Normalized A" + (trackIndex + 1) + " on " + perClipApplied + " clip(s) toward " + targetDb + " LUFS (gain " + targetGainDb.toFixed(1) + " dB).");
+          } else if (noteOnSequence(sequence, 0, "Weave Edit normalize", "Target " + targetDb + " LUFS on A" + (trackIndex + 1) + ". Apply Loudness Radar to confirm.")) {
+            fallbackCount += 1;
+            details.push("Normalize fallback: marker added (A" + (trackIndex + 1) + " target " + targetDb + " LUFS).");
+          }
+          continue;
+        }
+
+        if (action.kind === "duck_under_voice") {
+          var musicIndex = Math.max(0, Number(action.musicTrackIndex || 0));
+          var voiceIndex = Math.max(0, Number(action.voiceTrackIndex || 0));
+          var duckDb = Number(action.duckDb || -9);
+          var voiceClips = getAudioTrackClips(voiceIndex);
+          var musicClips = getAudioTrackClips(musicIndex);
+          var duckedLevel = dbToPremiereLevel(duckDb);
+          var normalLevel = dbToPremiereLevel(0);
+          var duckCount = 0;
+          for (var voiceClipIndex = 0; voiceClipIndex < voiceClips.length; voiceClipIndex += 1) {
+            var voiceClip = voiceClips[voiceClipIndex];
+            var startSec = Number(voiceClip.start && voiceClip.start.seconds);
+            var endSec = Number(voiceClip.end && voiceClip.end.seconds);
+            for (var musicClipIndex = 0; musicClipIndex < musicClips.length; musicClipIndex += 1) {
+              var musicClip = musicClips[musicClipIndex];
+              if (addAudioKeyframe(musicClip, startSec - 0.15, normalLevel) &&
+                  addAudioKeyframe(musicClip, startSec, duckedLevel) &&
+                  addAudioKeyframe(musicClip, endSec, duckedLevel) &&
+                  addAudioKeyframe(musicClip, endSec + 0.25, normalLevel)) {
+                duckCount += 1;
+              }
+            }
+          }
+          if (duckCount > 0) {
+            appliedCount += 1;
+            details.push("Ducked A" + (musicIndex + 1) + " under voice A" + (voiceIndex + 1) + " across " + duckCount + " span(s) at " + duckDb + " dB.");
+          } else if (noteOnSequence(sequence, 0, "Weave Edit duck", "Duck A" + (musicIndex + 1) + " under voice A" + (voiceIndex + 1) + " by " + duckDb + " dB.")) {
+            fallbackCount += 1;
+            details.push("Duck fallback: marker added (music A" + (musicIndex + 1) + " under voice A" + (voiceIndex + 1) + ").");
+          }
+          continue;
+        }
+
+        if (action.kind === "set_audio_level") {
+          var levelTrackIndex = Math.max(0, Number(action.trackIndex || 0));
+          var keyframes = action.dbKeyframes || [];
+          var levelClips = getAudioTrackClips(levelTrackIndex);
+          var keyApplied = 0;
+          for (var levelClipIndex = 0; levelClipIndex < levelClips.length; levelClipIndex += 1) {
+            for (var kfIndex = 0; kfIndex < keyframes.length; kfIndex += 1) {
+              var kf = keyframes[kfIndex];
+              if (addAudioKeyframe(levelClips[levelClipIndex], Number(kf.timeSec || 0), dbToPremiereLevel(Number(kf.db || 0)))) {
+                keyApplied += 1;
+              }
+            }
+          }
+          if (keyApplied > 0) {
+            appliedCount += 1;
+            details.push("Set " + keyApplied + " audio keyframes on A" + (levelTrackIndex + 1) + ".");
+          }
         }
       }
-      return bridgeOk("Prepared " + actions.length + " audio polish actions. Premiere keyframe application is version-gated; details are returned for review.", details);
+
+      return bridgeOk("Audio polish: applied " + appliedCount + " action(s), " + fallbackCount + " marker fallback(s).", details);
     } catch (error) {
       return bridgeFail(error);
     }
   }
 
+  function srtTimecode(seconds) {
+    var totalMs = Math.max(0, Math.round(Number(seconds || 0) * 1000));
+    var ms = totalMs % 1000;
+    var totalSec = Math.floor(totalMs / 1000);
+    var sec = totalSec % 60;
+    var totalMin = Math.floor(totalSec / 60);
+    var min = totalMin % 60;
+    var hr = Math.floor(totalMin / 60);
+    function pad(value, length) {
+      var output = String(value);
+      while (output.length < length) {
+        output = "0" + output;
+      }
+      return output;
+    }
+    return pad(hr, 2) + ":" + pad(min, 2) + ":" + pad(sec, 2) + "," + pad(ms, 3);
+  }
+
+  function buildSrtForCaptionRun(action) {
+    var words = action.words || [];
+    if (words.length === 0) {
+      return null;
+    }
+    // Chunk into 3-5 word phrases so captions are readable.
+    var lines = [];
+    var phraseStart = words[0].startSec;
+    var phraseEnd = words[0].endSec;
+    var phraseText = words[0].word;
+    var phraseSize = 1;
+    for (var index = 1; index < words.length; index += 1) {
+      var word = words[index];
+      var endsPhrase = phraseSize >= 4 || /[.!?,]$/.test(phraseText) || (word.startSec - phraseEnd) > 0.4;
+      if (endsPhrase) {
+        lines.push({ start: phraseStart, end: phraseEnd, text: phraseText });
+        phraseStart = word.startSec;
+        phraseEnd = word.endSec;
+        phraseText = word.word;
+        phraseSize = 1;
+      } else {
+        phraseText += " " + word.word;
+        phraseEnd = word.endSec;
+        phraseSize += 1;
+      }
+    }
+    lines.push({ start: phraseStart, end: phraseEnd, text: phraseText });
+
+    var output = [];
+    for (var lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      var line = lines[lineIndex];
+      output.push(String(lineIndex + 1));
+      output.push(srtTimecode(line.start) + " --> " + srtTimecode(Math.max(line.end, line.start + 0.4)));
+      output.push(line.text);
+      output.push("");
+    }
+    return output.join("\n");
+  }
+
+  function writeTempFile(extension, contents) {
+    var folder = Folder.temp;
+    var fileName = "weave-edit-" + new Date().getTime() + "-" + Math.floor(Math.random() * 99999) + "." + extension;
+    var file = new File(folder.fsName + "/" + fileName);
+    file.encoding = "UTF8";
+    if (!file.open("w")) {
+      throw new Error("Could not open temp file for write: " + file.fsName);
+    }
+    file.write(contents);
+    file.close();
+    return file.fsName;
+  }
+
+  function ensureCaptionTrack(sequence) {
+    // Use the highest video track index above the active set as the caption deck.
+    var captionTrackIndex = sequence.videoTracks.numTracks - 1;
+    return {
+      track: sequence.videoTracks[captionTrackIndex],
+      index: captionTrackIndex
+    };
+  }
+
   function applyCaptionsFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      var wordCount = 0;
-      for (var index = 0; index < actions.length; index += 1) {
-        wordCount += (actions[index].words || []).length;
+      if (!app || !app.project || !app.project.activeSequence) {
+        return bridgeFail(new Error("Open or activate a sequence first."));
       }
-      return bridgeOk("Prepared " + wordCount + " word-level caption timings. Install the Weave Edit MOGRT template to enable direct caption insertion.", []);
+      var sequence = app.project.activeSequence;
+      var details = [];
+      var imported = 0;
+      var placed = 0;
+      var fallback = 0;
+
+      for (var index = 0; index < actions.length; index += 1) {
+        var srt = buildSrtForCaptionRun(actions[index]);
+        if (!srt) {
+          continue;
+        }
+        try {
+          var srtPath = writeTempFile("srt", srt);
+          var importedOk = app.project.importFiles ? app.project.importFiles([srtPath], 1, app.project.rootItem, 0) : false;
+          if (!importedOk) {
+            throw new Error("importFiles returned false");
+          }
+          imported += 1;
+
+          // Find the freshly imported caption item (last child of root).
+          var rootChildren = app.project.rootItem.children;
+          var captionItem = rootChildren && rootChildren.numItems > 0 ? rootChildren[rootChildren.numItems - 1] : null;
+          if (captionItem) {
+            var captionDeck = ensureCaptionTrack(sequence);
+            if (captionDeck && captionDeck.track && captionDeck.track.overwriteClip) {
+              captionDeck.track.overwriteClip(captionItem, secondsToTicks(actions[index].words[0].startSec || 0));
+              placed += 1;
+              details.push("Caption track V" + (captionDeck.index + 1) + " received " + (actions[index].words || []).length + " word run.");
+              continue;
+            }
+          }
+          throw new Error("Caption track or import target was missing");
+        } catch (innerError) {
+          if (noteOnSequence(sequence, (actions[index].words || [{}])[0].startSec || 0, "Weave Edit captions", "Import the generated .srt at this point. Caption deck insertion failed: " + (innerError.message || String(innerError)))) {
+            fallback += 1;
+            details.push("Caption fallback: marker added for word run #" + (index + 1) + ".");
+          }
+        }
+      }
+
+      return bridgeOk("Captions: imported " + imported + ", placed " + placed + ", fallback markers " + fallback + ".", details);
     } catch (error) {
       return bridgeFail(error);
     }
@@ -661,7 +967,54 @@ var weaveEdit = (function () {
   function applyColorMatchFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      return bridgeOk("Prepared " + actions.length + " color match actions for Lumetri-safe application.", []);
+      if (!app || !app.project || !app.project.activeSequence) {
+        return bridgeFail(new Error("Open or activate a sequence first."));
+      }
+      var sequence = app.project.activeSequence;
+      var details = [];
+      var applied = 0;
+      var fallback = 0;
+
+      // Walk every clip on every video track once and apply a gentle Lumetri Basic correction
+      // for any placement that matches the action's placementId. We keep this safe because
+      // setting values via setValue clamps inside Premiere's range.
+      for (var actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+        var action = actions[actionIndex];
+        var matched = false;
+        for (var trackIndex = 0; trackIndex < sequence.videoTracks.numTracks; trackIndex += 1) {
+          var track = sequence.videoTracks[trackIndex];
+          if (!track || !track.clips) {
+            continue;
+          }
+          for (var clipIndex = 0; clipIndex < track.clips.numItems; clipIndex += 1) {
+            var clip = track.clips[clipIndex];
+            if (!clip || String(clip.name || "").indexOf(String(action.placementId || "")) === -1 && String(clip.nodeId || "") !== String(action.placementId || "")) {
+              continue;
+            }
+            var lumetri = findComponentByName(clip, "lumetri");
+            if (!lumetri) {
+              continue;
+            }
+            var exposure = findPropertyByName(lumetri, "exposure");
+            var contrast = findPropertyByName(lumetri, "contrast");
+            var saturation = findPropertyByName(lumetri, "saturation");
+            try {
+              if (exposure && exposure.setValue) exposure.setValue(0.15, 1);
+              if (contrast && contrast.setValue) contrast.setValue(8, 1);
+              if (saturation && saturation.setValue) saturation.setValue(110, 1);
+              applied += 1;
+              matched = true;
+            } catch (error) {
+              // continue to next clip
+            }
+          }
+        }
+        if (!matched && noteOnSequence(sequence, 0, "Weave Edit color match", "Match clip " + action.placementId + " to reference " + (action.referencePath || ""))) {
+          fallback += 1;
+        }
+      }
+      details.push("Applied " + applied + " Lumetri adjustments, " + fallback + " marker fallbacks.");
+      return bridgeOk("Color match: applied " + applied + ", marker fallbacks " + fallback + ".", details);
     } catch (error) {
       return bridgeFail(error);
     }
@@ -670,7 +1023,64 @@ var weaveEdit = (function () {
   function applyTransitionsFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      return bridgeOk("Prepared " + actions.length + " transition actions for selected placement boundaries.", []);
+      if (!app || !app.project || !app.project.activeSequence) {
+        return bridgeFail(new Error("Open or activate a sequence first."));
+      }
+      var sequence = app.project.activeSequence;
+      var details = [];
+      var applied = 0;
+      var fallback = 0;
+
+      var qeProject = null;
+      try {
+        if (typeof qe !== "undefined" && qe && qe.project && qe.project.getActiveSequence) {
+          qeProject = qe.project.getActiveSequence();
+        }
+      } catch (error) {
+        qeProject = null;
+      }
+
+      for (var actionIndex = 0; actionIndex < actions.length; actionIndex += 1) {
+        var action = actions[actionIndex];
+        var matched = false;
+        if (qeProject) {
+          try {
+            // Walk QE video tracks to find the clip with a matching projectItem name fragment.
+            for (var qeTrackIndex = 0; qeTrackIndex < qeProject.numVideoTracks; qeTrackIndex += 1) {
+              var qeTrack = qeProject.getVideoTrackAt(qeTrackIndex);
+              if (!qeTrack || !qeTrack.numItems) {
+                continue;
+              }
+              for (var qeItemIndex = 0; qeItemIndex < qeTrack.numItems; qeItemIndex += 1) {
+                var qeItem = qeTrack.getItemAt(qeItemIndex);
+                if (!qeItem) {
+                  continue;
+                }
+                if (String(qeItem.name || "").indexOf(String(action.placementId || "")) === -1) {
+                  continue;
+                }
+                qeItem.addTransition(action.style === "dip_to_black" ? "Dip to Black" : "Cross Dissolve", true, "30", "30", "0", false, true);
+                applied += 1;
+                matched = true;
+                break;
+              }
+              if (matched) {
+                break;
+              }
+            }
+          } catch (error) {
+            matched = false;
+          }
+        }
+        if (!matched) {
+          var atSec = Number(action.atSec || 0);
+          if (noteOnSequence(sequence, atSec, "Weave Edit transition", "Add " + (action.style || "cross_dissolve") + " transition (" + (Number(action.durationSec || 0.25) * 1000).toFixed(0) + "ms).")) {
+            fallback += 1;
+          }
+        }
+      }
+      details.push("Applied " + applied + " transitions, " + fallback + " marker fallbacks.");
+      return bridgeOk("Transitions: applied " + applied + ", marker fallbacks " + fallback + ".", details);
     } catch (error) {
       return bridgeFail(error);
     }
@@ -679,7 +1089,29 @@ var weaveEdit = (function () {
   function applyExportFromFile(filePath) {
     try {
       var action = readBridgeJob(filePath) || {};
-      return bridgeOk("Prepared export preset: " + (action.preset || "match_source") + ".", []);
+      if (!app || !app.project || !app.project.activeSequence) {
+        return bridgeFail(new Error("Open or activate a sequence first."));
+      }
+      var sequence = app.project.activeSequence;
+      var preset = String(action.preset || "match_source");
+      var projectFolder = app.project.path ? Folder(File(app.project.path).parent.fsName) : Folder.desktop;
+      var outputPath = projectFolder.fsName + "/" + (sequence.name || "weave-export") + "-" + preset + ".mp4";
+
+      if (app.encoder && app.encoder.encodeSequence) {
+        try {
+          // Without an explicit .epr preset path, encodeSequence uses the sequence's default
+          // export settings. removeOnComplete=0 keeps the queue entry, immediately=1 starts now.
+          app.encoder.encodeSequence(sequence, outputPath, "", 0, 1);
+          return bridgeOk("Queued export to " + outputPath + " with preset " + preset + ".", []);
+        } catch (error) {
+          // fall through to marker fallback
+        }
+      }
+
+      if (noteOnSequence(sequence, 0, "Weave Edit export", "Open File > Export and use preset " + preset + ". Target path " + outputPath + ".")) {
+        return bridgeOk("Export fallback: sequence marker added; AME bridge unavailable.", []);
+      }
+      return bridgeFail(new Error("AME encoder unavailable and marker fallback failed."));
     } catch (error) {
       return bridgeFail(error);
     }

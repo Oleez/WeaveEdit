@@ -4,7 +4,7 @@ import { TimelinePlacement } from "@/lib/timeline-plan";
 import { EditPlanDiff } from "@/lib/edit-core/types";
 import { AutopilotBar } from "./AutopilotBar";
 import { Inspector } from "./Inspector";
-import { SettingsDrawer } from "./SettingsDrawer";
+import { DrawerTab, SettingsDrawer } from "./SettingsDrawer";
 import { StageCanvas } from "./StageCanvas";
 import { TimelineDeck } from "./TimelineDeck";
 
@@ -31,7 +31,8 @@ interface EditorShellProps {
   likedPlacementIds: string[];
   dislikedPlacementIds: string[];
   onPlacementPreference: (placement: TimelinePlacement, preference: "liked" | "disliked") => void;
-  settings: ReactNode;
+  settings?: ReactNode;
+  settingsTabs?: DrawerTab[];
 }
 
 export function EditorShell({
@@ -58,6 +59,7 @@ export function EditorShell({
   dislikedPlacementIds,
   onPlacementPreference,
   settings,
+  settingsTabs,
 }: EditorShellProps) {
   const selectedPlacement = placements.find((placement) => placement.id === selectedPlacementId) ?? placements[0] ?? null;
   const durationSec = Math.max(0, ...placements.map((placement) => placement.endSec));
@@ -104,7 +106,7 @@ export function EditorShell({
           diff={diff}
         />
       </div>
-      <SettingsDrawer open={settingsOpen} onClose={onCloseSettings}>
+      <SettingsDrawer open={settingsOpen} onClose={onCloseSettings} tabs={settingsTabs}>
         {settings}
       </SettingsDrawer>
     </main>

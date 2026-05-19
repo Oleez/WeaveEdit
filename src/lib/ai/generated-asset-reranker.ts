@@ -1,4 +1,5 @@
 import type { TimelinePlacement } from "../timeline-plan";
+import type { CreatorProfile } from "../edit-core/creator-profile";
 import type {
   GeneratedAssetMatchSuggestion,
   GeneratedAssetRerankResult,
@@ -18,6 +19,7 @@ interface GeneratedAssetRerankInput {
   captionStyle?: string;
   creativeDirection?: string;
   brandNotes?: string;
+  creatorProfile?: CreatorProfile;
 }
 
 interface ScoredSuggestion {
@@ -173,7 +175,8 @@ function scoreAssetForPlacement(
   const analysisBonus = asset.analysisStatus === "available" ? 0.13 : 0.03;
   const typeBonus = placement.mediaPreference === asset.fileType ? 0.07 : 0;
   const reusePenalty = usedAssetIds.has(asset.id) ? 0.22 : 0;
-  const confidence = clamp01(0.12 + overlap + linkedBonus + roleBonus + analysisBonus + typeBonus - reusePenalty);
+  const creatorBonus = scoreCreatorProfileBonus(asset, placement, assetTokens, input.creatorProfile);
+  const confidence = clamp01(0.12 + overlap + linkedBonus + roleBonus + analysisBonus + typeBonus + creatorBonus - reusePenalty);
 
   if (confidence <= 0.2) {
     return null;
@@ -190,7 +193,7 @@ function scoreAssetForPlacement(
       endSec: placement.endSec,
       transcriptText: placement.text,
       confidence,
-      matchReason: buildMatchReason(asset, placement, overlap, linkedBonus, roleBonus),
+      matchReason: buildMatchReason(asset, placement, overlap, linkedBonus, roleBonus, creatorBonus),
       matchKind,
       replaces,
       sourceTool: asset.sourceTool,
@@ -207,6 +210,7 @@ function buildMatchReason(
   overlap: number,
   linkedBonus: number,
   roleBonus: number,
+  creatorBonus = 0,
 ): string {
   const reasons = [];
   if (linkedBonus > 0) {
@@ -221,7 +225,48 @@ function buildMatchReason(
   if (overlap > 0.12) {
     reasons.push("metadata overlaps with transcript idea");
   }
+  if (creatorBonus > 0) {
+    reasons.push("aligns with learned creator preferences");
+  }
   return reasons.join("; ") || "approved generated asset has the best available metadata match.";
+}
+
+function scoreCreatorProfileBonus(
+  asset: ImportedGeneratedAsset,
+  placement: TimelinePlacement,
+  assetTokens: string[],
+  profile?: CreatorProfile,
+): number {
+  if (
+    !profile ||
+    (profile.likedPlacementIds.length === 0 &&
+      profile.dislikedPlacementIds.length === 0 &&
+      profile.semanticHints.length === 0)
+  ) {
+    return 0;
+  }
+  let bonus = 0;
+  if (profile.dislikedPlacementIds.includes(placement.id)) {
+    bonus -= 0.12;
+  }
+  const liked = new Set(profile.likedPlacementIds);
+  if (liked.has(placement.id)) {
+    bonus += 0.08;
+  }
+  if (profile.semanticHints.length > 0) {
+    const hintSet = new Set(profile.semanticHints.map((hint) => hint.toLowerCase()));
+    const tokenHits = assetTokens.filter((token) => hintSet.has(token)).length;
+    if (tokenHits > 0) {
+      bonus += Math.min(0.12, tokenHits * 0.04);
+    }
+    if (asset.editorialRoleFit?.some((role) => hintSet.has(role))) {
+      bonus += 0.05;
+    }
+    if (asset.matchKind && hintSet.has(asset.matchKind)) {
+      bonus += 0.04;
+    }
+  }
+  return Math.max(-0.15, Math.min(0.2, bonus));
 }
 
 function inferMatchKind(
