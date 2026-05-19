@@ -1,16 +1,44 @@
 import { TimelinePlacement } from "@/lib/timeline-plan";
 import { formatSeconds } from "@/lib/script-parser";
+import { EditPlanDiff } from "@/lib/edit-core/types";
 
 interface TimelineDeckProps {
   placements: TimelinePlacement[];
   selectedPlacementId: string | null;
   onSelectPlacement: (placementId: string) => void;
+  diff: EditPlanDiff;
 }
 
 const TRACKS = ["V2", "V1", "A1", "A2", "Captions"];
 
-export function TimelineDeck({ placements, selectedPlacementId, onSelectPlacement }: TimelineDeckProps) {
+export function TimelineDeck({ placements, selectedPlacementId, onSelectPlacement, diff }: TimelineDeckProps) {
   const duration = Math.max(1, ...placements.map((placement) => placement.endSec));
+  const addedIds = new Set(
+    diff.added
+      .filter((action) => action.kind === "place_clip" || action.kind === "punch_in" || action.kind === "add_transition")
+      .map((action) => ("placementId" in action ? action.placementId : "")),
+  );
+  const changedIds = new Set(
+    diff.changed
+      .map(({ after }) => after)
+      .filter((action) => "placementId" in action)
+      .map((action) => ("placementId" in action ? action.placementId : "")),
+  );
+  const resolveChipClass = (placement: TimelinePlacement) => {
+    if (selectedPlacementId === placement.id) {
+      return "bg-primary text-primary-foreground";
+    }
+    if (addedIds.has(placement.id)) {
+      return "bg-emerald-500/40 text-emerald-50 ring-1 ring-emerald-300/60";
+    }
+    if (changedIds.has(placement.id)) {
+      return "bg-violet-500/35 text-violet-50 ring-1 ring-violet-300/60";
+    }
+    if (placement.lowConfidence) {
+      return "bg-amber-500/30 text-amber-100";
+    }
+    return "bg-sky-500/25 text-sky-100 hover:bg-sky-500/40";
+  };
 
   return (
     <section className="border-t border-border/70 bg-card/80 p-3">
@@ -25,13 +53,7 @@ export function TimelineDeck({ placements, selectedPlacementId, onSelectPlacemen
                       key={placement.id}
                       type="button"
                       onClick={() => onSelectPlacement(placement.id)}
-                      className={`absolute top-1 h-8 overflow-hidden rounded px-2 text-left text-[11px] leading-8 transition ${
-                        selectedPlacementId === placement.id
-                          ? "bg-primary text-primary-foreground"
-                          : placement.lowConfidence
-                            ? "bg-amber-500/30 text-amber-100"
-                            : "bg-sky-500/25 text-sky-100 hover:bg-sky-500/40"
-                      }`}
+                      className={`absolute top-1 h-8 overflow-hidden rounded px-2 text-left text-[11px] leading-8 transition ${resolveChipClass(placement)}`}
                       style={{
                         left: `${(placement.startSec / duration) * 100}%`,
                         width: `${Math.max(3, ((placement.endSec - placement.startSec) / duration) * 100)}%`,

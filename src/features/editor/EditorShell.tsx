@@ -1,6 +1,7 @@
 import { ReactNode } from "react";
 import { PremiereStatus } from "@/lib/cep";
 import { TimelinePlacement } from "@/lib/timeline-plan";
+import { EditPlanDiff } from "@/lib/edit-core/types";
 import { AutopilotBar } from "./AutopilotBar";
 import { Inspector } from "./Inspector";
 import { SettingsDrawer } from "./SettingsDrawer";
@@ -26,6 +27,10 @@ interface EditorShellProps {
   onSendChat: () => void;
   deliberation: Array<{ agent: string; claim: string; confidence: number }>;
   diffSummary: string;
+  diff: EditPlanDiff;
+  likedPlacementIds: string[];
+  dislikedPlacementIds: string[];
+  onPlacementPreference: (placement: TimelinePlacement, preference: "liked" | "disliked") => void;
   settings: ReactNode;
 }
 
@@ -48,6 +53,10 @@ export function EditorShell({
   onSendChat,
   deliberation,
   diffSummary,
+  diff,
+  likedPlacementIds,
+  dislikedPlacementIds,
+  onPlacementPreference,
   settings,
 }: EditorShellProps) {
   const selectedPlacement = placements.find((placement) => placement.id === selectedPlacementId) ?? placements[0] ?? null;
@@ -79,12 +88,20 @@ export function EditorShell({
             onSendChat={onSendChat}
             deliberation={deliberation}
             diffSummary={diffSummary}
+            liked={Boolean(selectedPlacement && likedPlacementIds.includes(selectedPlacement.id))}
+            disliked={Boolean(selectedPlacement && dislikedPlacementIds.includes(selectedPlacement.id))}
+            onPreference={
+              selectedPlacement
+                ? (preference) => onPlacementPreference(selectedPlacement, preference)
+                : undefined
+            }
           />
         </div>
         <TimelineDeck
           placements={placements}
           selectedPlacementId={selectedPlacementId}
           onSelectPlacement={onSelectPlacement}
+          diff={diff}
         />
       </div>
       <SettingsDrawer open={settingsOpen} onClose={onCloseSettings}>

@@ -12,6 +12,7 @@ export interface AutopilotInput {
   targetVideoTrackIndex: number;
   targetAudioTrackIndex: number;
   targetLufs?: number;
+  creatorProfileSummary?: string;
 }
 
 export async function runAutopilot(input: AutopilotInput): Promise<EditPlan> {

@@ -9,6 +9,7 @@ import {
   executeTimelineJob,
   executeTransitions,
 } from "@/lib/cep";
+import { canUseFfmpegBridge, resolvePreferredFfmpegPath } from "@/lib/audio/ffmpeg-bridge";
 import { EditAction, EditPlan } from "./types";
 
 export interface EditExecutorOptions {
@@ -45,11 +46,17 @@ export async function runEditPlan(plan: EditPlan, options: EditExecutorOptions):
     messages.push(result.message);
   }
 
-  await runOptionalBridge("audio polish", messages, () =>
-    executeAudioPolish(plan.actions.filter((action) =>
-      action.kind === "normalize_loudness" || action.kind === "duck_under_voice" || action.kind === "set_audio_level",
-    )),
+  const audioActions = plan.actions.filter((action) =>
+    action.kind === "normalize_loudness" || action.kind === "duck_under_voice" || action.kind === "set_audio_level",
   );
+  if (audioActions.length > 0) {
+    messages.push(
+      canUseFfmpegBridge()
+        ? `audio analysis: FFmpeg bridge available at ${resolvePreferredFfmpegPath()}`
+        : "audio analysis: FFmpeg bridge unavailable outside CEP/Node runtime",
+    );
+  }
+  await runOptionalBridge("audio polish", messages, () => executeAudioPolish(audioActions));
   await runOptionalBridge("captions", messages, () =>
     executeCaptions(plan.actions.filter((action) => action.kind === "add_caption_run")),
   );

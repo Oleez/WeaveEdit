@@ -104,6 +104,7 @@ import { useChatAgent } from "@/features/editor/hooks/useChatAgent";
 import { useEditorStore } from "@/features/editor/hooks/useEditorStore";
 import { useTimelineSelection } from "@/features/editor/hooks/useTimelineSelection";
 import { runEditPlan } from "@/lib/edit-core/executor";
+import { loadCreatorProfile, recordPlacementPreference } from "@/lib/edit-core/creator-profile";
 
 const STORAGE_KEY = "weave-edit-settings";
 const LEGACY_STORAGE_KEY = "sora-genie-settings";
@@ -321,6 +322,7 @@ const Index = () => {
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [silencePreview, setSilencePreview] = useState<SilencePreviewResult | null>(null);
   const [silenceBusyMessage, setSilenceBusyMessage] = useState<string | null>(null);
+  const [creatorProfile, setCreatorProfile] = useState(() => loadCreatorProfile());
   const [showAdvancedUi, setShowAdvancedUi] = useState(false);
   const [busyMessage, setBusyMessage] = useState<string | null>(null);
   const [folderError, setFolderError] = useState<string | null>(null);
@@ -1895,6 +1897,7 @@ const Index = () => {
       targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
       targetAudioTrackIndex: Math.max(0, targetAudioTrack - 1),
       targetLufs: captionStyle === "documentary-lower-third" ? -16 : -14,
+      creatorProfileSummary: creatorProfile.semanticHints.join(", ") || "No learned creator preferences yet.",
     });
     editorStore.setPreviewPlan(plan);
   }
@@ -1978,6 +1981,12 @@ const Index = () => {
         onSendChat={() => void handleSendTimelineChat()}
         deliberation={editorStore.activePlan.rationale}
         diffSummary={editorDiffSummary}
+        diff={editorStore.diff}
+        likedPlacementIds={creatorProfile.likedPlacementIds}
+        dislikedPlacementIds={creatorProfile.dislikedPlacementIds}
+        onPlacementPreference={(placement, preference) =>
+          setCreatorProfile((profile) => recordPlacementPreference(profile, placement, preference))
+        }
         settings={
           <div className="space-y-6">
             <WorkflowModeCard
@@ -2016,13 +2025,9 @@ const Index = () => {
               onBrandNotesChange={setBrandNotes}
             />
             <p className="rounded-md border border-border/70 bg-card p-4 text-sm text-muted-foreground">
-              The legacy dashboard remains below this editor shell during the migration. Close Advanced to return to the focused Stage, Timeline, and Chat workspace.
+              Advanced workflow controls now live in this drawer. Close Advanced to return to the focused Stage, Timeline, and Chat workspace.
             </p>
-          </div>
-        }
-      />
-      {showAdvancedUi ? (
-    <main className="dark min-h-screen bg-background px-4 py-6 text-foreground">
+            <main className="dark bg-background text-foreground">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
         <section className="rounded-[28px] border border-border/70 bg-card/95 p-6 shadow-2xl shadow-black/20">
           <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
@@ -3126,8 +3131,10 @@ const Index = () => {
           </div>
         </section>
       </div>
-    </main>
-      ) : null}
+            </main>
+          </div>
+        }
+      />
     </>
   );
 };

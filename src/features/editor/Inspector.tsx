@@ -9,6 +9,9 @@ interface InspectorProps {
   onSendChat: () => void;
   deliberation: Array<{ agent: string; claim: string; confidence: number }>;
   diffSummary: string;
+  liked?: boolean;
+  disliked?: boolean;
+  onPreference?: (preference: "liked" | "disliked") => void;
 }
 
 export function Inspector({
@@ -18,6 +21,9 @@ export function Inspector({
   onSendChat,
   deliberation,
   diffSummary,
+  liked,
+  disliked,
+  onPreference,
 }: InspectorProps) {
   if (!placement) {
     return (
@@ -46,6 +52,28 @@ export function Inspector({
         <p className="mt-4 rounded-md border border-border/70 bg-background/70 p-3 text-xs leading-5 text-muted-foreground">
           {placement.aiRationale}
         </p>
+      ) : null}
+      {onPreference ? (
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => onPreference("liked")}
+            className={`rounded-md border px-3 py-2 text-sm font-medium transition ${
+              liked ? "border-emerald-500/70 bg-emerald-500/15 text-emerald-200" : "border-border/70 hover:bg-accent"
+            }`}
+          >
+            Like
+          </button>
+          <button
+            type="button"
+            onClick={() => onPreference("disliked")}
+            className={`rounded-md border px-3 py-2 text-sm font-medium transition ${
+              disliked ? "border-rose-500/70 bg-rose-500/15 text-rose-200" : "border-border/70 hover:bg-accent"
+            }`}
+          >
+            Dislike
+          </button>
+        </div>
       ) : null}
     </aside>
   );
