@@ -23,6 +23,8 @@ export interface PremiereRangeStatus {
 export interface PremiereStatus {
   ok: boolean;
   connected: boolean;
+  projectId: string | null;
+  projectPath: string | null;
   projectName: string;
   sequenceName: string;
   videoTracks: PremiereTrackStatus[];
@@ -351,6 +353,8 @@ export async function getPremiereStatus(): Promise<PremiereStatus> {
     return {
       ok: false,
       connected: false,
+      projectId: null,
+      projectPath: null,
       projectName: "",
       sequenceName: "",
       videoTracks: [],

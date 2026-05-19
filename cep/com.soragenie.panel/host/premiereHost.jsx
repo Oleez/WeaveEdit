@@ -132,11 +132,41 @@ var weaveEdit = (function () {
     };
   }
 
+  function getProjectIdentity() {
+    if (!app || !app.project) {
+      return { id: null, path: null };
+    }
+
+    var projectPath = "";
+    var projectId = "";
+    try {
+      projectPath = app.project.path || "";
+    } catch (error) {
+      projectPath = "";
+    }
+    try {
+      projectId = app.project.documentID || "";
+    } catch (error) {
+      projectId = "";
+    }
+    if (!projectId && projectPath) {
+      projectId = "path:" + normalizePath(projectPath);
+    }
+
+    return {
+      id: projectId || null,
+      path: projectPath ? normalizePath(projectPath) : null
+    };
+  }
+
   function getStatus() {
+    var identity = getProjectIdentity();
     if (!app || !app.project) {
       return stringify({
         ok: false,
         connected: true,
+        projectId: identity.id,
+        projectPath: identity.path,
         projectName: "",
         sequenceName: "",
         videoTracks: [],
@@ -156,6 +186,8 @@ var weaveEdit = (function () {
       return stringify({
         ok: false,
         connected: true,
+        projectId: identity.id,
+        projectPath: identity.path,
         projectName: app.project.name || "",
         sequenceName: "",
         videoTracks: [],
@@ -183,6 +215,8 @@ var weaveEdit = (function () {
     return stringify({
       ok: true,
       connected: true,
+      projectId: identity.id,
+      projectPath: identity.path,
       projectName: app.project.name || "",
       sequenceName: sequence.name || "",
       videoTracks: videoTracks,

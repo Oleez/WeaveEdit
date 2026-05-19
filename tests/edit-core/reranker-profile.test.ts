@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { rerankGeneratedAssetsForPlacements } from "@/lib/ai/generated-asset-reranker";
-import type { CreatorProfile } from "@/lib/edit-core/creator-profile";
+import { mergeCreatorProfile, type CreatorProfile } from "@/lib/edit-core/creator-profile";
 import type { TimelinePlacement } from "@/lib/timeline-plan";
 import type { ImportedGeneratedAsset } from "@/lib/ai/types";
 
@@ -114,6 +114,27 @@ describe("rerankGeneratedAssetsForPlacements creator profile", () => {
 
     expect(penalised.suggestions[0]?.confidence ?? 1).toBeLessThan(
       baseline.suggestions[0]?.confidence ?? 1,
+    );
+  });
+
+  it("uses merged per-project creator profile overrides", () => {
+    const merged = mergeCreatorProfile(baseProfile, {
+      likedPlacementIds: ["placement-1"],
+      semanticHints: ["cinematic", "hook"],
+    });
+    const baseline = rerankGeneratedAssetsForPlacements({
+      placements: [basePlacement],
+      assets: [baseAsset],
+      creatorProfile: baseProfile,
+    });
+    const boosted = rerankGeneratedAssetsForPlacements({
+      placements: [basePlacement],
+      assets: [baseAsset],
+      creatorProfile: merged,
+    });
+
+    expect(boosted.suggestions[0]?.confidence ?? 0).toBeGreaterThan(
+      baseline.suggestions[0]?.confidence ?? 0,
     );
   });
 });

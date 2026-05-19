@@ -1,4 +1,4 @@
-import { ChangeEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { ChangeEvent, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ExecuteTimelineJobInput,
   MediaScanResult,
@@ -105,7 +105,24 @@ import { useChatAgent } from "@/features/editor/hooks/useChatAgent";
 import { useEditorStore } from "@/features/editor/hooks/useEditorStore";
 import { useTimelineSelection } from "@/features/editor/hooks/useTimelineSelection";
 import { runEditPlan } from "@/lib/edit-core/executor";
-import { loadCreatorProfile, recordPlacementPreference } from "@/lib/edit-core/creator-profile";
+import {
+  loadCreatorProfile,
+  loadProjectCreatorOverride,
+  mergeCreatorProfile,
+  recordPlacementPreference,
+  recordProjectPlacementPreference,
+  resetProjectCreatorOverride,
+} from "@/lib/edit-core/creator-profile";
+import {
+  GlobalSettings,
+  ProjectSettings,
+  loadGlobalSettings,
+  loadProjectSettings,
+  migrateLegacySettings,
+  resetProjectSettings,
+  saveGlobalSettings,
+  saveProjectSettings,
+} from "@/lib/edit-core/project-settings-store";
 
 const STORAGE_KEY = "weave-edit-settings";
 const LEGACY_STORAGE_KEY = "sora-genie-settings";
@@ -323,7 +340,8 @@ const Index = () => {
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [silencePreview, setSilencePreview] = useState<SilencePreviewResult | null>(null);
   const [silenceBusyMessage, setSilenceBusyMessage] = useState<string | null>(null);
-  const [creatorProfile, setCreatorProfile] = useState(() => loadCreatorProfile());
+  const [creatorProfileVersion, setCreatorProfileVersion] = useState(0);
+  const [savePreferencesToProjectOnly, setSavePreferencesToProjectOnly] = useState(false);
   const [executionResult, setExecutionResult] = useState<PremiereRunResult | null>(null);
   const [executionBusy, setExecutionBusy] = useState(false);
   const [showAdvancedUi, setShowAdvancedUi] = useState(false);
@@ -369,6 +387,8 @@ const Index = () => {
   const [agentResultJson, setAgentResultJson] = useState("");
   const [agentResultImportSummary, setAgentResultImportSummary] =
     useState<AgentResultImportSummary | null>(null);
+  const previousProjectIdRef = useRef<string | null | undefined>(undefined);
+  const settingsHydratingRef = useRef(false);
 
   const dynamicEditorSettings = useMemo<DynamicEditorSettings>(
     () => ({
@@ -429,6 +449,8 @@ const Index = () => {
       setHostStatus({
         ok: false,
         connected: true,
+        projectId: null,
+        projectPath: null,
         projectName: "",
         sequenceName: "",
         videoTracks: [],
@@ -461,42 +483,41 @@ const Index = () => {
     setResult(null);
   }, [libraryMode]);
 
-  useEffect(() => {
-    const stored = loadStoredSettings();
-    if (!stored) {
-      return;
-    }
+  const resetTransientEditorState = useCallback(() => {
+    setResult(null);
+    setExecutionResult(null);
+    setExecutionBusy(false);
+    setAiRankingsBySegmentId({});
+    setManualOverridesBySegmentId({});
+    setSilencePreview(null);
+    setGeneratedAssetRerankResult(null);
+    setRefinedMissingAssetPlan(null);
+    setPromptRefinementResult(null);
+    setAiHealth([]);
+    setAiErrors([]);
+    setAppliedGeneratedAssetIdsByPlacementId({});
+    setGeneratedAssetApplySummary(null);
+    setMediaItems([]);
+    setScanWarnings([]);
+    setFolderError(null);
+    setTranscriptError(null);
+    setCopiedPromptIds({});
+    setAssetDraftsByPromptId({});
+    setAgentResultJson("");
+    setAgentResultImportSummary(null);
+  }, []);
 
-    setScriptText(stored.scriptText ?? defaultSettings.scriptText);
-    setImageFolderPath(stored.imageFolderPath ?? defaultSettings.imageFolderPath);
+  const applyGlobalSettings = useCallback((stored: Partial<GlobalSettings>) => {
     setLibraryMode(stored.libraryMode ?? defaultSettings.libraryMode);
     setTranscriptSourceMode(stored.transcriptSourceMode ?? defaultSettings.transcriptSourceMode);
     setMediaSortMode(stored.mediaSortMode ?? defaultSettings.mediaSortMode);
-    setPlacementStrategyMode(stored.placementStrategyMode ?? defaultSettings.placementStrategyMode);
-    setEditGoal(stored.editGoal ?? defaultSettings.editGoal);
-    setEditStyle(stored.editStyle ?? defaultSettings.editStyle);
-    setBrollStyle(stored.brollStyle ?? defaultSettings.brollStyle);
-    setCaptionStyle(stored.captionStyle ?? defaultSettings.captionStyle);
-    setCtaContext(stored.ctaContext ?? defaultSettings.ctaContext);
-    setCreativeDirection(stored.creativeDirection ?? defaultSettings.creativeDirection);
-    setBrandNotes(stored.brandNotes ?? defaultSettings.brandNotes);
-    setGeneratedAssets(stored.generatedAssets ?? defaultSettings.generatedAssets);
-    setCustomInstructions(stored.customInstructions ?? defaultSettings.customInstructions);
     setMinDurationSec(clampDurationInput(stored.minDurationSec ?? defaultSettings.minDurationSec, 0.5));
     setMaxDurationSec(clampDurationInput(stored.maxDurationSec ?? defaultSettings.maxDurationSec, 0.5));
-    setTargetVideoTrack(stored.targetVideoTrack ?? defaultSettings.targetVideoTrack);
-    setAppendAtTrackEnd(stored.appendAtTrackEnd ?? defaultSettings.appendAtTrackEnd);
-    setUseWholeSequenceFallback(
-      stored.useWholeSequenceFallback ?? defaultSettings.useWholeSequenceFallback,
-    );
     setAiMode(stored.aiMode ?? defaultSettings.aiMode);
     setOllamaBaseUrl(stored.ollamaBaseUrl ?? defaultSettings.ollamaBaseUrl);
     setOllamaModel(stored.ollamaModel ?? defaultSettings.ollamaModel);
     setGeminiModel(stored.geminiModel ?? defaultSettings.geminiModel);
-    setAiConfidenceThreshold(
-      stored.aiConfidenceThreshold ?? defaultSettings.aiConfidenceThreshold,
-    );
-    setPacingPreset(stored.pacingPreset ?? defaultSettings.pacingPreset);
+    setAiConfidenceThreshold(stored.aiConfidenceThreshold ?? defaultSettings.aiConfidenceThreshold);
     setCutBoundaryMode(stored.cutBoundaryMode ?? defaultSettings.cutBoundaryMode);
     setMatchStyle(stored.matchStyle ?? defaultSettings.matchStyle);
     setAssetReusePolicy(stored.assetReusePolicy ?? defaultSettings.assetReusePolicy);
@@ -504,6 +525,26 @@ const Index = () => {
     setAnalysisDepth(stored.analysisDepth ?? defaultSettings.analysisDepth);
     setCandidatePoolSize(stored.candidatePoolSize ?? defaultSettings.candidatePoolSize);
     setRerankDepth(stored.rerankDepth ?? defaultSettings.rerankDepth);
+  }, []);
+
+  const applyProjectSettings = useCallback((stored: Partial<ProjectSettings>) => {
+    setScriptText(stored.scriptText ?? defaultSettings.scriptText);
+    setScriptSourceName(stored.scriptText ? "Restored project memory" : "Paste script or load a file");
+    setImageFolderPath(stored.imageFolderPath ?? defaultSettings.imageFolderPath);
+    setPlacementStrategyMode(stored.placementStrategyMode ?? defaultSettings.placementStrategyMode);
+    setEditGoal((stored.editGoal as EditGoal | undefined) ?? defaultSettings.editGoal);
+    setEditStyle((stored.editStyle as EditStyle | undefined) ?? defaultSettings.editStyle);
+    setBrollStyle((stored.brollStyle as BrollStyle | undefined) ?? defaultSettings.brollStyle);
+    setCaptionStyle((stored.captionStyle as CaptionStyle | undefined) ?? defaultSettings.captionStyle);
+    setCtaContext(stored.ctaContext ?? defaultSettings.ctaContext);
+    setCreativeDirection(stored.creativeDirection ?? defaultSettings.creativeDirection);
+    setBrandNotes(stored.brandNotes ?? defaultSettings.brandNotes);
+    setGeneratedAssets(stored.generatedAssets ?? defaultSettings.generatedAssets);
+    setCustomInstructions(stored.customInstructions ?? defaultSettings.customInstructions);
+    setTargetVideoTrack(stored.targetVideoTrack ?? defaultSettings.targetVideoTrack);
+    setAppendAtTrackEnd(stored.appendAtTrackEnd ?? defaultSettings.appendAtTrackEnd);
+    setUseWholeSequenceFallback(stored.useWholeSequenceFallback ?? defaultSettings.useWholeSequenceFallback);
+    setPacingPreset(stored.pacingPreset ?? defaultSettings.pacingPreset);
     setAverageShotLengthSec(clampDurationInput(stored.averageShotLengthSec ?? defaultSettings.averageShotLengthSec, 1));
     setVariationStrength(clampVariationStrength(stored.variationStrength ?? defaultSettings.variationStrength));
     setSilenceThresholdDb(stored.silenceThresholdDb ?? defaultSettings.silenceThresholdDb);
@@ -513,56 +554,103 @@ const Index = () => {
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        scriptText,
-        imageFolderPath,
-        libraryMode,
-        transcriptSourceMode,
-        mediaSortMode,
-        placementStrategyMode,
-        editGoal,
-        editStyle,
-        brollStyle,
-        captionStyle,
-        ctaContext,
-        creativeDirection,
-        brandNotes,
-        generatedAssets,
-        customInstructions,
-        minDurationSec,
-        maxDurationSec,
-        targetVideoTrack,
-        appendAtTrackEnd,
-        useWholeSequenceFallback,
-        aiMode,
-        ollamaBaseUrl,
-        ollamaModel,
-        geminiModel,
-        aiConfidenceThreshold,
-        pacingPreset,
-        cutBoundaryMode,
-        matchStyle,
-        assetReusePolicy,
-        videoTrimPolicy,
-        analysisDepth,
-        candidatePoolSize,
-        rerankDepth,
-        averageShotLengthSec,
-        variationStrength,
-        silenceThresholdDb,
-        minSilenceSec,
-        keepSilenceSec,
-        targetAudioTrack,
-      } satisfies StoredSettings),
-    );
+    if (!hostStatus) {
+      return;
+    }
+
+    const projectId = hostStatus.projectId;
+    settingsHydratingRef.current = true;
+    migrateLegacySettings(projectId);
+    applyGlobalSettings(loadGlobalSettings());
+    applyProjectSettings(loadProjectSettings(projectId));
+    if (previousProjectIdRef.current !== projectId) {
+      resetTransientEditorState();
+      setCreatorProfileVersion((version) => version + 1);
+    }
+    previousProjectIdRef.current = projectId;
+    window.setTimeout(() => {
+      settingsHydratingRef.current = false;
+    }, 0);
+  }, [applyGlobalSettings, applyProjectSettings, hostStatus?.projectId, resetTransientEditorState]);
+
+  useEffect(() => {
+    if (!hostStatus || settingsHydratingRef.current) {
+      return;
+    }
+
+    saveGlobalSettings({
+      libraryMode,
+      transcriptSourceMode,
+      mediaSortMode,
+      minDurationSec,
+      maxDurationSec,
+      aiMode,
+      ollamaBaseUrl,
+      ollamaModel,
+      geminiModel,
+      aiConfidenceThreshold,
+      cutBoundaryMode,
+      matchStyle,
+      assetReusePolicy,
+      videoTrimPolicy,
+      analysisDepth,
+      candidatePoolSize,
+      rerankDepth,
+    });
   }, [
-    appendAtTrackEnd,
-    imageFolderPath,
     libraryMode,
+    hostStatus?.projectId,
     transcriptSourceMode,
     mediaSortMode,
+    maxDurationSec,
+    minDurationSec,
+    aiMode,
+    ollamaBaseUrl,
+    ollamaModel,
+    geminiModel,
+    aiConfidenceThreshold,
+    cutBoundaryMode,
+    matchStyle,
+    assetReusePolicy,
+    videoTrimPolicy,
+    analysisDepth,
+    candidatePoolSize,
+    rerankDepth,
+  ]);
+
+  useEffect(() => {
+    if (settingsHydratingRef.current) {
+      return;
+    }
+
+    saveProjectSettings(hostStatus?.projectId ?? null, {
+      scriptText,
+      imageFolderPath,
+      placementStrategyMode,
+      editGoal,
+      editStyle,
+      brollStyle,
+      captionStyle,
+      ctaContext,
+      creativeDirection,
+      brandNotes,
+      generatedAssets,
+      customInstructions,
+      targetVideoTrack,
+      appendAtTrackEnd,
+      useWholeSequenceFallback,
+      pacingPreset,
+      averageShotLengthSec,
+      variationStrength,
+      silenceThresholdDb,
+      minSilenceSec,
+      keepSilenceSec,
+      targetAudioTrack,
+    });
+  }, [
+    appendAtTrackEnd,
+    hostStatus?.projectId,
+    imageFolderPath,
     placementStrategyMode,
     editGoal,
     editStyle,
@@ -573,24 +661,10 @@ const Index = () => {
     brandNotes,
     generatedAssets,
     customInstructions,
-    maxDurationSec,
-    minDurationSec,
     scriptText,
     targetVideoTrack,
     useWholeSequenceFallback,
-    aiMode,
-    ollamaBaseUrl,
-    ollamaModel,
-    geminiModel,
-    aiConfidenceThreshold,
     pacingPreset,
-    cutBoundaryMode,
-    matchStyle,
-    assetReusePolicy,
-    videoTrimPolicy,
-    analysisDepth,
-    candidatePoolSize,
-    rerankDepth,
     averageShotLengthSec,
     variationStrength,
     silenceThresholdDb,
@@ -876,7 +950,7 @@ const Index = () => {
         ctaContext,
         creativeDirection,
         brandNotes,
-        projectId: hostStatus?.projectName,
+        projectId: hostStatus?.projectId ?? hostStatus?.projectName,
         sessionId: hostStatus?.sequenceName,
         highPriorityOnly: agentHandoffHighPriorityOnly,
       }),
@@ -890,6 +964,7 @@ const Index = () => {
       editGoal,
       editStyle,
       generatedAssets,
+      hostStatus?.projectId,
       hostStatus?.projectName,
       hostStatus?.sequenceName,
       missingAssetPlan,
@@ -1044,6 +1119,14 @@ const Index = () => {
         ? `Gemini ${geminiModel} available after local failure`
         : "Gemini fallback not available: missing environment key"
       : "Gemini fallback disabled";
+  const effectiveCreatorProfile = useMemo(
+    () =>
+      mergeCreatorProfile(
+        loadCreatorProfile(),
+        loadProjectCreatorOverride(hostStatus?.projectId ?? null),
+      ),
+    [creatorProfileVersion, hostStatus?.projectId],
+  );
   const aiContext = useMemo<AiScoringContext>(
     () => ({
       ollamaBaseUrl,
@@ -1711,7 +1794,7 @@ const Index = () => {
       captionStyle: getOptionLabel(CAPTION_STYLE_OPTIONS, captionStyle),
       creativeDirection,
       brandNotes,
-      creatorProfile,
+      creatorProfile: effectiveCreatorProfile,
     });
     setGeneratedAssetRerankResult(result);
   }
@@ -1868,6 +1951,9 @@ const Index = () => {
   );
   const autopilot = useAutopilot();
   const chatAgent = useChatAgent();
+  useEffect(() => {
+    editorStore.setPreviewPlan(null);
+  }, [hostStatus?.projectId]);
   const editorDiffSummary = editorStore.previewPlan
     ? `Preview diff: ${editorStore.diff.added.length} added, ${editorStore.diff.changed.length} changed, ${editorStore.diff.removed.length} removed.`
     : "";
@@ -1884,7 +1970,7 @@ const Index = () => {
       enabled: aiMode !== "off",
       ollamaBaseUrl,
       ollamaModel,
-      creatorProfile,
+      creatorProfile: effectiveCreatorProfile,
       customInstructions,
     };
 
@@ -2001,7 +2087,7 @@ const Index = () => {
       enabled: aiMode !== "off",
       ollamaBaseUrl,
       ollamaModel,
-      creatorProfile,
+      creatorProfile: effectiveCreatorProfile,
       customInstructions,
     };
     const nextPlan = await chatAgent.previewChatEdit(editorStore.activePlan, agentContext);
@@ -2083,11 +2169,16 @@ const Index = () => {
         deliberation={editorStore.activePlan.rationale}
         diffSummary={editorDiffSummary}
         diff={editorStore.diff}
-        likedPlacementIds={creatorProfile.likedPlacementIds}
-        dislikedPlacementIds={creatorProfile.dislikedPlacementIds}
-        onPlacementPreference={(placement, preference) =>
-          setCreatorProfile((profile) => recordPlacementPreference(profile, placement, preference))
-        }
+        likedPlacementIds={effectiveCreatorProfile.likedPlacementIds}
+        dislikedPlacementIds={effectiveCreatorProfile.dislikedPlacementIds}
+        onPlacementPreference={(placement, preference) => {
+          if (savePreferencesToProjectOnly && hostStatus?.projectId) {
+            recordProjectPlacementPreference(hostStatus.projectId, effectiveCreatorProfile, placement, preference);
+          } else {
+            recordPlacementPreference(effectiveCreatorProfile, placement, preference);
+          }
+          setCreatorProfileVersion((version) => version + 1);
+        }}
         settingsTabs={[
           {
             id: "director",
@@ -2130,6 +2221,54 @@ const Index = () => {
                   onCreativeDirectionChange={setCreativeDirection}
                   onBrandNotesChange={setBrandNotes}
                 />
+                <div className="grid gap-3 rounded-md border border-border/70 bg-card p-4 text-sm">
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={savePreferencesToProjectOnly}
+                      disabled={!hostStatus?.projectId}
+                      onChange={(event) => setSavePreferencesToProjectOnly(event.target.checked)}
+                      className="mt-1"
+                    />
+                    <span>
+                      <span className="block font-medium">Save preferences to this project only</span>
+                      <span className="mt-1 block text-muted-foreground">
+                        Like/dislike choices will override the global creator profile only for the active Premiere project.
+                      </span>
+                    </span>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!hostStatus?.projectId}
+                    onClick={() => {
+                      const projectId = hostStatus?.projectId;
+                      if (!projectId) {
+                        return;
+                      }
+                      const label = hostStatus?.projectName || "this project";
+                      if (!window.confirm(`Reset all Weave Edit memory for '${label}'?`)) {
+                        return;
+                      }
+                      resetProjectSettings(projectId);
+                      resetProjectCreatorOverride(projectId);
+                      settingsHydratingRef.current = true;
+                      applyProjectSettings({});
+                      resetTransientEditorState();
+                      setCreatorProfileVersion((version) => version + 1);
+                      window.setTimeout(() => {
+                        settingsHydratingRef.current = false;
+                      }, 0);
+                    }}
+                    className="w-fit rounded-md border border-destructive/60 px-3 py-2 font-medium text-destructive transition hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Reset this project
+                  </button>
+                  {!hostStatus?.projectId ? (
+                    <p className="text-xs text-muted-foreground">
+                      Save the Premiere project to enable per-project memory and reset controls.
+                    </p>
+                  ) : null}
+                </div>
                 <p className="rounded-md border border-border/70 bg-card p-4 text-sm text-muted-foreground">
                   Quick-tune the council. The Pipeline tab holds full ingest, planning, silence, and handoff controls.
                 </p>
