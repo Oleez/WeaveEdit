@@ -5,6 +5,7 @@ import { CardHeader, InlineMessage, StatusCard, StatusPill, SummaryRow } from ".
 interface GeneratedAssetSuggestionsCardProps {
   rerankResult: GeneratedAssetRerankResult | null;
   allowReplacingStrongMatches: boolean;
+  emptyReason?: string;
   onAllowReplacingStrongMatchesChange: (value: boolean) => void;
   onBuildSuggestions: () => void;
   onApplySuggestion: (suggestion: GeneratedAssetMatchSuggestion) => void;
@@ -15,6 +16,7 @@ interface GeneratedAssetSuggestionsCardProps {
 export function GeneratedAssetSuggestionsCard({
   rerankResult,
   allowReplacingStrongMatches,
+  emptyReason,
   onAllowReplacingStrongMatchesChange,
   onBuildSuggestions,
   onApplySuggestion,
@@ -81,7 +83,7 @@ export function GeneratedAssetSuggestionsCard({
         </div>
       ) : (
         <p className="mt-4 text-sm text-muted-foreground">
-          No suggestions yet. Run matching after approving and analyzing generated image/video assets.
+          {emptyReason ?? "No suggestions yet. Run matching after approving and analyzing generated image/video assets."}
         </p>
       )}
     </div>

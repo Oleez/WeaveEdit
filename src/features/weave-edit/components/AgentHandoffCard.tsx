@@ -6,6 +6,7 @@ interface AgentHandoffCardProps {
   highPriorityOnly: boolean;
   resultJson: string;
   importSummary: AgentResultImportSummary | null;
+  emptyReason?: string;
   onHighPriorityOnlyChange: (value: boolean) => void;
   onCopyHandoffJson: () => void | Promise<void>;
   onExportHandoffJson: () => void;
@@ -20,6 +21,7 @@ export function AgentHandoffCard({
   highPriorityOnly,
   resultJson,
   importSummary,
+  emptyReason,
   onHighPriorityOnlyChange,
   onCopyHandoffJson,
   onExportHandoffJson,
@@ -85,7 +87,7 @@ export function AgentHandoffCard({
       </div>
       {promptCount === 0 ? (
         <p className="mt-4 text-sm text-muted-foreground">
-          No missing-asset prompts are available yet. Build a preview first, then export the handoff package.
+          {emptyReason ?? "No missing-asset prompts are available yet. Build a preview first, then export the handoff package."}
         </p>
       ) : null}
       <div className="mt-4 grid gap-3 rounded-2xl border border-border/70 bg-card/50 p-3 text-sm">

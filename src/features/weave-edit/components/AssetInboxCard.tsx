@@ -17,6 +17,7 @@ interface AssetInboxCardProps {
   appliedGeneratedAssetIdsByPlacementId: AppliedGeneratedAssetMap;
   canUseApprovedAssets: boolean;
   canAnalyzeAssets: boolean;
+  compactWhenEmpty?: boolean;
   onAnalyzeAllGeneratedAssets: () => void | Promise<void>;
   onUseAllApprovedAssetsInPlan: () => void;
   onRestoreAllGeneratedAssetPlacements: () => void;
@@ -43,6 +44,7 @@ export function AssetInboxCard({
   appliedGeneratedAssetIdsByPlacementId,
   canUseApprovedAssets,
   canAnalyzeAssets,
+  compactWhenEmpty,
   onAnalyzeAllGeneratedAssets,
   onUseAllApprovedAssetsInPlan,
   onRestoreAllGeneratedAssetPlacements,
@@ -171,7 +173,9 @@ export function AssetInboxCard({
         </div>
       ) : (
         <p className="mt-4 text-sm text-muted-foreground">
-          No generated assets match the current filters. Attach one from a prompt card when a file is ready.
+          {compactWhenEmpty
+            ? "Asset Inbox is ready, but no generated assets are linked yet. Import Agent Result JSON or attach files from prompt cards when ready."
+            : "No generated assets match the current filters. Attach one from a prompt card when a file is ready."}
         </p>
       )}
       <InlineMessage

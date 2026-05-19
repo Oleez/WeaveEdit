@@ -130,6 +130,12 @@ export interface SilenceCleanupResult {
   details: string[];
 }
 
+export interface PremiereBridgeResult {
+  ok: boolean;
+  message: string;
+  details?: string[];
+}
+
 type NodeRequire = (moduleName: string) => unknown;
 
 interface NodeModules {
@@ -419,6 +425,26 @@ export async function executeTimelineJob(
   return evaluateJson<PremiereRunResult>(`weaveEdit.runJobFromFile("${escapedJobPath}")`);
 }
 
+export async function executeAudioPolish(payload: unknown): Promise<PremiereBridgeResult> {
+  return executeHostBridge("applyAudioPolishFromFile", payload, "Open Weave Edit inside Premiere Pro to polish audio.");
+}
+
+export async function executeCaptions(payload: unknown): Promise<PremiereBridgeResult> {
+  return executeHostBridge("applyCaptionsFromFile", payload, "Open Weave Edit inside Premiere Pro to add captions.");
+}
+
+export async function executeColorMatch(payload: unknown): Promise<PremiereBridgeResult> {
+  return executeHostBridge("applyColorMatchFromFile", payload, "Open Weave Edit inside Premiere Pro to match color.");
+}
+
+export async function executeTransitions(payload: unknown): Promise<PremiereBridgeResult> {
+  return executeHostBridge("applyTransitionsFromFile", payload, "Open Weave Edit inside Premiere Pro to add transitions.");
+}
+
+export async function executeExport(payload: unknown): Promise<PremiereBridgeResult> {
+  return executeHostBridge("applyExportFromFile", payload, "Open Weave Edit inside Premiere Pro to export.");
+}
+
 function getNodeModules(): NodeModules {
   if (!isNodeEnabled()) {
     throw new Error("Node.js is not enabled in the CEP panel.");
@@ -645,7 +671,18 @@ function getExtensionRoot(): string {
   );
 }
 
-function writeTempJob(payload: ExecuteTimelineJobInput): string {
+async function executeHostBridge(handlerName: string, payload: unknown, browserMessage: string): Promise<PremiereBridgeResult> {
+  if (!isCepEnvironment()) {
+    throw new Error(browserMessage);
+  }
+
+  await ensureHostLoaded();
+  const tempJobPath = writeTempJob(payload);
+  const escapedJobPath = escapeForJsx(tempJobPath);
+  return evaluateJson<PremiereBridgeResult>(`weaveEdit.${handlerName}("${escapedJobPath}")`);
+}
+
+function writeTempJob(payload: unknown): string {
   const { fs, os, path } = getNodeModules();
   const tempPath = path.join(os.tmpdir(), `weave-edit-job-${Date.now()}.json`);
   fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), "utf8");

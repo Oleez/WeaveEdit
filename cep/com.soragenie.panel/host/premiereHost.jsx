@@ -605,6 +605,86 @@ var weaveEdit = (function () {
     });
   }
 
+  function readBridgeJob(filePath) {
+    return parse(readTextFile(filePath));
+  }
+
+  function bridgeOk(message, details) {
+    return stringify({
+      ok: true,
+      message: message,
+      details: details || []
+    });
+  }
+
+  function bridgeFail(error) {
+    return stringify({
+      ok: false,
+      message: error.message || String(error),
+      details: []
+    });
+  }
+
+  function applyAudioPolishFromFile(filePath) {
+    try {
+      var actions = readBridgeJob(filePath) || [];
+      var details = [];
+      for (var index = 0; index < actions.length; index += 1) {
+        var action = actions[index];
+        if (action.kind === "normalize_loudness") {
+          details.push("Normalize A" + (Number(action.trackIndex || 0) + 1) + " to " + Number(action.targetLufs || -14) + " LUFS.");
+        } else if (action.kind === "duck_under_voice") {
+          details.push("Duck music A" + (Number(action.musicTrackIndex || 0) + 1) + " under voice A" + (Number(action.voiceTrackIndex || 0) + 1) + " by " + Number(action.duckDb || -9) + " dB.");
+        } else if (action.kind === "set_audio_level") {
+          details.push("Set " + (action.dbKeyframes || []).length + " audio keyframes on A" + (Number(action.trackIndex || 0) + 1) + ".");
+        }
+      }
+      return bridgeOk("Prepared " + actions.length + " audio polish actions. Premiere keyframe application is version-gated; details are returned for review.", details);
+    } catch (error) {
+      return bridgeFail(error);
+    }
+  }
+
+  function applyCaptionsFromFile(filePath) {
+    try {
+      var actions = readBridgeJob(filePath) || [];
+      var wordCount = 0;
+      for (var index = 0; index < actions.length; index += 1) {
+        wordCount += (actions[index].words || []).length;
+      }
+      return bridgeOk("Prepared " + wordCount + " word-level caption timings. Install the Weave Edit MOGRT template to enable direct caption insertion.", []);
+    } catch (error) {
+      return bridgeFail(error);
+    }
+  }
+
+  function applyColorMatchFromFile(filePath) {
+    try {
+      var actions = readBridgeJob(filePath) || [];
+      return bridgeOk("Prepared " + actions.length + " color match actions for Lumetri-safe application.", []);
+    } catch (error) {
+      return bridgeFail(error);
+    }
+  }
+
+  function applyTransitionsFromFile(filePath) {
+    try {
+      var actions = readBridgeJob(filePath) || [];
+      return bridgeOk("Prepared " + actions.length + " transition actions for selected placement boundaries.", []);
+    } catch (error) {
+      return bridgeFail(error);
+    }
+  }
+
+  function applyExportFromFile(filePath) {
+    try {
+      var action = readBridgeJob(filePath) || {};
+      return bridgeOk("Prepared export preset: " + (action.preset || "match_source") + ".", []);
+    } catch (error) {
+      return bridgeFail(error);
+    }
+  }
+
   return {
     getStatus: getStatus,
     getTranscriptSegments: getTranscriptSegments,
@@ -618,6 +698,11 @@ var weaveEdit = (function () {
       }
     },
     runJobFromFile: runJobFromFile,
-    applySilenceCleanupFromFile: applySilenceCleanupFromFile
+    applySilenceCleanupFromFile: applySilenceCleanupFromFile,
+    applyAudioPolishFromFile: applyAudioPolishFromFile,
+    applyCaptionsFromFile: applyCaptionsFromFile,
+    applyColorMatchFromFile: applyColorMatchFromFile,
+    applyTransitionsFromFile: applyTransitionsFromFile,
+    applyExportFromFile: applyExportFromFile
   };
 }());

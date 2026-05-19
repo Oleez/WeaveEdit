@@ -49,6 +49,7 @@ import { GeneratedAssetSuggestionsCard } from "@/features/weave-edit/components/
 import { MissingAssetPlanCard } from "@/features/weave-edit/components/MissingAssetPlanCard";
 import { PreviewPlacementCard } from "@/features/weave-edit/components/PreviewPlacementCard";
 import { WorkflowQaCard } from "@/features/weave-edit/components/WorkflowQaCard";
+import { WorkflowMode, WorkflowModeCard } from "@/features/weave-edit/components/WorkflowModeCard";
 import { InlineMessage, StatusCard, StatusPill, SummaryRow } from "@/features/weave-edit/components/ui";
 import { rerankGeneratedAssetsForPlacements } from "@/lib/ai/generated-asset-reranker";
 import {
@@ -97,6 +98,12 @@ import {
   resolveTimelineCoverage,
 } from "@/lib/timeline-plan";
 import { MediaLibraryItem, MediaLibraryMode, MediaSortMode, getFileName, normalizePath } from "@/lib/media";
+import { EditorShell } from "@/features/editor/EditorShell";
+import { useAutopilot } from "@/features/editor/hooks/useAutopilot";
+import { useChatAgent } from "@/features/editor/hooks/useChatAgent";
+import { useEditorStore } from "@/features/editor/hooks/useEditorStore";
+import { useTimelineSelection } from "@/features/editor/hooks/useTimelineSelection";
+import { runEditPlan } from "@/lib/edit-core/executor";
 
 const STORAGE_KEY = "weave-edit-settings";
 const LEGACY_STORAGE_KEY = "sora-genie-settings";
@@ -1007,6 +1014,31 @@ const Index = () => {
     () => buildWorkflowQaReport(workflowQaInput),
     [workflowQaInput],
   );
+  const workflowMode: WorkflowMode =
+    placementStrategyMode === "folder-order"
+      ? "manual-folder-order"
+      : brollStyle === "generated-asset-ready" || missingAssetPlan.prompts.length > 0 || generatedAssets.length > 0
+        ? "generated-asset-workflow"
+        : "ai-smart-broll";
+  const canRunAiAnalysis =
+    aiMode !== "off" &&
+    placementStrategyMode !== "folder-order" &&
+    Boolean(parsedScriptState.result) &&
+    mediaItems.length > 0;
+  const activeProviderLabel =
+    placementStrategyMode === "folder-order"
+      ? "Manual folder order"
+      : aiMode === "off"
+        ? "AI off"
+        : aiMode === "local"
+          ? "Gemma/Ollama local"
+          : "Gemma/Ollama + Gemini fallback";
+  const fallbackLabel =
+    aiMode === "hybrid"
+      ? geminiApiKey
+        ? `Gemini ${geminiModel} available after local failure`
+        : "Gemini fallback not available: missing environment key"
+      : "Gemini fallback disabled";
   const aiContext = useMemo<AiScoringContext>(
     () => ({
       ollamaBaseUrl,
@@ -1489,6 +1521,21 @@ const Index = () => {
     });
   }
 
+  function handleWorkflowModeChange(mode: WorkflowMode) {
+    if (mode === "manual-folder-order") {
+      setPlacementStrategyMode("folder-order");
+      return;
+    }
+
+    setPlacementStrategyMode(mode === "generated-asset-workflow" ? "hybrid-fallback" : "ai-dynamic");
+    if (aiMode === "off") {
+      setAiMode("local");
+    }
+    if (mode === "generated-asset-workflow") {
+      setBrollStyle("generated-asset-ready");
+    }
+  }
+
   function handleExportWorkflowQaMarkdown() {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     downloadTextFile(
@@ -1806,7 +1853,175 @@ const Index = () => {
     }
   }
 
+  const editorPlacements = previewPlan?.placements ?? effectivePlan?.placements ?? [];
+  const timelineSelection = useTimelineSelection(editorPlacements);
+  const editorStore = useEditorStore(
+    editorPlacements,
+    Math.max(0, targetVideoTrack - 1),
+    Math.max(0, targetAudioTrack - 1),
+  );
+  const autopilot = useAutopilot();
+  const chatAgent = useChatAgent();
+  const editorDiffSummary = editorStore.previewPlan
+    ? `Preview diff: ${editorStore.diff.added.length} added, ${editorStore.diff.changed.length} changed, ${editorStore.diff.removed.length} removed.`
+    : "";
+  const editorRangeLabel = appendAtTrackEnd
+    ? "Append mode"
+    : hasMeaningfulInOut
+      ? `${formatSeconds(hostStatus?.range.inSec ?? 0)} - ${formatSeconds(hostStatus?.range.outSec ?? 0)}`
+      : useWholeSequenceFallback
+        ? "Whole sequence"
+        : "No In/Out";
+
+  async function handleAutopilotEdit() {
+    if (editorPlacements.length === 0) {
+      setExecutionResult({
+        ok: false,
+        message: "Build a preview plan first by loading transcript/media or scanning the folder.",
+        placedCount: 0,
+        blankCount: 0,
+        importedCount: 0,
+        appendOffsetSec: 0,
+        skippedCount: 0,
+        clippedCount: 0,
+        workingRangeStartSec: 0,
+        workingRangeEndSec: 0,
+      });
+      return;
+    }
+
+    const plan = await autopilot.buildAutopilotPlan({
+      placements: editorPlacements,
+      targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
+      targetAudioTrackIndex: Math.max(0, targetAudioTrack - 1),
+      targetLufs: captionStyle === "documentary-lower-third" ? -16 : -14,
+    });
+    editorStore.setPreviewPlan(plan);
+  }
+
+  async function handleSendTimelineChat() {
+    const nextPlan = await chatAgent.previewChatEdit(editorStore.activePlan);
+    if (nextPlan) {
+      editorStore.setPreviewPlan(nextPlan);
+    }
+  }
+
+  async function handleApplyEditorPlan() {
+    if (!editorStore.previewPlan) {
+      await handlePlaceOnTimeline();
+      return;
+    }
+
+    setExecutionBusy(true);
+    try {
+      const result = await runEditPlan(editorStore.previewPlan, {
+        targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
+        appendAtTrackEnd,
+        useSequenceInOut: !appendAtTrackEnd && hasMeaningfulInOut,
+        rangeStartSec: previewPlan?.rangeStartSec ?? null,
+        rangeEndSec: previewPlan?.rangeEndSec ?? null,
+        silenceSettings: {
+          targetAudioTrackIndex: Math.max(0, targetAudioTrack - 1),
+          silenceThresholdDb,
+          minSilenceSec,
+          keepSilenceSec,
+        },
+      });
+      setExecutionResult({
+        ok: result.ok,
+        message: result.messages.join(" "),
+        placedCount: editorPlacements.length,
+        blankCount: editorPlacements.filter((placement) => !placement.mediaPath).length,
+        importedCount: 0,
+        appendOffsetSec: 0,
+        skippedCount: 0,
+        clippedCount: 0,
+        workingRangeStartSec: previewPlan?.rangeStartSec ?? 0,
+        workingRangeEndSec: previewPlan?.rangeEndSec ?? 0,
+      });
+    } catch (error) {
+      setExecutionResult({
+        ok: false,
+        message: String(error),
+        placedCount: 0,
+        blankCount: 0,
+        importedCount: 0,
+        appendOffsetSec: 0,
+        skippedCount: 0,
+        clippedCount: 0,
+        workingRangeStartSec: 0,
+        workingRangeEndSec: 0,
+      });
+    } finally {
+      setExecutionBusy(false);
+    }
+  }
+
   return (
+    <>
+      <EditorShell
+        placements={editorPlacements}
+        selectedPlacementId={timelineSelection.selectedPlacementId}
+        onSelectPlacement={timelineSelection.selectPlacement}
+        hostStatus={hostStatus}
+        providerLabel={activeProviderLabel}
+        rangeLabel={editorRangeLabel}
+        busy={autopilot.busy || chatAgent.busy || executionBusy}
+        settingsOpen={showAdvancedUi}
+        onOpenSettings={() => setShowAdvancedUi(true)}
+        onCloseSettings={() => setShowAdvancedUi(false)}
+        onAutopilot={() => void handleAutopilotEdit()}
+        onApply={() => void handleApplyEditorPlan()}
+        canApply={editorPlacements.length > 0}
+        chatValue={chatAgent.chatValue}
+        onChatValueChange={chatAgent.setChatValue}
+        onSendChat={() => void handleSendTimelineChat()}
+        deliberation={editorStore.activePlan.rationale}
+        diffSummary={editorDiffSummary}
+        settings={
+          <div className="space-y-6">
+            <WorkflowModeCard
+              activeMode={workflowMode}
+              providerLabel={activeProviderLabel}
+              modelLabel={ollamaModel}
+              fallbackLabel={fallbackLabel}
+              indexedAssets={dynamicMetrics.indexedAssets}
+              profiledAssets={dynamicMetrics.profiledAssets}
+              confidenceThreshold={aiConfidenceThreshold}
+              canAnalyze={canRunAiAnalysis}
+              aiBusyMessage={aiBusyMessage}
+              onModeChange={handleWorkflowModeChange}
+              onCheckProviders={runAiHealthCheck}
+              onAnalyzeWithAi={runAiRanking}
+            />
+            <DirectorControlsCard
+              editGoal={editGoal}
+              editStyle={editStyle}
+              brollStyle={brollStyle}
+              captionStyle={captionStyle}
+              ctaContext={ctaContext}
+              creativeDirection={creativeDirection}
+              brandNotes={brandNotes}
+              editGoalOptions={EDIT_GOAL_OPTIONS}
+              editStyleOptions={EDIT_STYLE_OPTIONS}
+              brollStyleOptions={BROLL_STYLE_OPTIONS}
+              captionStyleOptions={CAPTION_STYLE_OPTIONS}
+              editStyleLabel={getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}
+              onEditGoalChange={setEditGoal}
+              onEditStyleChange={setEditStyle}
+              onBrollStyleChange={setBrollStyle}
+              onCaptionStyleChange={setCaptionStyle}
+              onCtaContextChange={setCtaContext}
+              onCreativeDirectionChange={setCreativeDirection}
+              onBrandNotesChange={setBrandNotes}
+            />
+            <p className="rounded-md border border-border/70 bg-card p-4 text-sm text-muted-foreground">
+              The legacy dashboard remains below this editor shell during the migration. Close Advanced to return to the focused Stage, Timeline, and Chat workspace.
+            </p>
+          </div>
+        }
+      />
+      {showAdvancedUi ? (
     <main className="dark min-h-screen bg-background px-4 py-6 text-foreground">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
         <section className="rounded-[28px] border border-border/70 bg-card/95 p-6 shadow-2xl shadow-black/20">
@@ -1865,6 +2080,21 @@ const Index = () => {
             </div>
           </div>
         </section>
+
+        <WorkflowModeCard
+          activeMode={workflowMode}
+          providerLabel={activeProviderLabel}
+          modelLabel={ollamaModel}
+          fallbackLabel={fallbackLabel}
+          indexedAssets={dynamicMetrics.indexedAssets}
+          profiledAssets={dynamicMetrics.profiledAssets}
+          confidenceThreshold={aiConfidenceThreshold}
+          canAnalyze={canRunAiAnalysis}
+          aiBusyMessage={aiBusyMessage}
+          onModeChange={handleWorkflowModeChange}
+          onCheckProviders={runAiHealthCheck}
+          onAnalyzeWithAi={runAiRanking}
+        />
 
         <section className="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
           <div className="space-y-6">
@@ -2053,6 +2283,17 @@ const Index = () => {
               title="Edit Planning"
               description="Placement mode chooses how media lines up with each script span. Preferred shot length merges beats toward longer reads; variation adds bounded randomness inside transcript timing."
             >
+              {placementStrategyMode === "folder-order" ? (
+                <InlineMessage
+                  tone="warning"
+                  message="Manual Folder Order is active. Gemma is not selecting B-roll in this preview. Switch to AI Smart B-roll to use semantic matching, missing asset prompts, and generated asset suggestions."
+                />
+              ) : (
+                <InlineMessage
+                  tone="neutral"
+                  message="Recommended Gemma test path: choose AI Smart B-roll, run Check Providers, Analyze with AI, then review the preview plan."
+                />
+              )}
               <div className="grid gap-5">
                 <label className="grid gap-2 text-sm">
                   <span className="text-muted-foreground">Placement mode</span>
@@ -2555,21 +2796,22 @@ const Index = () => {
               </PanelSection>
             ) : null}
 
-            <PanelSection
-              step="5"
-              title="Clean silence"
-              description="Detect silent spans on the active Premiere audio track with local ffmpeg, then mark those ranges for safe timeline cleanup."
-              action={
-                <button
-                  type="button"
-                  onClick={() => void handlePreviewSilenceCleanup()}
-                  disabled={Boolean(silenceBusyMessage)}
-                  className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
-                >
-                  {silenceBusyMessage ?? "Preview silence"}
-                </button>
-              }
-            >
+            {showAdvancedUi ? (
+              <PanelSection
+                step="5"
+                title="Utilities / Silence Cleanup"
+                description="Detect silent spans on the active Premiere audio track with local ffmpeg, then mark those ranges for safe timeline cleanup."
+                action={
+                  <button
+                    type="button"
+                    onClick={() => void handlePreviewSilenceCleanup()}
+                    disabled={Boolean(silenceBusyMessage)}
+                    className="rounded-full border border-border/70 px-4 py-2 text-sm font-medium transition hover:bg-accent disabled:opacity-50"
+                  >
+                    {silenceBusyMessage ?? "Preview silence"}
+                  </button>
+                }
+              >
               <div className="grid gap-4 md:grid-cols-2">
                 <NumberField
                   label="Audio track"
@@ -2635,7 +2877,8 @@ const Index = () => {
                   </button>
                 </div>
               ) : null}
-            </PanelSection>
+              </PanelSection>
+            ) : null}
 
             <PanelSection
               step="6"
@@ -2651,6 +2894,28 @@ const Index = () => {
                 <StatCard
                   label="Edit recipe"
                   value={`${getOptionLabel(EDIT_GOAL_OPTIONS, editGoal)} / ${getOptionLabel(EDIT_STYLE_OPTIONS, editStyle)}`}
+                />
+              </div>
+              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                <StatusCard
+                  label="Timeline coverage"
+                  value={`${formatSeconds(previewPlan?.coverage.coveredSec ?? 0)} covered / ${(previewPlan?.coverage.gapSec ?? 0).toFixed(2)}s gap`}
+                />
+                <StatusCard
+                  label="AI usage"
+                  value={
+                    placementStrategyMode === "folder-order"
+                      ? "Manual folder order; semantic AI bypassed"
+                      : `${previewStats.ai} AI, ${previewStats.fallback} fallback, ${dynamicMetrics.profiledAssets} profiled`
+                  }
+                />
+                <StatusCard
+                  label="Generated assets"
+                  value={`${generatedAssets.filter((asset) => asset.status === "approved").length} approved / ${previewStats.generated} in plan`}
+                />
+                <StatusCard
+                  label="QA status"
+                  value={`${workflowQaReport.readinessStatus} / ${workflowQaReport.metrics.generatedAssetMatchSuggestions} suggestions`}
                 />
                 {showAdvancedUi ? (
                   <>
@@ -2698,6 +2963,11 @@ const Index = () => {
                 activeAttachPromptId={activeAttachPromptId}
                 copiedPromptIds={copiedPromptIds}
                 appliedGeneratedAssetIdsByPlacementId={appliedGeneratedAssetIdsByPlacementId}
+                inactiveReason={
+                  placementStrategyMode === "folder-order"
+                    ? "Prompt plan is inactive because this preview uses Manual Folder Order."
+                    : undefined
+                }
                 onRefinePromptPlan={handleRefinePromptPlan}
                 onCopyAllPrompts={handleCopyAllPrompts}
                 onExportPromptBrief={handleExportPromptBrief}
@@ -2721,6 +2991,11 @@ const Index = () => {
                 highPriorityOnly={agentHandoffHighPriorityOnly}
                 resultJson={agentResultJson}
                 importSummary={agentResultImportSummary}
+                emptyReason={
+                  placementStrategyMode === "folder-order"
+                    ? "Agent Handoff has no prompt briefs because Manual Folder Order bypasses semantic review and missing-asset planning."
+                    : "No missing-asset prompts are available yet. Run AI Smart B-roll analysis or review weak placements first."
+                }
                 onHighPriorityOnlyChange={setAgentHandoffHighPriorityOnly}
                 onCopyHandoffJson={handleCopyAgentHandoffJson}
                 onExportHandoffJson={handleExportAgentHandoffJson}
@@ -2738,6 +3013,7 @@ const Index = () => {
                 assetAnalysisBusyMessage={assetAnalysisBusyMessage}
                 generatedAssetApplySummary={generatedAssetApplySummary}
                 appliedGeneratedAssetIdsByPlacementId={appliedGeneratedAssetIdsByPlacementId}
+                compactWhenEmpty={missingAssetPlan.prompts.length === 0 && generatedAssets.length === 0}
                 canUseApprovedAssets={Boolean(effectivePlan) && generatedAssets.some((asset) => asset.status === "approved")}
                 canAnalyzeAssets={aiMode !== "off" && generatedAssets.some((asset) => (asset.fileType === "image" || asset.fileType === "video") && asset.analysisStatus !== "available")}
                 onAnalyzeAllGeneratedAssets={handleAnalyzeAllGeneratedAssets}
@@ -2757,6 +3033,11 @@ const Index = () => {
               <GeneratedAssetSuggestionsCard
                 rerankResult={generatedAssetRerankResult}
                 allowReplacingStrongMatches={allowReplacingStrongGeneratedMatches}
+                emptyReason={
+                  generatedAssets.some((asset) => asset.status === "approved")
+                    ? "No suggestions yet. Run matching after approved generated assets have visual analysis."
+                    : "Generated Asset Matches stay quiet until approved generated image/video assets exist."
+                }
                 onAllowReplacingStrongMatchesChange={setAllowReplacingStrongGeneratedMatches}
                 onBuildSuggestions={handleBuildGeneratedAssetSuggestions}
                 onApplySuggestion={handleApplyGeneratedAssetSuggestion}
@@ -2846,6 +3127,8 @@ const Index = () => {
         </section>
       </div>
     </main>
+      ) : null}
+    </>
   );
 };
 

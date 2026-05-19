@@ -1,0 +1,61 @@
+import { TimelinePlacement } from "@/lib/timeline-plan";
+import { formatSeconds } from "@/lib/script-parser";
+import { ChatAgent } from "./ChatAgent";
+
+interface InspectorProps {
+  placement: TimelinePlacement | null;
+  chatValue: string;
+  onChatValueChange: (value: string) => void;
+  onSendChat: () => void;
+  deliberation: Array<{ agent: string; claim: string; confidence: number }>;
+  diffSummary: string;
+}
+
+export function Inspector({
+  placement,
+  chatValue,
+  onChatValueChange,
+  onSendChat,
+  deliberation,
+  diffSummary,
+}: InspectorProps) {
+  if (!placement) {
+    return (
+      <ChatAgent
+        value={chatValue}
+        onChange={onChatValueChange}
+        onSend={onSendChat}
+        deliberation={deliberation}
+        diffSummary={diffSummary}
+      />
+    );
+  }
+
+  return (
+    <aside className="flex min-h-0 flex-col border-l border-border/70 bg-card/90 p-4">
+      <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Inspector</p>
+      <h2 className="mt-2 text-lg font-semibold">{placement.mediaName || "Face-time / blank beat"}</h2>
+      <dl className="mt-4 grid gap-3 text-sm">
+        <Info label="Timing" value={`${formatSeconds(placement.startSec)} - ${formatSeconds(placement.endSec)}`} />
+        <Info label="Role" value={placement.editorialRole} />
+        <Info label="Strategy" value={placement.strategy} />
+        <Info label="Confidence" value={`${Math.round(placement.aiConfidence * 100)}%`} />
+      </dl>
+      <p className="mt-5 text-sm leading-6 text-muted-foreground">{placement.text}</p>
+      {placement.aiRationale ? (
+        <p className="mt-4 rounded-md border border-border/70 bg-background/70 p-3 text-xs leading-5 text-muted-foreground">
+          {placement.aiRationale}
+        </p>
+      ) : null}
+    </aside>
+  );
+}
+
+function Info({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-border/50 pb-2">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="truncate font-medium">{value}</dd>
+    </div>
+  );
+}

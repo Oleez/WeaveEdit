@@ -18,6 +18,7 @@ interface MissingAssetPlanCardProps {
   activeAttachPromptId: string | null;
   copiedPromptIds: Record<string, boolean>;
   appliedGeneratedAssetIdsByPlacementId: AppliedGeneratedAssetMap;
+  inactiveReason?: string;
   onRefinePromptPlan: () => void | Promise<void>;
   onCopyAllPrompts: () => void | Promise<void>;
   onExportPromptBrief: (format: PromptBriefFormat) => void;
@@ -46,6 +47,7 @@ export function MissingAssetPlanCard({
   activeAttachPromptId,
   copiedPromptIds,
   appliedGeneratedAssetIdsByPlacementId,
+  inactiveReason,
   onRefinePromptPlan,
   onCopyAllPrompts,
   onExportPromptBrief,
@@ -187,7 +189,7 @@ export function MissingAssetPlanCard({
         </>
       ) : (
         <p className="mt-4 text-sm text-muted-foreground">
-          No prompt briefs needed for this preview. Strong local matches can go straight to review.
+          {inactiveReason ?? "No prompt briefs needed for this preview. Strong local matches can go straight to review."}
         </p>
       )}
     </div>
