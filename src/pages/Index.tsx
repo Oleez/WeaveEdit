@@ -4,9 +4,11 @@ import {
   MediaScanResult,
   PremiereTranscriptSegment,
   PremiereRunResult,
+  ShortsMarkerPayload,
   SilencePreviewResult,
   SilenceSpan,
   PremiereStatus,
+  executeShortsMarkers,
   executeTimelineJob,
   executeSilenceCleanup,
   getEnvironmentVariable,
@@ -51,7 +53,10 @@ import { MissingAssetPlanCard } from "@/features/weave-edit/components/MissingAs
 import { PreviewPlacementCard } from "@/features/weave-edit/components/PreviewPlacementCard";
 import { WorkflowQaCard } from "@/features/weave-edit/components/WorkflowQaCard";
 import { WorkflowMode, WorkflowModeCard } from "@/features/weave-edit/components/WorkflowModeCard";
+import { ShortsExtractorCard } from "@/features/weave-edit/components/ShortsExtractorCard";
 import { InlineMessage, StatusCard, StatusPill, SummaryRow } from "@/features/weave-edit/components/ui";
+import { extractShortsWithAi } from "@/lib/ai/shorts-extractor";
+import { serializeShortsToCsv, serializeShortsToJson } from "@/lib/ai/shorts-exporters";
 import { rerankGeneratedAssetsForPlacements } from "@/lib/ai/generated-asset-reranker";
 import {
   buildAgentHandoffPackage,
@@ -89,6 +94,9 @@ import {
   MatchStyle,
   MissingAssetPlan,
   PlacementStrategyMode,
+  ShortCandidate,
+  ShortExtractionResult,
+  ShortExtractionSettings,
   VideoTrimPolicy,
 } from "@/lib/ai/types";
 import { ScriptSegment, formatSeconds, parseTimestampScript } from "@/lib/script-parser";
@@ -232,6 +240,8 @@ interface StoredSettings {
   minSilenceSec: number;
   keepSilenceSec: number;
   targetAudioTrack: number;
+  shortsSettings: ShortExtractionSettings;
+  shortsExtractorActive: boolean;
 }
 
 interface WorkingPlan {
@@ -284,6 +294,19 @@ const defaultSettings: StoredSettings = {
   minSilenceSec: 0.35,
   keepSilenceSec: 0.05,
   targetAudioTrack: 1,
+  shortsExtractorActive: false,
+  shortsSettings: {
+    desiredDurationSec: 60,
+    clipCount: 3,
+    platform: "youtube-shorts",
+    clipGoal: "retention",
+    hookStyle: "value",
+    allowOverrun: true,
+    includeCtaEnding: true,
+    avoidDuplicateTopics: true,
+    minHookScore: 0.45,
+    minCompletenessScore: 0.55,
+  },
 };
 
 const Index = () => {
@@ -387,6 +410,13 @@ const Index = () => {
   const [agentResultJson, setAgentResultJson] = useState("");
   const [agentResultImportSummary, setAgentResultImportSummary] =
     useState<AgentResultImportSummary | null>(null);
+  const [shortsExtractorActive, setShortsExtractorActive] = useState(defaultSettings.shortsExtractorActive);
+  const [shortsSettings, setShortsSettings] = useState<ShortExtractionSettings>(defaultSettings.shortsSettings);
+  const [shortsResult, setShortsResult] = useState<ShortExtractionResult | null>(null);
+  const [shortsBusy, setShortsBusy] = useState(false);
+  const [shortsError, setShortsError] = useState<string | null>(null);
+  const [selectedShortIds, setSelectedShortIds] = useState<Set<string>>(() => new Set());
+  const [shortScopedRange, setShortScopedRange] = useState<{ startSec: number; endSec: number; shortId: string } | null>(null);
   const previousProjectIdRef = useRef<string | null | undefined>(undefined);
   const settingsHydratingRef = useRef(false);
 
@@ -505,6 +535,10 @@ const Index = () => {
     setAssetDraftsByPromptId({});
     setAgentResultJson("");
     setAgentResultImportSummary(null);
+    setShortsResult(null);
+    setShortsError(null);
+    setSelectedShortIds(new Set());
+    setShortScopedRange(null);
   }, []);
 
   const applyGlobalSettings = useCallback((stored: Partial<GlobalSettings>) => {
@@ -551,6 +585,8 @@ const Index = () => {
     setMinSilenceSec(clampDurationInput(stored.minSilenceSec ?? defaultSettings.minSilenceSec, 0.05));
     setKeepSilenceSec(clampDurationInput(stored.keepSilenceSec ?? defaultSettings.keepSilenceSec, 0));
     setTargetAudioTrack(stored.targetAudioTrack ?? defaultSettings.targetAudioTrack);
+    setShortsExtractorActive(stored.shortsExtractorActive ?? defaultSettings.shortsExtractorActive);
+    setShortsSettings(stored.shortsSettings ?? defaultSettings.shortsSettings);
   }, []);
 
   useEffect(() => {
@@ -646,6 +682,8 @@ const Index = () => {
       minSilenceSec,
       keepSilenceSec,
       targetAudioTrack,
+      shortsExtractorActive,
+      shortsSettings,
     });
   }, [
     appendAtTrackEnd,
@@ -671,6 +709,8 @@ const Index = () => {
     minSilenceSec,
     keepSilenceSec,
     targetAudioTrack,
+    shortsExtractorActive,
+    shortsSettings,
   ]);
 
   useEffect(() => {
@@ -731,6 +771,8 @@ const Index = () => {
       maxOverlapLayers: dynamicEditorSettings.pacingPreset === "cinematic-slow" ? 1 : 2,
       frameRate: hostStatus?.frameRate ?? 30,
       sequenceEndSec: hostStatus?.range.sequenceEndSec,
+      rangeStartSec: shortScopedRange?.startSec ?? null,
+      rangeEndSec: shortScopedRange?.endSec ?? null,
       targetSecondsPerClip: dynamicEditorSettings.averageShotLengthSec,
       placementStrategyMode,
       variationStrength: dynamicEditorSettings.variationStrength,
@@ -749,11 +791,24 @@ const Index = () => {
     parsedScriptState.result,
     placementStrategyMode,
     pacingPreset,
+    shortScopedRange,
   ]);
 
   const effectivePlan = useMemo<WorkingPlan | null>(() => {
     if (!basePlan) {
       return null;
+    }
+
+    if (shortScopedRange) {
+      return {
+        mode: "sequence_in_out",
+        placements: basePlan.placements,
+        skippedCount: 0,
+        clippedCount: 0,
+        rangeStartSec: shortScopedRange.startSec,
+        rangeEndSec: shortScopedRange.endSec,
+        coverage: basePlan.coverage,
+      };
     }
 
     if (appendAtTrackEnd) {
@@ -825,6 +880,7 @@ const Index = () => {
     maxDurationSec,
     minDurationSec,
     pacingPreset,
+    shortScopedRange,
     useWholeSequenceFallback,
   ]);
 
@@ -1095,11 +1151,13 @@ const Index = () => {
     [workflowQaInput],
   );
   const workflowMode: WorkflowMode =
-    placementStrategyMode === "folder-order"
-      ? "manual-folder-order"
-      : brollStyle === "generated-asset-ready" || missingAssetPlan.prompts.length > 0 || generatedAssets.length > 0
-        ? "generated-asset-workflow"
-        : "ai-smart-broll";
+    shortsExtractorActive
+      ? "long-to-shorts"
+      : placementStrategyMode === "folder-order"
+        ? "manual-folder-order"
+        : brollStyle === "generated-asset-ready" || missingAssetPlan.prompts.length > 0 || generatedAssets.length > 0
+          ? "generated-asset-workflow"
+          : "ai-smart-broll";
   const canRunAiAnalysis =
     aiMode !== "off" &&
     placementStrategyMode !== "folder-order" &&
@@ -1610,6 +1668,12 @@ const Index = () => {
   }
 
   function handleWorkflowModeChange(mode: WorkflowMode) {
+    if (mode === "long-to-shorts") {
+      setShortsExtractorActive(true);
+      return;
+    }
+
+    setShortsExtractorActive(false);
     if (mode === "manual-folder-order") {
       setPlacementStrategyMode("folder-order");
       return;
@@ -1622,6 +1686,111 @@ const Index = () => {
     if (mode === "generated-asset-workflow") {
       setBrollStyle("generated-asset-ready");
     }
+  }
+
+  async function handleFindBestShorts() {
+    if (!parsedScriptState.result?.segments.length) {
+      setShortsError("Load Premiere markers or a timestamped transcript first.");
+      return;
+    }
+
+    setShortsBusy(true);
+    setShortsError(null);
+    setSelectedShortIds(new Set());
+    try {
+      const segments = parsedScriptState.result.segments;
+      const result = await extractShortsWithAi(
+        segments,
+        shortsSettings,
+        aiMode,
+        { ...aiContext, fullScriptContext: buildFullScriptContext(segments) },
+      );
+      setShortsResult(result);
+      setSelectedShortIds(new Set(result.candidates.map((candidate) => candidate.id)));
+    } catch (error) {
+      setShortsError(String(error));
+    } finally {
+      setShortsBusy(false);
+    }
+  }
+
+  async function handleCreateShortsMarkers() {
+    if (!shortsResult) {
+      return;
+    }
+
+    const shorts = shortsResult.candidates.filter((candidate) => selectedShortIds.has(candidate.id));
+    if (shorts.length === 0) {
+      setShortsError("Select at least one short before creating markers.");
+      return;
+    }
+
+    const payload: ShortsMarkerPayload = {
+      shorts: shorts.map((candidate, index) => ({
+        id: candidate.id,
+        markerName: `Weave Short ${index + 1} - ${candidate.titleSuggestion}`.slice(0, 120),
+        markerComment: formatShortMarkerComment(candidate),
+        startSec: candidate.startSec,
+        endSec: candidate.endSec,
+      })),
+    };
+
+    try {
+      const bridgeResult = await executeShortsMarkers(payload);
+      setResult({
+        ok: bridgeResult.ok,
+        message: bridgeResult.message,
+        placedCount: 0,
+        blankCount: 0,
+        importedCount: 0,
+        appendOffsetSec: 0,
+        skippedCount: 0,
+        clippedCount: 0,
+        workingRangeStartSec: shorts[0]?.startSec ?? 0,
+        workingRangeEndSec: shorts[shorts.length - 1]?.endSec ?? 0,
+        details: bridgeResult.details,
+      });
+      await refreshPremiereStatus();
+    } catch (error) {
+      setShortsError(String(error));
+    }
+  }
+
+  function handleSendShortToBrollWorkflow(candidate: ShortCandidate) {
+    setShortScopedRange({ startSec: candidate.startSec, endSec: candidate.endSec, shortId: candidate.id });
+    setShortsExtractorActive(false);
+    setPlacementStrategyMode("ai-dynamic");
+    window.requestAnimationFrame(() => {
+      document.getElementById("weave-preview-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  function handleToggleShort(candidateId: string) {
+    setSelectedShortIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(candidateId)) {
+        next.delete(candidateId);
+      } else {
+        next.add(candidateId);
+      }
+      return next;
+    });
+  }
+
+  function handleExportShortsJson() {
+    if (!shortsResult) {
+      return;
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadTextFile(`weave-edit-shorts-${timestamp}.json`, serializeShortsToJson(shortsResult), "application/json");
+  }
+
+  function handleExportShortsCsv() {
+    if (!shortsResult) {
+      return;
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    downloadTextFile(`weave-edit-shorts-${timestamp}.csv`, serializeShortsToCsv(shortsResult), "text/csv");
   }
 
   function handleExportWorkflowQaMarkdown() {
@@ -2076,8 +2245,8 @@ const Index = () => {
       maxClipDurationSec: maxDurationSec,
       frameRate: hostStatus?.frameRate ?? 30,
       sequenceEndSec: hostStatus?.range.sequenceEndSec,
-      rangeStartSec: hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.inSec : null,
-      rangeEndSec: hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.outSec : null,
+      rangeStartSec: shortScopedRange?.startSec ?? (hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.inSec : null),
+      rangeEndSec: shortScopedRange?.endSec ?? (hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.outSec : null),
     });
     editorStore.setPreviewPlan(result.plan);
   }
@@ -2199,6 +2368,28 @@ const Index = () => {
                   onModeChange={handleWorkflowModeChange}
                   onCheckProviders={runAiHealthCheck}
                   onAnalyzeWithAi={runAiRanking}
+                />
+                <ShortsExtractorCard
+                  settings={shortsSettings}
+                  result={shortsResult}
+                  busy={shortsBusy}
+                  error={shortsError}
+                  aiMode={aiMode}
+                  hasTranscript={Boolean(parsedScriptState.result)}
+                  selectedIds={selectedShortIds}
+                  scopedRangeLabel={shortScopedRange ? `${formatSeconds(shortScopedRange.startSec)} - ${formatSeconds(shortScopedRange.endSec)}` : null}
+                  onSettingsChange={setShortsSettings}
+                  onFind={handleFindBestShorts}
+                  onToggleSelect={handleToggleShort}
+                  onSelectAll={() => setSelectedShortIds(new Set(shortsResult?.candidates.map((candidate) => candidate.id) ?? []))}
+                  onClearSelection={() => setSelectedShortIds(new Set())}
+                  onCreateMarkers={handleCreateShortsMarkers}
+                  onExportJson={handleExportShortsJson}
+                  onExportCsv={handleExportShortsCsv}
+                  onCopyTitle={(candidate) => copyText(candidate.titleSuggestion)}
+                  onCopyHook={(candidate) => copyText(candidate.hookLine)}
+                  onCopyNotes={(candidate) => copyText(formatShortMarkerComment(candidate))}
+                  onSendToBrollWorkflow={handleSendShortToBrollWorkflow}
                 />
                 <DirectorControlsCard
                   editGoal={editGoal}
@@ -3139,6 +3330,7 @@ const Index = () => {
             ) : null}
 
             <PanelSection
+              id="weave-preview-section"
               step="6"
               title="Preview and execute"
               description="Review only the placements that matter for the current working range, then send them to Premiere."
@@ -3202,6 +3394,30 @@ const Index = () => {
                       ? "Whole-sequence fallback is active because sequence In/Out is not being used."
                       : "Set sequence In/Out or enable whole-sequence fallback to make the preview executable."}
               </div>
+              {workflowMode === "long-to-shorts" ? (
+                <ShortsExtractorCard
+                  settings={shortsSettings}
+                  result={shortsResult}
+                  busy={shortsBusy}
+                  error={shortsError}
+                  aiMode={aiMode}
+                  hasTranscript={Boolean(parsedScriptState.result)}
+                  selectedIds={selectedShortIds}
+                  scopedRangeLabel={shortScopedRange ? `${formatSeconds(shortScopedRange.startSec)} - ${formatSeconds(shortScopedRange.endSec)}` : null}
+                  onSettingsChange={setShortsSettings}
+                  onFind={handleFindBestShorts}
+                  onToggleSelect={handleToggleShort}
+                  onSelectAll={() => setSelectedShortIds(new Set(shortsResult?.candidates.map((candidate) => candidate.id) ?? []))}
+                  onClearSelection={() => setSelectedShortIds(new Set())}
+                  onCreateMarkers={handleCreateShortsMarkers}
+                  onExportJson={handleExportShortsJson}
+                  onExportCsv={handleExportShortsCsv}
+                  onCopyTitle={(candidate) => copyText(candidate.titleSuggestion)}
+                  onCopyHook={(candidate) => copyText(candidate.hookLine)}
+                  onCopyNotes={(candidate) => copyText(formatShortMarkerComment(candidate))}
+                  onSendToBrollWorkflow={handleSendShortToBrollWorkflow}
+                />
+              ) : null}
               <WorkflowQaCard
                 checklist={workflowQaChecklist}
                 report={workflowQaReport}
@@ -3536,6 +3752,31 @@ function downloadTextFile(fileName: string, content: string, mimeType: string) {
   URL.revokeObjectURL(url);
 }
 
+function formatShortMarkerComment(candidate: ShortCandidate): string {
+  return [
+    candidate.titleSuggestion,
+    candidate.hookLine,
+    "",
+    candidate.reasonSelected,
+    `CTA: ${candidate.hasCtaOpportunity ? "yes" : "optional"}`,
+    `Caption style: ${candidate.suggestedCaptionStyle}`,
+    `B-roll style: ${candidate.suggestedBrollStyle}`,
+    "",
+    `Edit notes: ${formatShortEditNotes(candidate)}`,
+    candidate.warnings.length ? `Warnings: ${candidate.warnings.join(", ")}` : "",
+  ].filter((line) => line.length > 0).join("\n");
+}
+
+function formatShortEditNotes(candidate: ShortCandidate): string {
+  return [
+    `punch-in@${candidate.editNotes.punchInAtSec.join("/") || "none"}`,
+    `b-roll@${candidate.editNotes.brollAtSec.join("/") || "none"}`,
+    `captions@${candidate.editNotes.captionsAtSec.join("/") || "none"}`,
+    `sound@${candidate.editNotes.soundHitsAtSec.join("/") || "none"}`,
+    `silence@${candidate.editNotes.silenceCutsAtSec.join("/") || "none"}`,
+  ].join(", ");
+}
+
 function generatedAssetPathExists(filePath: string): boolean | null {
   if (!isNodeEnabled()) {
     return null;
@@ -3726,12 +3967,14 @@ function formatMatchKind(kind: TimelinePlacement["matchKind"]): string {
 }
 
 function PanelSection({
+  id,
   step,
   title,
   description,
   action,
   children,
 }: {
+  id?: string;
   step: string;
   title: string;
   description: string;
@@ -3739,7 +3982,7 @@ function PanelSection({
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-[28px] border border-border/70 bg-card/95 p-6 shadow-xl shadow-black/10">
+    <section id={id} className="rounded-[28px] border border-border/70 bg-card/95 p-6 shadow-xl shadow-black/10">
       <div className="flex flex-col gap-4">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>

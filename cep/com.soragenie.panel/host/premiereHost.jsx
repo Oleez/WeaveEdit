@@ -643,6 +643,46 @@ var weaveEdit = (function () {
     return parse(readTextFile(filePath));
   }
 
+  function applyShortsMarkersFromFile(filePath) {
+    try {
+      var job = readBridgeJob(filePath) || {};
+      var sequence = app && app.project ? app.project.activeSequence : null;
+      if (!sequence) {
+        return bridgeFail(new Error("Open or activate a sequence first."));
+      }
+      if (!sequence.markers || !sequence.markers.createMarker) {
+        return bridgeFail(new Error("This Premiere version does not expose sequence markers to the panel."));
+      }
+
+      var shorts = job.shorts || [];
+      var details = [];
+      var added = 0;
+      for (var index = 0; index < shorts.length; index += 1) {
+        var short = shorts[index] || {};
+        try {
+          var startSec = Number(short.startSec || 0);
+          var endSec = Number(short.endSec || startSec);
+          var marker = sequence.markers.createMarker(startSec);
+          marker.name = String(short.markerName || ("Weave Short " + (index + 1)));
+          marker.comments = String(short.markerComment || "");
+          try {
+            marker.end = makeTime(endSec);
+          } catch (endError) {}
+          try {
+            marker.setColorByIndex(1);
+          } catch (colorError) {}
+          added += 1;
+        } catch (markerError) {
+          details.push("Could not mark short " + (index + 1) + ": " + (markerError.message || String(markerError)));
+        }
+      }
+      details.unshift("Added " + added + " short marker(s).");
+      return bridgeOk("Created " + added + " short marker(s).", details);
+    } catch (error) {
+      return bridgeFail(error);
+    }
+  }
+
   function bridgeOk(message, details) {
     return stringify({
       ok: true,
@@ -1165,6 +1205,7 @@ var weaveEdit = (function () {
     },
     runJobFromFile: runJobFromFile,
     applySilenceCleanupFromFile: applySilenceCleanupFromFile,
+    applyShortsMarkersFromFile: applyShortsMarkersFromFile,
     applyAudioPolishFromFile: applyAudioPolishFromFile,
     applyCaptionsFromFile: applyCaptionsFromFile,
     applyColorMatchFromFile: applyColorMatchFromFile,

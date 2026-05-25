@@ -7,6 +7,7 @@ import {
   ImportedGeneratedAsset,
   MatchStyle,
   PlacementStrategyMode,
+  ShortExtractionSettings,
   VideoTrimPolicy,
 } from "@/lib/ai/types";
 import { MediaLibraryMode, MediaSortMode } from "@/lib/media";
@@ -60,6 +61,8 @@ export interface ProjectSettings {
   keepSilenceSec: number;
   appendAtTrackEnd: boolean;
   useWholeSequenceFallback: boolean;
+  shortsSettings: ShortExtractionSettings;
+  shortsExtractorActive: boolean;
 }
 
 export function loadGlobalSettings(): Partial<GlobalSettings> {
@@ -174,6 +177,8 @@ const PROJECT_FIELDS = [
   "keepSilenceSec",
   "appendAtTrackEnd",
   "useWholeSequenceFallback",
+  "shortsSettings",
+  "shortsExtractorActive",
 ];
 
 function pick(source: Record<string, unknown>, fields: string[]): Record<string, unknown> {

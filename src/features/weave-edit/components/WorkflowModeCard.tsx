@@ -1,6 +1,6 @@
 import { CardHeader, StatusPill, SummaryRow } from "./ui";
 
-export type WorkflowMode = "manual-folder-order" | "ai-smart-broll" | "generated-asset-workflow";
+export type WorkflowMode = "manual-folder-order" | "ai-smart-broll" | "generated-asset-workflow" | "long-to-shorts";
 
 interface WorkflowModeCardProps {
   activeMode: WorkflowMode;
@@ -37,6 +37,11 @@ const modes: Array<{
     title: "Generated Asset Workflow",
     description: "Uses Prompt Plan, Asset Inbox, Agent Handoff, and generated asset matching for missing visuals.",
   },
+  {
+    id: "long-to-shorts",
+    title: "Long to Shorts",
+    description: "Finds 30-90s short-form moments inside a long transcript, then exports notes or markers.",
+  },
 ];
 
 export function WorkflowModeCard({
@@ -54,6 +59,7 @@ export function WorkflowModeCard({
   onAnalyzeWithAi,
 }: WorkflowModeCardProps) {
   const isManual = activeMode === "manual-folder-order";
+  const isShorts = activeMode === "long-to-shorts";
 
   return (
     <div className="rounded-[28px] border border-border/70 bg-card/95 p-5 shadow-xl shadow-black/10">
@@ -63,7 +69,7 @@ export function WorkflowModeCard({
         description="Pick the main editing path first; advanced controls stay available when you need them."
         action={<StatusPill tone={isManual ? "warning" : "info"} label={modes.find((mode) => mode.id === activeMode)?.title ?? "Workflow"} />}
       />
-      <div className="mt-4 grid gap-3 lg:grid-cols-3">
+      <div className="mt-4 grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
         {modes.map((mode) => (
           <button
             key={mode.id}
@@ -83,9 +89,11 @@ export function WorkflowModeCard({
       <div className={`mt-4 rounded-3xl border px-4 py-3 text-sm ${isManual ? "border-amber-500/30 bg-amber-500/10 text-amber-200" : "border-sky-500/30 bg-sky-500/10 text-sky-100"}`}>
         {isManual
           ? "Manual Folder Order is active. Gemma is not selecting B-roll in this preview. Switch to AI Smart B-roll to use semantic matching, missing asset prompts, and generated asset suggestions."
-          : "AI Smart B-roll is active. Check providers, then analyze with AI to let Gemma/Ollama review transcript meaning and media fit."}
+          : isShorts
+            ? "Shorts Extractor mode is active. Transcript is the input; B-roll workflows stay available per selected short."
+            : "AI Smart B-roll is active. Check providers, then analyze with AI to let Gemma/Ollama review transcript meaning and media fit."}
       </div>
-      {!isManual ? (
+      {!isManual && !isShorts ? (
         <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_auto]">
           <div className="grid gap-2 rounded-3xl border border-border/70 bg-background/60 p-4 text-sm">
             <SummaryRow label="Active provider" value={providerLabel} />

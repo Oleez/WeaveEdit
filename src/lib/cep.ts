@@ -138,6 +138,16 @@ export interface PremiereBridgeResult {
   details?: string[];
 }
 
+export interface ShortsMarkerPayload {
+  shorts: Array<{
+    id: string;
+    markerName: string;
+    markerComment: string;
+    startSec: number;
+    endSec: number;
+  }>;
+}
+
 type NodeRequire = (moduleName: string) => unknown;
 
 interface NodeModules {
@@ -447,6 +457,14 @@ export async function executeTransitions(payload: unknown): Promise<PremiereBrid
 
 export async function executeExport(payload: unknown): Promise<PremiereBridgeResult> {
   return executeHostBridge("applyExportFromFile", payload, "Open Weave Edit inside Premiere Pro to export.");
+}
+
+export async function executeShortsMarkers(payload: ShortsMarkerPayload): Promise<PremiereBridgeResult> {
+  return executeHostBridge(
+    "applyShortsMarkersFromFile",
+    payload,
+    "Open Weave Edit inside Premiere Pro to create short markers.",
+  );
 }
 
 function getNodeModules(): NodeModules {

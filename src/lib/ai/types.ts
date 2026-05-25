@@ -389,3 +389,79 @@ export interface AiModelProfile {
   maxCandidatesPerSegment: number;
   maxSegmentsPerBatch: number;
 }
+
+export type ShortClipExportMode = "markers" | "sequence-duplicate" | "in-out-only";
+export type ShortPlatform = "youtube-shorts" | "instagram-reels" | "tiktok" | "linkedin";
+export type ShortGoal = "retention" | "leads" | "sales" | "authority" | "education" | "controversy" | "story";
+export type ShortHookStyle = "shocking" | "curiosity" | "value" | "emotional" | "contrarian" | "story";
+export type ShortWarning =
+  | "starts-mid-thought"
+  | "ends-mid-thought"
+  | "too-long"
+  | "too-short"
+  | "weak-hook"
+  | "needs-context"
+  | "unsafe-wording";
+
+export interface ShortExtractionSettings {
+  desiredDurationSec: 30 | 45 | 60 | 90;
+  clipCount: 1 | 3 | 5 | 10;
+  platform: ShortPlatform;
+  clipGoal: ShortGoal;
+  hookStyle: ShortHookStyle;
+  allowOverrun: boolean;
+  includeCtaEnding: boolean;
+  avoidDuplicateTopics: boolean;
+  minHookScore: number;
+  minCompletenessScore: number;
+}
+
+export interface ShortCandidateScore {
+  hook: number;
+  retention: number;
+  completeness: number;
+  controversy: number;
+  clarity: number;
+  ctaOpportunity: number;
+  overall: number;
+}
+
+export interface ShortCandidateEditNotes {
+  punchInAtSec: number[];
+  brollAtSec: number[];
+  captionsAtSec: number[];
+  soundHitsAtSec: number[];
+  silenceCutsAtSec: number[];
+}
+
+export interface ShortCandidate {
+  id: string;
+  titleSuggestion: string;
+  hookLine: string;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+  transcriptExcerpt: string;
+  platformFit: ShortPlatform;
+  clipGoal: ShortGoal;
+  scores: ShortCandidateScore;
+  hasCtaOpportunity: boolean;
+  reasonSelected: string;
+  suggestedCaptionStyle: string;
+  suggestedBrollStyle: string;
+  suggestedThumbnailText: string;
+  suggestedTitle: string;
+  suggestedDescription: string;
+  suggestedHashtags: string[];
+  segmentIds: string[];
+  warnings: ShortWarning[];
+  editNotes: ShortCandidateEditNotes;
+}
+
+export interface ShortExtractionResult {
+  candidates: ShortCandidate[];
+  generatedAt: string;
+  providerUsed: "ollama" | "gemini" | "heuristic";
+  errors: string[];
+  settings: ShortExtractionSettings;
+}
