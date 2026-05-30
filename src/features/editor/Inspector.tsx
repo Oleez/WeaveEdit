@@ -1,40 +1,19 @@
 import { TimelinePlacement } from "@/lib/timeline-plan";
 import { formatSeconds } from "@/lib/script-parser";
 import { ChatAgent } from "./ChatAgent";
+import { ChatAgentView } from "./chat-types";
 
 interface InspectorProps {
   placement: TimelinePlacement | null;
-  chatValue: string;
-  onChatValueChange: (value: string) => void;
-  onSendChat: () => void;
-  deliberation: Array<{ agent: string; claim: string; confidence: number }>;
-  diffSummary: string;
+  chat: ChatAgentView;
   liked?: boolean;
   disliked?: boolean;
   onPreference?: (preference: "liked" | "disliked") => void;
 }
 
-export function Inspector({
-  placement,
-  chatValue,
-  onChatValueChange,
-  onSendChat,
-  deliberation,
-  diffSummary,
-  liked,
-  disliked,
-  onPreference,
-}: InspectorProps) {
+export function Inspector({ placement, chat, liked, disliked, onPreference }: InspectorProps) {
   if (!placement) {
-    return (
-      <ChatAgent
-        value={chatValue}
-        onChange={onChatValueChange}
-        onSend={onSendChat}
-        deliberation={deliberation}
-        diffSummary={diffSummary}
-      />
-    );
+    return <ChatAgent {...chat} />;
   }
 
   return (

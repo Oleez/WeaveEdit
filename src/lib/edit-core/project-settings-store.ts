@@ -11,6 +11,9 @@ import {
   VideoTrimPolicy,
 } from "@/lib/ai/types";
 import { MediaLibraryMode, MediaSortMode } from "@/lib/media";
+import { getEnvironmentVariable } from "@/lib/cep";
+
+export type ImageQuality = "low" | "medium" | "high";
 
 export const LEGACY_SETTINGS_KEY = "weave-edit-settings";
 export const LEGACY_SETTINGS_FALLBACK_KEY = "sora-genie-settings";
@@ -36,6 +39,10 @@ export interface GlobalSettings {
   transcriptSourceMode: "upload" | "premiere-markers";
   minDurationSec: number;
   maxDurationSec: number;
+  /** OpenAI key for gpt-image-1 generation. Falls back to the OPENAI_API_KEY env var. */
+  openAiApiKey?: string;
+  imageModel?: string;
+  imageQuality?: ImageQuality;
 }
 
 export interface ProjectSettings {
@@ -63,6 +70,12 @@ export interface ProjectSettings {
   useWholeSequenceFallback: boolean;
   shortsSettings: ShortExtractionSettings;
   shortsExtractorActive: boolean;
+  /** Folder where generated images are written before import. Empty = derive from imageFolderPath. */
+  imageGenFolder?: string;
+  /** Track offset above targetVideoTrack where generated images are placed (1 = one track up). */
+  imageTrackOffset?: number;
+  /** Default on-timeline duration for a generated still image. */
+  imageDefaultDurationSec?: number;
 }
 
 export function loadGlobalSettings(): Partial<GlobalSettings> {
@@ -152,6 +165,9 @@ const GLOBAL_FIELDS = [
   "transcriptSourceMode",
   "minDurationSec",
   "maxDurationSec",
+  "openAiApiKey",
+  "imageModel",
+  "imageQuality",
 ];
 
 const PROJECT_FIELDS = [
@@ -179,7 +195,22 @@ const PROJECT_FIELDS = [
   "useWholeSequenceFallback",
   "shortsSettings",
   "shortsExtractorActive",
+  "imageGenFolder",
+  "imageTrackOffset",
+  "imageDefaultDurationSec",
 ];
+
+/**
+ * Resolves the OpenAI image API key: explicit setting first, then the OPENAI_API_KEY env var
+ * (only readable inside the Node-enabled CEP panel).
+ */
+export function resolveOpenAiApiKey(settingsKey: string | undefined | null): string {
+  const trimmed = (settingsKey ?? "").trim();
+  if (trimmed) {
+    return trimmed;
+  }
+  return (getEnvironmentVariable("OPENAI_API_KEY") ?? "").trim();
+}
 
 function pick(source: Record<string, unknown>, fields: string[]): Record<string, unknown> {
   return fields.reduce<Record<string, unknown>>((result, field) => {

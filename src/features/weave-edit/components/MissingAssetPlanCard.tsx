@@ -21,6 +21,9 @@ interface MissingAssetPlanCardProps {
   inactiveReason?: string;
   onRefinePromptPlan: () => void | Promise<void>;
   onCopyAllPrompts: () => void | Promise<void>;
+  /** Optional: generate + place images for the whole plan with gpt-image-1 (Premiere only). */
+  onGenerateAllImages?: () => void | Promise<void>;
+  generateImagesBusyMessage?: string | null;
   onExportPromptBrief: (format: PromptBriefFormat) => void;
   onResetAllPrompts: () => void;
   onCopyPrompt: (promptId: string) => void | Promise<void>;
@@ -50,6 +53,8 @@ export function MissingAssetPlanCard({
   inactiveReason,
   onRefinePromptPlan,
   onCopyAllPrompts,
+  onGenerateAllImages,
+  generateImagesBusyMessage,
   onExportPromptBrief,
   onResetAllPrompts,
   onCopyPrompt,
@@ -111,6 +116,16 @@ export function MissingAssetPlanCard({
             >
               Copy all prompts
             </button>
+            {onGenerateAllImages ? (
+              <button
+                type="button"
+                onClick={() => void onGenerateAllImages()}
+                disabled={Boolean(generateImagesBusyMessage)}
+                className="rounded-full bg-emerald-500/90 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {generateImagesBusyMessage ?? "Generate images now"}
+              </button>
+            ) : null}
             <button
               type="button"
               onClick={() => onExportPromptBrief("md")}

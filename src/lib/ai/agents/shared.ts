@@ -119,26 +119,84 @@ export function buildDeliberation(
   return { agent, claim, evidence, confidence };
 }
 
+export interface OllamaChatMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/**
+ * Multi-turn chat transport against Ollama's /api/chat endpoint. Returns the raw assistant
+ * content string (callers parse JSON with parseJsonLoose) or null on any failure, matching
+ * the degrade-to-fallback contract used by callOllamaAgent.
+ */
+export async function chatWithOllama(
+  context: AgentContext | undefined,
+  messages: OllamaChatMessage[],
+  options: { format?: "json"; temperature?: number; timeoutMs?: number } = {},
+): Promise<string | null> {
+  if (!context || !context.enabled || !context.ollamaBaseUrl || !context.ollamaModel) {
+    return null;
+  }
+
+  const timeoutMs = options.timeoutMs ?? context.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(`${normalizeOllamaUrl(context.ollamaBaseUrl)}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: context.ollamaModel,
+        messages,
+        stream: false,
+        ...(options.format ? { format: options.format } : {}),
+        options: { temperature: options.temperature ?? 0.3 },
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as { message?: { content?: string } };
+    return payload.message?.content ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 function normalizeOllamaUrl(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
-function parseAgentJson(text: string): OllamaAgentResponse | null {
+/**
+ * Parses the first JSON object found in a model response. Tolerates leading/trailing
+ * commentary by falling back to the first {...} match. Returns null when nothing parses.
+ */
+export function parseJsonLoose<T = unknown>(text: string): T | null {
   if (!text) {
     return null;
   }
   const trimmed = text.trim();
   try {
-    return JSON.parse(trimmed) as OllamaAgentResponse;
+    return JSON.parse(trimmed) as T;
   } catch {
     const match = /\{[\s\S]*\}/.exec(trimmed);
     if (!match) {
       return null;
     }
     try {
-      return JSON.parse(match[0]) as OllamaAgentResponse;
+      return JSON.parse(match[0]) as T;
     } catch {
       return null;
     }
   }
+}
+
+function parseAgentJson(text: string): OllamaAgentResponse | null {
+  return parseJsonLoose<OllamaAgentResponse>(text);
 }

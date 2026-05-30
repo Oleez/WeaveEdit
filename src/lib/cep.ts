@@ -165,6 +165,7 @@ interface NodeModules {
     readFileSync: (path: string, encoding: string) => string;
     statSync: (path: string) => { birthtimeMs?: number; ctimeMs?: number; mtimeMs?: number };
     writeFileSync: (path: string, data: string, encoding?: string) => void;
+    mkdirSync: (path: string, options?: { recursive?: boolean }) => void;
   };
   childProcess: {
     execFileSync: (
@@ -381,6 +382,17 @@ export async function getPremiereStatus(): Promise<PremiereStatus> {
 
   await ensureHostLoaded();
   return evaluateJson<PremiereStatus>("weaveEdit.getStatus()");
+}
+
+export async function getPlayheadPosition(): Promise<number> {
+  if (!isCepEnvironment()) {
+    return 0;
+  }
+
+  await ensureHostLoaded();
+  const raw = await evaluateRaw("weaveEdit.getPlayheadPosition()");
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 export async function getPremiereTranscriptSegments(): Promise<PremiereTranscriptSegment[]> {
@@ -709,6 +721,26 @@ function writeTempJob(payload: unknown): string {
   const tempPath = path.join(os.tmpdir(), `weave-edit-job-${Date.now()}.json`);
   fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), "utf8");
   return normalizePath(tempPath);
+}
+
+/**
+ * Decodes a base64 image payload (e.g. from gpt-image-1) and writes it to disk so it can
+ * be imported into Premiere. Requires the Node-enabled CEP environment. Returns the
+ * normalized absolute path of the written file.
+ */
+export function saveBase64Image(folderPath: string, fileName: string, base64Data: string): string {
+  const { fs, os, path } = getNodeModules();
+  const targetFolder = folderPath && folderPath.trim() ? folderPath : os.tmpdir();
+
+  if (!fs.existsSync(targetFolder)) {
+    fs.mkdirSync(targetFolder, { recursive: true });
+  }
+
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const fullPath = path.join(targetFolder, safeName);
+  // Node accepts a base64-encoded string when the encoding argument is "base64".
+  fs.writeFileSync(fullPath, base64Data, "base64");
+  return normalizePath(fullPath);
 }
 
 function evaluateRaw(script: string): Promise<string> {

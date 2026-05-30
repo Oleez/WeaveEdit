@@ -52,7 +52,17 @@ export type EditAction =
   | { kind: "export"; preset: ExportPreset };
 
 export interface AgentDeliberation {
-  agent: "director" | "pacing" | "continuity" | "audio" | "critic" | "chat-router" | "executor";
+  agent:
+    | "director"
+    | "pacing"
+    | "continuity"
+    | "audio"
+    | "critic"
+    | "chat-router"
+    | "executor"
+    | "script-editor"
+    | "prompt-engineer"
+    | "orchestrator";
   claim: string;
   evidence: string[];
   confidence: number;

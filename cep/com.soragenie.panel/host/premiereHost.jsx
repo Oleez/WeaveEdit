@@ -225,6 +225,31 @@ var weaveEdit = (function () {
     });
   }
 
+  function getPlayheadPosition() {
+    try {
+      var sequence = app && app.project ? app.project.activeSequence : null;
+      if (!sequence) {
+        return "0";
+      }
+
+      // Premiere exposes the current time indicator via getPlayerPosition() (a Time
+      // object) on most versions. Fall back gracefully when the API is absent.
+      if (sequence.getPlayerPosition) {
+        var position = sequence.getPlayerPosition();
+        if (position && typeof position.seconds !== "undefined") {
+          return String(Number(position.seconds) || 0);
+        }
+        if (position && typeof position.ticks !== "undefined") {
+          return String((Number(position.ticks) || 0) / TICKS_PER_SECOND);
+        }
+      }
+    } catch (error) {
+      // Fall through to 0 below.
+    }
+
+    return "0";
+  }
+
   function getTranscriptSegments() {
     if (!app || !app.project || !app.project.activeSequence) {
       return stringify([]);
@@ -1193,6 +1218,7 @@ var weaveEdit = (function () {
 
   return {
     getStatus: getStatus,
+    getPlayheadPosition: getPlayheadPosition,
     getTranscriptSegments: getTranscriptSegments,
     getAudioClips: getAudioClips,
     pickFolder: selectFolderPath,

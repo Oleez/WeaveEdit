@@ -109,10 +109,17 @@ import {
 import { MediaLibraryItem, MediaLibraryMode, MediaSortMode, getFileName, normalizePath } from "@/lib/media";
 import { EditorShell } from "@/features/editor/EditorShell";
 import { useAutopilot } from "@/features/editor/hooks/useAutopilot";
-import { useChatAgent } from "@/features/editor/hooks/useChatAgent";
+import { useStudioChat } from "@/features/editor/hooks/useStudioChat";
+import { usePlayhead } from "@/features/editor/hooks/usePlayhead";
 import { useEditorStore } from "@/features/editor/hooks/useEditorStore";
 import { useTimelineSelection } from "@/features/editor/hooks/useTimelineSelection";
+import { ChatQuickAction } from "@/features/editor/chat-types";
 import { runEditPlan } from "@/lib/edit-core/executor";
+import { routeChatToPlan } from "@/lib/ai/agents/chat-router";
+import { editScriptLine } from "@/lib/ai/agents/script-editor";
+import { applyScriptEdit, findSegmentAtTime } from "@/lib/script-edit";
+import { generateAndPlaceImage } from "@/lib/ai/image/generate-and-place";
+import { StudioToolResult, ToolRegistry } from "@/lib/ai/studio-chat";
 import {
   loadCreatorProfile,
   loadProjectCreatorOverride,
@@ -123,11 +130,13 @@ import {
 } from "@/lib/edit-core/creator-profile";
 import {
   GlobalSettings,
+  ImageQuality,
   ProjectSettings,
   loadGlobalSettings,
   loadProjectSettings,
   migrateLegacySettings,
   resetProjectSettings,
+  resolveOpenAiApiKey,
   saveGlobalSettings,
   saveProjectSettings,
 } from "@/lib/edit-core/project-settings-store";
@@ -242,6 +251,12 @@ interface StoredSettings {
   targetAudioTrack: number;
   shortsSettings: ShortExtractionSettings;
   shortsExtractorActive: boolean;
+  openAiApiKey: string;
+  imageModel: string;
+  imageQuality: ImageQuality;
+  imageGenFolder: string;
+  imageTrackOffset: number;
+  imageDefaultDurationSec: number;
 }
 
 interface WorkingPlan {
@@ -307,6 +322,12 @@ const defaultSettings: StoredSettings = {
     minHookScore: 0.45,
     minCompletenessScore: 0.55,
   },
+  openAiApiKey: "",
+  imageModel: "gpt-image-1",
+  imageQuality: "low",
+  imageGenFolder: "",
+  imageTrackOffset: 1,
+  imageDefaultDurationSec: 4,
 };
 
 const Index = () => {
@@ -359,6 +380,13 @@ const Index = () => {
   const [minSilenceSec, setMinSilenceSec] = useState(defaultSettings.minSilenceSec);
   const [keepSilenceSec, setKeepSilenceSec] = useState(defaultSettings.keepSilenceSec);
   const [targetAudioTrack, setTargetAudioTrack] = useState(defaultSettings.targetAudioTrack);
+  const [openAiApiKey, setOpenAiApiKey] = useState(defaultSettings.openAiApiKey);
+  const [imageModel, setImageModel] = useState(defaultSettings.imageModel);
+  const [imageQuality, setImageQuality] = useState<ImageQuality>(defaultSettings.imageQuality);
+  const [imageGenFolder, setImageGenFolder] = useState(defaultSettings.imageGenFolder);
+  const [imageTrackOffset, setImageTrackOffset] = useState(defaultSettings.imageTrackOffset);
+  const [imageDefaultDurationSec, setImageDefaultDurationSec] = useState(defaultSettings.imageDefaultDurationSec);
+  const [generateImagesBusyMessage, setGenerateImagesBusyMessage] = useState<string | null>(null);
   const [hostStatus, setHostStatus] = useState<PremiereStatus | null>(null);
   const [result, setResult] = useState<PremiereRunResult | null>(null);
   const [silencePreview, setSilencePreview] = useState<SilencePreviewResult | null>(null);
@@ -559,6 +587,9 @@ const Index = () => {
     setAnalysisDepth(stored.analysisDepth ?? defaultSettings.analysisDepth);
     setCandidatePoolSize(stored.candidatePoolSize ?? defaultSettings.candidatePoolSize);
     setRerankDepth(stored.rerankDepth ?? defaultSettings.rerankDepth);
+    setOpenAiApiKey(stored.openAiApiKey ?? defaultSettings.openAiApiKey);
+    setImageModel(stored.imageModel ?? defaultSettings.imageModel);
+    setImageQuality(stored.imageQuality ?? defaultSettings.imageQuality);
   }, []);
 
   const applyProjectSettings = useCallback((stored: Partial<ProjectSettings>) => {
@@ -587,6 +618,9 @@ const Index = () => {
     setTargetAudioTrack(stored.targetAudioTrack ?? defaultSettings.targetAudioTrack);
     setShortsExtractorActive(stored.shortsExtractorActive ?? defaultSettings.shortsExtractorActive);
     setShortsSettings(stored.shortsSettings ?? defaultSettings.shortsSettings);
+    setImageGenFolder(stored.imageGenFolder ?? defaultSettings.imageGenFolder);
+    setImageTrackOffset(stored.imageTrackOffset ?? defaultSettings.imageTrackOffset);
+    setImageDefaultDurationSec(stored.imageDefaultDurationSec ?? defaultSettings.imageDefaultDurationSec);
   }, []);
 
   useEffect(() => {
@@ -632,6 +666,9 @@ const Index = () => {
       analysisDepth,
       candidatePoolSize,
       rerankDepth,
+      openAiApiKey,
+      imageModel,
+      imageQuality,
     });
   }, [
     libraryMode,
@@ -652,6 +689,9 @@ const Index = () => {
     analysisDepth,
     candidatePoolSize,
     rerankDepth,
+    openAiApiKey,
+    imageModel,
+    imageQuality,
   ]);
 
   useEffect(() => {
@@ -684,11 +724,17 @@ const Index = () => {
       targetAudioTrack,
       shortsExtractorActive,
       shortsSettings,
+      imageGenFolder,
+      imageTrackOffset,
+      imageDefaultDurationSec,
     });
   }, [
     appendAtTrackEnd,
     hostStatus?.projectId,
     imageFolderPath,
+    imageGenFolder,
+    imageTrackOffset,
+    imageDefaultDurationSec,
     placementStrategyMode,
     editGoal,
     editStyle,
@@ -2119,13 +2165,11 @@ const Index = () => {
     Math.max(0, targetAudioTrack - 1),
   );
   const autopilot = useAutopilot();
-  const chatAgent = useChatAgent();
+  const studioChat = useStudioChat();
+  const { playheadSec } = usePlayhead({ paused: autopilot.busy || executionBusy });
   useEffect(() => {
     editorStore.setPreviewPlan(null);
   }, [hostStatus?.projectId]);
-  const editorDiffSummary = editorStore.previewPlan
-    ? `Preview diff: ${editorStore.diff.added.length} added, ${editorStore.diff.changed.length} changed, ${editorStore.diff.removed.length} removed.`
-    : "";
   const editorRangeLabel = appendAtTrackEnd
     ? "Append mode"
     : hasMeaningfulInOut
@@ -2251,18 +2295,240 @@ const Index = () => {
     editorStore.setPreviewPlan(result.plan);
   }
 
-  async function handleSendTimelineChat() {
-    const agentContext = {
+  function buildChatAgentContext() {
+    return {
       enabled: aiMode !== "off",
       ollamaBaseUrl,
       ollamaModel,
       creatorProfile: effectiveCreatorProfile,
       customInstructions,
     };
-    const nextPlan = await chatAgent.previewChatEdit(editorStore.activePlan, agentContext);
-    if (nextPlan) {
-      editorStore.setPreviewPlan(nextPlan);
+  }
+
+  function buildImageStyleNotes(): string {
+    return [editStyle, brollStyle, creativeDirection, brandNotes].filter(Boolean).join(" | ");
+  }
+
+  function scriptLineAtSec(sec: number): string {
+    if (!scriptText.trim()) {
+      return "";
     }
+    try {
+      const segments = parseTimestampScript(scriptText, { fps: hostStatus?.frameRate }).segments;
+      return findSegmentAtTime(segments, sec)?.text ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  function buildToolRegistry(agentContext: ReturnType<typeof buildChatAgentContext>): ToolRegistry {
+    return {
+      apply_edit_ops: async (args): Promise<StudioToolResult> => {
+        const request = typeof args.request === "string" && args.request.trim() ? args.request : "improve the edit";
+        const nextPlan = await routeChatToPlan(editorStore.activePlan, request, agentContext);
+        editorStore.setPreviewPlan(nextPlan);
+        return {
+          ok: true,
+          summary: `Updated the edit plan (${nextPlan.actions.length} actions).`,
+          deliberation: nextPlan.rationale,
+        };
+      },
+      edit_script: async (args): Promise<StudioToolResult> => {
+        const instruction = typeof args.instruction === "string" ? args.instruction : "";
+        const atSec = typeof args.atSec === "number" ? args.atSec : playheadSec;
+        const scope = args.scope === "all" ? "all" : "line";
+        if (!scriptText.trim()) {
+          return { ok: false, summary: "No script is loaded to edit." };
+        }
+        let segments;
+        try {
+          segments = parseTimestampScript(scriptText, { fps: hostStatus?.frameRate }).segments;
+        } catch (error) {
+          return { ok: false, summary: `Could not parse the script: ${String(error)}` };
+        }
+        const target = findSegmentAtTime(segments, atSec);
+        if (!target) {
+          return { ok: false, summary: "Couldn't find a script line at the playhead." };
+        }
+        const index = segments.findIndex((segment) => segment.id === target.id);
+        const edit = await editScriptLine(
+          {
+            originalLine: target.text,
+            instruction,
+            contextBefore: segments[index - 1]?.text,
+            contextAfter: segments[index + 1]?.text,
+          },
+          agentContext,
+        );
+        const applied = applyScriptEdit(
+          scriptText,
+          { atSec, newText: edit.newText, scope },
+          { fps: hostStatus?.frameRate },
+        );
+        if (applied.changedSegmentId) {
+          setScriptText(applied.scriptText);
+        }
+        return {
+          ok: edit.changed,
+          summary: edit.changed
+            ? `Edited line at ${formatSeconds(atSec)}: "${edit.newText.slice(0, 80)}"`
+            : `Left the line at ${formatSeconds(atSec)} unchanged.`,
+          deliberation: [{ agent: "script-editor", claim: edit.claim, evidence: [], confidence: edit.confidence }],
+        };
+      },
+      generate_image: async (args): Promise<StudioToolResult> => {
+        const atSec = typeof args.atSec === "number" ? args.atSec : playheadSec;
+        const idea =
+          typeof args.idea === "string" && args.idea.trim()
+            ? args.idea
+            : scriptLineAtSec(atSec) || creativeDirection || "premium B-roll for this video";
+        const result = await generateAndPlaceImage({
+          idea,
+          atSec,
+          styleNotes: buildImageStyleNotes(),
+          apiKey: resolveOpenAiApiKey(openAiApiKey),
+          model: imageModel,
+          quality: imageQuality,
+          imageFolder: imageGenFolder || imageFolderPath,
+          targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
+          trackOffset: imageTrackOffset,
+          durationSec: imageDefaultDurationSec,
+          agentContext,
+        });
+        return { ok: result.ok, summary: result.message, deliberation: result.deliberation };
+      },
+      batch_generate_images: async (args): Promise<StudioToolResult> => {
+        const apiKey = resolveOpenAiApiKey(openAiApiKey);
+        if (!apiKey) {
+          return { ok: false, summary: "Set your OpenAI API key in Settings to generate images." };
+        }
+        if (editorPlacements.length === 0) {
+          return { ok: false, summary: "Build a timeline preview first, then I can fill coverage gaps." };
+        }
+        const sectionStart = typeof args.sectionStartSec === "number" ? args.sectionStartSec : 0;
+        const sectionEnd = typeof args.sectionEndSec === "number" ? args.sectionEndSec : Number.POSITIVE_INFINITY;
+        const requestedMax = typeof args.maxImages === "number" ? args.maxImages : 12;
+        const maxImages = Math.max(1, Math.min(40, Math.round(requestedMax)));
+
+        const plan = buildMissingAssetPlan(editorPlacements, dynamicEditorSettings);
+        const prompts = plan.prompts
+          .filter((prompt) => prompt.startSec >= sectionStart && prompt.startSec <= sectionEnd)
+          .filter((prompt) => prompt.suggestedAssetType === "image" || prompt.suggestedAssetType === "background")
+          .slice(0, maxImages);
+
+        if (prompts.length === 0) {
+          return { ok: false, summary: "No image coverage gaps were found in that section." };
+        }
+
+        let placed = 0;
+        for (const prompt of prompts) {
+          const result = await generateAndPlaceImage({
+            idea: prompt.transcriptText,
+            atSec: prompt.startSec,
+            editorialRole: prompt.editorialRole,
+            styleNotes: buildImageStyleNotes(),
+            apiKey,
+            model: imageModel,
+            quality: imageQuality,
+            imageFolder: imageGenFolder || imageFolderPath,
+            targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
+            trackOffset: imageTrackOffset,
+            durationSec: imageDefaultDurationSec,
+            agentContext,
+            promptOverride: prompt.promptText,
+            negativeOverride: prompt.negativePrompt,
+          });
+          if (result.ok) {
+            placed += 1;
+          }
+        }
+        return {
+          ok: placed > 0,
+          summary: `Generated and placed ${placed}/${prompts.length} B-roll images across the section.`,
+        };
+      },
+    };
+  }
+
+  async function handleSendStudioChat(text?: string) {
+    const message = (text ?? studioChat.input).trim();
+    if (!message) {
+      return;
+    }
+    const agentContext = buildChatAgentContext();
+    await studioChat.send(message, {
+      agentContext,
+      registry: buildToolRegistry(agentContext),
+      context: {
+        playheadSec,
+        hasScript: Boolean(scriptText.trim()),
+        hasPlan: editorPlacements.length > 0,
+        sequenceName: hostStatus?.sequenceName,
+      },
+    });
+  }
+
+  function handleChatQuickAction(action: ChatQuickAction) {
+    if (action === "edit_line") {
+      studioChat.setInput("Tighten and improve the script line at the playhead.");
+    } else if (action === "make_image") {
+      studioChat.setInput("Make an image for this moment and place it at the playhead.");
+    } else {
+      studioChat.setInput("Generate B-roll images where visual coverage is missing in this section.");
+    }
+  }
+
+  async function handleGenerateAllImages() {
+    const apiKey = resolveOpenAiApiKey(openAiApiKey);
+    if (!apiKey) {
+      window.alert("Set your OpenAI API key in Settings (Images tab) before generating.");
+      return;
+    }
+    const plan = refinedMissingAssetPlan ?? missingAssetPlan;
+    const prompts = plan.prompts.filter(
+      (prompt) => prompt.suggestedAssetType === "image" || prompt.suggestedAssetType === "background",
+    );
+    if (prompts.length === 0) {
+      window.alert("No image prompts to generate in the current plan.");
+      return;
+    }
+    const confirmed = window.confirm(
+      `Generate and place ${prompts.length} image(s) with ${imageModel} (${imageQuality} quality)? This calls the OpenAI API and may incur cost.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    const agentContext = buildChatAgentContext();
+    let placed = 0;
+    try {
+      for (let index = 0; index < prompts.length; index += 1) {
+        const prompt = prompts[index];
+        setGenerateImagesBusyMessage(`Generating ${index + 1}/${prompts.length}…`);
+        const result = await generateAndPlaceImage({
+          idea: prompt.transcriptText,
+          atSec: prompt.startSec,
+          editorialRole: prompt.editorialRole,
+          styleNotes: buildImageStyleNotes(),
+          apiKey,
+          model: imageModel,
+          quality: imageQuality,
+          imageFolder: imageGenFolder || imageFolderPath,
+          targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
+          trackOffset: imageTrackOffset,
+          durationSec: imageDefaultDurationSec,
+          agentContext,
+          promptOverride: prompt.promptText,
+          negativeOverride: prompt.negativePrompt,
+        });
+        if (result.ok) {
+          placed += 1;
+        }
+      }
+    } finally {
+      setGenerateImagesBusyMessage(null);
+    }
+    window.alert(`Generated and placed ${placed}/${prompts.length} images.`);
   }
 
   async function handleApplyEditorPlan() {
@@ -2325,18 +2591,23 @@ const Index = () => {
         hostStatus={hostStatus}
         providerLabel={activeProviderLabel}
         rangeLabel={editorRangeLabel}
-        busy={autopilot.busy || chatAgent.busy || executionBusy}
+        busy={autopilot.busy || studioChat.busy || executionBusy}
         settingsOpen={showAdvancedUi}
         onOpenSettings={() => setShowAdvancedUi(true)}
         onCloseSettings={() => setShowAdvancedUi(false)}
         onAutopilot={() => void handleAutopilotEdit()}
         onApply={() => void handleApplyEditorPlan()}
         canApply={editorPlacements.length > 0}
-        chatValue={chatAgent.chatValue}
-        onChatValueChange={chatAgent.setChatValue}
-        onSendChat={() => void handleSendTimelineChat()}
-        deliberation={editorStore.activePlan.rationale}
-        diffSummary={editorDiffSummary}
+        chat={{
+          messages: studioChat.messages,
+          input: studioChat.input,
+          onInputChange: studioChat.setInput,
+          onSend: () => void handleSendStudioChat(),
+          busy: studioChat.busy,
+          playheadSec,
+          deliberation: studioChat.deliberation,
+          onQuickAction: handleChatQuickAction,
+        }}
         diff={editorStore.diff}
         likedPlacementIds={effectiveCreatorProfile.likedPlacementIds}
         dislikedPlacementIds={effectiveCreatorProfile.dislikedPlacementIds}
@@ -3444,6 +3715,8 @@ const Index = () => {
                 }
                 onRefinePromptPlan={handleRefinePromptPlan}
                 onCopyAllPrompts={handleCopyAllPrompts}
+                onGenerateAllImages={handleGenerateAllImages}
+                generateImagesBusyMessage={generateImagesBusyMessage}
                 onExportPromptBrief={handleExportPromptBrief}
                 onResetAllPrompts={handleResetAllPrompts}
                 onCopyPrompt={handleCopyPrompt}
@@ -3601,6 +3874,85 @@ const Index = () => {
         </section>
       </div>
             </main>
+            ),
+          },
+          {
+            id: "images",
+            label: "Images",
+            description: "AI image generation (gpt-image-1) for B-roll placed on the timeline by the agent chat.",
+            content: (
+              <div className="space-y-4">
+                <label className="grid gap-2 text-sm">
+                  <span className="text-muted-foreground">OpenAI API key</span>
+                  <input
+                    type="password"
+                    value={openAiApiKey}
+                    onChange={(event) => setOpenAiApiKey(event.target.value)}
+                    placeholder="sk-... (falls back to OPENAI_API_KEY env var)"
+                    className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                  />
+                </label>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <label className="grid gap-2 text-sm">
+                    <span className="text-muted-foreground">Image model</span>
+                    <input
+                      type="text"
+                      value={imageModel}
+                      onChange={(event) => setImageModel(event.target.value)}
+                      className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                    />
+                  </label>
+                  <label className="grid gap-2 text-sm">
+                    <span className="text-muted-foreground">Quality</span>
+                    <select
+                      value={imageQuality}
+                      onChange={(event) => setImageQuality(event.target.value as ImageQuality)}
+                      className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                    >
+                      <option value="low">Low (fastest, cheapest)</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High (best quality)</option>
+                    </select>
+                  </label>
+                </div>
+                <label className="grid gap-2 text-sm">
+                  <span className="text-muted-foreground">Generated image folder (blank = use media folder)</span>
+                  <input
+                    type="text"
+                    value={imageGenFolder}
+                    onChange={(event) => setImageGenFolder(event.target.value)}
+                    placeholder={imageFolderPath || "C:/path/to/save/generated"}
+                    className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                  />
+                </label>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <label className="grid gap-2 text-sm">
+                    <span className="text-muted-foreground">Overlay track offset (above target)</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={imageTrackOffset}
+                      onChange={(event) => setImageTrackOffset(Math.max(0, Number(event.target.value) || 0))}
+                      className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                    />
+                  </label>
+                  <label className="grid gap-2 text-sm">
+                    <span className="text-muted-foreground">Default image duration (sec)</span>
+                    <input
+                      type="number"
+                      min={0.5}
+                      step={0.5}
+                      value={imageDefaultDurationSec}
+                      onChange={(event) => setImageDefaultDurationSec(Math.max(0.5, Number(event.target.value) || 0.5))}
+                      className="rounded-3xl border border-border/70 bg-background/60 px-4 py-3 text-sm outline-none transition focus:border-primary"
+                    />
+                  </label>
+                </div>
+                <p className="rounded-3xl border border-border/70 bg-background/60 p-4 text-xs leading-5 text-muted-foreground">
+                  Studio Chat can prompt-engineer and place a single image at the playhead, or batch-fill B-roll
+                  gaps across a section. Generated images need a video track above V{targetVideoTrack} to land on.
+                </p>
+              </div>
             ),
           },
         ]}

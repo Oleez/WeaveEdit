@@ -4,6 +4,7 @@ import { TimelinePlacement } from "@/lib/timeline-plan";
 import { EditPlanDiff } from "@/lib/edit-core/types";
 import { AutopilotBar } from "./AutopilotBar";
 import { Inspector } from "./Inspector";
+import { ChatAgentView } from "./chat-types";
 import { DrawerTab, SettingsDrawer } from "./SettingsDrawer";
 import { StageCanvas } from "./StageCanvas";
 import { TimelineDeck } from "./TimelineDeck";
@@ -22,11 +23,7 @@ interface EditorShellProps {
   onAutopilot: () => void;
   onApply: () => void;
   canApply: boolean;
-  chatValue: string;
-  onChatValueChange: (value: string) => void;
-  onSendChat: () => void;
-  deliberation: Array<{ agent: string; claim: string; confidence: number }>;
-  diffSummary: string;
+  chat: ChatAgentView;
   diff: EditPlanDiff;
   likedPlacementIds: string[];
   dislikedPlacementIds: string[];
@@ -49,11 +46,7 @@ export function EditorShell({
   onAutopilot,
   onApply,
   canApply,
-  chatValue,
-  onChatValueChange,
-  onSendChat,
-  deliberation,
-  diffSummary,
+  chat,
   diff,
   likedPlacementIds,
   dislikedPlacementIds,
@@ -85,11 +78,7 @@ export function EditorShell({
           />
           <Inspector
             placement={selectedPlacementId ? selectedPlacement : null}
-            chatValue={chatValue}
-            onChatValueChange={onChatValueChange}
-            onSendChat={onSendChat}
-            deliberation={deliberation}
-            diffSummary={diffSummary}
+            chat={chat}
             liked={Boolean(selectedPlacement && likedPlacementIds.includes(selectedPlacement.id))}
             disliked={Boolean(selectedPlacement && dislikedPlacementIds.includes(selectedPlacement.id))}
             onPreference={
