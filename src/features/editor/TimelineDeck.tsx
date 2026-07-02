@@ -15,7 +15,14 @@ export function TimelineDeck({ placements, selectedPlacementId, onSelectPlacemen
   const duration = Math.max(1, ...placements.map((placement) => placement.endSec));
   const addedIds = new Set(
     diff.added
-      .filter((action) => action.kind === "place_clip" || action.kind === "punch_in" || action.kind === "add_transition")
+      .filter(
+        (action) =>
+          action.kind === "place_clip" ||
+          action.kind === "punch_in" ||
+          action.kind === "add_transition" ||
+          action.kind === "color_match" ||
+          action.kind === "trim_clip",
+      )
       .map((action) => ("placementId" in action ? action.placementId : "")),
   );
   const changedIds = new Set(
@@ -42,6 +49,10 @@ export function TimelineDeck({ placements, selectedPlacementId, onSelectPlacemen
 
   return (
     <section className="border-t border-border/70 bg-card/80 p-3">
+      <p className="mb-2 text-[11px] text-muted-foreground">
+        <span className="font-medium text-foreground/80">Timeline</span> — every planned clip; click a chip to inspect.
+        Green = newly added, purple = changed by your last edit, amber = low confidence.
+      </p>
       <div className="grid gap-2">
         {TRACKS.map((track) => (
           <div key={track} className="grid grid-cols-[72px_1fr] items-center gap-2">

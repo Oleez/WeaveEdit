@@ -16,11 +16,14 @@ export function ChatAgent({
   onQuickAction,
 }: ChatAgentView) {
   return (
-    <aside className="flex min-h-0 flex-col border-l border-border/70 bg-card/90 p-4">
+    <aside className="flex min-h-0 flex-1 flex-col p-4">
       <div className="flex items-center justify-between">
         <div>
           <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Studio Chat</p>
           <h2 className="mt-1 text-lg font-semibold">Edit the script &amp; timeline with gemma</h2>
+          <p className="mt-1 text-xs leading-4 text-muted-foreground">
+            Type what you want changed, in plain words — the edit updates in the preview first.
+          </p>
         </div>
         <span className="rounded-full border border-border/70 bg-background/70 px-2 py-1 font-mono text-[11px] text-muted-foreground">
           ▮ {formatSeconds(playheadSec)}
@@ -80,6 +83,7 @@ export function ChatAgent({
 
       <div className="mt-4 grid gap-2">
         <Textarea
+          id="studio-chat-input"
           value={input}
           onChange={(event) => onInputChange(event.target.value)}
           onKeyDown={(event) => {

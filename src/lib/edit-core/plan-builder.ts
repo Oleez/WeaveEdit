@@ -35,12 +35,7 @@ export function buildEditPlan({
     });
   }
 
-  actions.push({
-    kind: "add_caption_run",
-    track: captionTrack,
-    style: { preset: "clean-bold", position: "lower" },
-    words: placements.flatMap((placement) => wordsFromPlacement(placement)),
-  });
+  actions.push(buildCaptionRunAction(placements, captionTrack));
 
   return {
     id: createPlanId("plan"),
@@ -59,6 +54,23 @@ export function buildEditPlan({
 
 export function createPlanId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Word-timed caption run from placement text. Shared by the initial plan build
+ * and the chat "add captions" command so both produce identical caption data.
+ */
+export function buildCaptionRunAction(
+  placements: TimelinePlacement[],
+  captionTrack = "C1",
+  style: Extract<EditAction, { kind: "add_caption_run" }>["style"] = { preset: "clean-bold", position: "lower" },
+): Extract<EditAction, { kind: "add_caption_run" }> {
+  return {
+    kind: "add_caption_run",
+    track: captionTrack,
+    style,
+    words: placements.flatMap((placement) => wordsFromPlacement(placement)),
+  };
 }
 
 function wordsFromPlacement(placement: TimelinePlacement) {

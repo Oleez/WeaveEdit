@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { HelpTip } from "@/features/editor/HelpTip";
 
 const statusPillBase =
   "inline-flex rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]";
@@ -66,15 +67,20 @@ export function DirectionSelect<T extends string>({
   value,
   options,
   onChange,
+  help,
 }: {
   label: string;
   value: T;
   options: Array<DirectionOption<T>>;
   onChange: (value: T) => void;
+  help?: string;
 }) {
   return (
     <label className="text-sm">
-      <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{label}</span>
+      <span className="inline-flex items-center gap-1.5 text-xs uppercase tracking-[0.18em] text-muted-foreground">
+        {label}
+        {help ? <HelpTip text={help} /> : null}
+      </span>
       <select
         value={value}
         onChange={(event) => onChange(event.target.value as T)}

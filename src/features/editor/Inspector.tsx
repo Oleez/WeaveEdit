@@ -17,9 +17,12 @@ export function Inspector({ placement, chat, liked, disliked, onPreference }: In
   }
 
   return (
-    <aside className="flex min-h-0 flex-col border-l border-border/70 bg-card/90 p-4">
+    <aside className="flex min-h-0 flex-1 flex-col p-4">
       <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Inspector</p>
       <h2 className="mt-2 text-lg font-semibold">{placement.mediaName || "Face-time / blank beat"}</h2>
+      <p className="mt-1 text-xs leading-4 text-muted-foreground">
+        Details for the selected clip. Like/Dislike teaches the editor your taste.
+      </p>
       <dl className="mt-4 grid gap-3 text-sm">
         <Info label="Timing" value={`${formatSeconds(placement.startSec)} - ${formatSeconds(placement.endSec)}`} />
         <Info label="Role" value={placement.editorialRole} />

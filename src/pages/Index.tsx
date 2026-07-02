@@ -112,9 +112,11 @@ import { useAutopilot } from "@/features/editor/hooks/useAutopilot";
 import { useStudioChat } from "@/features/editor/hooks/useStudioChat";
 import { usePlayhead } from "@/features/editor/hooks/usePlayhead";
 import { useEditorStore } from "@/features/editor/hooks/useEditorStore";
+import { useEditHistory } from "@/features/editor/hooks/useEditHistory";
 import { useTimelineSelection } from "@/features/editor/hooks/useTimelineSelection";
 import { ChatQuickAction } from "@/features/editor/chat-types";
 import { runEditPlan } from "@/lib/edit-core/executor";
+import { EditPlan } from "@/lib/edit-core/types";
 import { routeChatToPlan } from "@/lib/ai/agents/chat-router";
 import { editScriptLine } from "@/lib/ai/agents/script-editor";
 import { applyScriptEdit, findSegmentAtTime } from "@/lib/script-edit";
@@ -2167,8 +2169,18 @@ const Index = () => {
   const autopilot = useAutopilot();
   const studioChat = useStudioChat();
   const { playheadSec } = usePlayhead({ paused: autopilot.busy || executionBusy });
+  const [autoApplyEnabled, setAutoApplyEnabled] = useState(false);
+  const [hasAppliedToPremiere, setHasAppliedToPremiere] = useState(false);
+  const editHistory = useEditHistory({
+    projectId: hostStatus?.projectId ?? null,
+    onRestore: (snapshot) => {
+      editorStore.setPreviewPlan(snapshot.plan);
+      setScriptText(snapshot.scriptText);
+    },
+  });
   useEffect(() => {
     editorStore.setPreviewPlan(null);
+    setHasAppliedToPremiere(false);
   }, [hostStatus?.projectId]);
   const editorRangeLabel = appendAtTrackEnd
     ? "Append mode"
@@ -2293,6 +2305,15 @@ const Index = () => {
       rangeEndSec: shortScopedRange?.endSec ?? (hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.outSec : null),
     });
     editorStore.setPreviewPlan(result.plan);
+    editHistory.push(
+      "Autopilot full edit",
+      { plan: result.plan, scriptText: workingScript },
+      false,
+      { plan: editorStore.previewPlan, scriptText },
+    );
+    if (autoApplyEnabled) {
+      await applyPlanToPremiere(result.plan);
+    }
   }
 
   function buildChatAgentContext() {
@@ -2325,8 +2346,17 @@ const Index = () => {
     return {
       apply_edit_ops: async (args): Promise<StudioToolResult> => {
         const request = typeof args.request === "string" && args.request.trim() ? args.request : "improve the edit";
-        const nextPlan = await routeChatToPlan(editorStore.activePlan, request, agentContext);
+        const nextPlan = await routeChatToPlan(editorStore.activePlan, request, agentContext, {
+          rankingsBySegmentId: aiRankingsBySegmentId,
+          mediaItems,
+        });
         editorStore.setPreviewPlan(nextPlan);
+        editHistory.push(
+          `Chat: ${request.slice(0, 60)}`,
+          { plan: nextPlan, scriptText },
+          false,
+          { plan: editorStore.previewPlan, scriptText },
+        );
         return {
           ok: true,
           summary: `Updated the edit plan (${nextPlan.actions.length} actions).`,
@@ -2367,6 +2397,12 @@ const Index = () => {
         );
         if (applied.changedSegmentId) {
           setScriptText(applied.scriptText);
+          editHistory.push(
+            `Script edit at ${formatSeconds(atSec)}`,
+            { plan: editorStore.previewPlan, scriptText: applied.scriptText },
+            false,
+            { plan: editorStore.previewPlan, scriptText },
+          );
         }
         return {
           ok: edit.changed,
@@ -2395,6 +2431,14 @@ const Index = () => {
           durationSec: imageDefaultDurationSec,
           agentContext,
         });
+        if (result.ok) {
+          editHistory.push(
+            `Image placed at ${formatSeconds(atSec)}`,
+            { plan: editorStore.previewPlan, scriptText },
+            true,
+            { plan: editorStore.previewPlan, scriptText },
+          );
+        }
         return { ok: result.ok, summary: result.message, deliberation: result.deliberation };
       },
       batch_generate_images: async (args): Promise<StudioToolResult> => {
@@ -2442,6 +2486,14 @@ const Index = () => {
             placed += 1;
           }
         }
+        if (placed > 0) {
+          editHistory.push(
+            `Placed ${placed} generated image(s)`,
+            { plan: editorStore.previewPlan, scriptText },
+            true,
+            { plan: editorStore.previewPlan, scriptText },
+          );
+        }
         return {
           ok: placed > 0,
           summary: `Generated and placed ${placed}/${prompts.length} B-roll images across the section.`,
@@ -2470,11 +2522,13 @@ const Index = () => {
 
   function handleChatQuickAction(action: ChatQuickAction) {
     if (action === "edit_line") {
+      // Needs the user's wording, so prefill and focus instead of auto-sending.
       studioChat.setInput("Tighten and improve the script line at the playhead.");
+      document.getElementById("studio-chat-input")?.focus();
     } else if (action === "make_image") {
-      studioChat.setInput("Make an image for this moment and place it at the playhead.");
+      void handleSendStudioChat("Make an image for this moment and place it at the playhead.");
     } else {
-      studioChat.setInput("Generate B-roll images where visual coverage is missing in this section.");
+      void handleSendStudioChat("Generate B-roll images where visual coverage is missing in this section.");
     }
   }
 
@@ -2536,10 +2590,13 @@ const Index = () => {
       await handlePlaceOnTimeline();
       return;
     }
+    await applyPlanToPremiere(editorStore.previewPlan);
+  }
 
+  async function applyPlanToPremiere(planToApply: EditPlan) {
     setExecutionBusy(true);
     try {
-      const result = await runEditPlan(editorStore.previewPlan, {
+      const result = await runEditPlan(planToApply, {
         targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
         appendAtTrackEnd,
         useSequenceInOut: !appendAtTrackEnd && hasMeaningfulInOut,
@@ -2564,6 +2621,10 @@ const Index = () => {
         workingRangeStartSec: previewPlan?.rangeStartSec ?? 0,
         workingRangeEndSec: previewPlan?.rangeEndSec ?? 0,
       });
+      if (result.ok) {
+        setHasAppliedToPremiere(true);
+        editHistory.push("Applied to Premiere", { plan: planToApply, scriptText }, true);
+      }
     } catch (error) {
       setExecutionResult({
         ok: false,
@@ -2592,12 +2653,24 @@ const Index = () => {
         providerLabel={activeProviderLabel}
         rangeLabel={editorRangeLabel}
         busy={autopilot.busy || studioChat.busy || executionBusy}
+        busyStage={
+          autopilot.stage ?? (studioChat.busy ? "Gemma is working" : executionBusy ? "Applying to Premiere" : null)
+        }
         settingsOpen={showAdvancedUi}
         onOpenSettings={() => setShowAdvancedUi(true)}
         onCloseSettings={() => setShowAdvancedUi(false)}
         onAutopilot={() => void handleAutopilotEdit()}
         onApply={() => void handleApplyEditorPlan()}
         canApply={editorPlacements.length > 0}
+        onUndo={editHistory.undo}
+        canUndo={editHistory.canUndo}
+        autoApply={autoApplyEnabled}
+        onAutoApplyChange={setAutoApplyEnabled}
+        hasTranscript={Boolean(parsedScriptState.result?.segments.length)}
+        hasPreviewPlan={Boolean(editorStore.previewPlan)}
+        hasApplied={hasAppliedToPremiere}
+        historyEntries={editHistory.entries}
+        onRestoreHistoryTo={editHistory.restoreTo}
         chat={{
           messages: studioChat.messages,
           input: studioChat.input,

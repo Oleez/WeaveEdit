@@ -1,3 +1,4 @@
+import { HelpTip } from "@/features/editor/HelpTip";
 import { CardHeader, DirectionOption, DirectionSelect, StatusPill } from "./ui";
 
 interface DirectorControlsCardProps<
@@ -67,29 +68,34 @@ export function DirectorControlsCard<
           value={editGoal}
           options={editGoalOptions}
           onChange={onEditGoalChange}
+          help='What the video should achieve — e.g. "retention" keeps cuts fast to hold viewers, "sales" leans on proof and CTA moments.'
         />
         <DirectionSelect
           label="Edit style"
           value={editStyle}
           options={editStyleOptions}
           onChange={onEditStyleChange}
+          help='Overall pacing and energy — e.g. "documentary" holds shots longer, "punchy" cuts on every beat.'
         />
         <DirectionSelect
           label="B-roll style"
           value={brollStyle}
           options={brollStyleOptions}
           onChange={onBrollStyleChange}
+          help='How visuals are chosen over your talking head — e.g. "literal" shows exactly what you say, "metaphorical" picks mood-matching imagery.'
         />
         <DirectionSelect
           label="Caption style"
           value={captionStyle}
           options={captionStyleOptions}
           onChange={onCaptionStyleChange}
+          help='The look of the burned-in captions — e.g. "hormozi-punchy" is big bold word-by-word, "minimal-premium" is subtle and clean.'
         />
       </div>
       <label className="mt-4 block text-sm">
-        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5 text-xs uppercase tracking-[0.18em] text-muted-foreground">
           CTA / offer context
+          <HelpTip text='Tell the editor what you are selling or asking for, so CTA moments get emphasis — e.g. "Comment MONEY and I will DM you the link."' />
         </span>
         <input
           value={ctaContext}
@@ -99,8 +105,9 @@ export function DirectorControlsCard<
         />
       </label>
       <label className="mt-4 block text-sm">
-        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5 text-xs uppercase tracking-[0.18em] text-muted-foreground">
           Custom creative direction
+          <HelpTip text='Free-form instructions the AI follows on every decision — e.g. "Make this feel like a premium money mentor reel, avoid cheesy stock visuals."' />
         </span>
         <textarea
           value={creativeDirection}
@@ -110,8 +117,9 @@ export function DirectorControlsCard<
         />
       </label>
       <label className="mt-4 block text-sm">
-        <span className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5 text-xs uppercase tracking-[0.18em] text-muted-foreground">
           Brand notes
+          <HelpTip text='Your visual identity rules — e.g. "Dark premium look, yellow highlight words, no emojis, confident tone."' />
         </span>
         <textarea
           value={brandNotes}

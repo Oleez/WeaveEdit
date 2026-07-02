@@ -13,8 +13,8 @@ import { reviewContinuity } from "@/lib/ai/agents/continuity";
 import { critiquePlan } from "@/lib/ai/agents/critic";
 import { directEdit } from "@/lib/ai/agents/director";
 import { reviewPacing } from "@/lib/ai/agents/pacing";
-import { buildEditPlan } from "./plan-builder";
-import { ChatEditIntent, EditAction, EditPlan } from "./types";
+import { buildCaptionRunAction, buildEditPlan } from "./plan-builder";
+import { AgentDeliberation, ChatEditIntent, EditAction, EditPlan } from "./types";
 
 export interface AutopilotInput {
   placements: TimelinePlacement[];
@@ -197,42 +197,159 @@ export async function runFullAutopilot(input: FullAutopilotInput): Promise<FullA
   };
 }
 
-export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent): EditPlan {
+export interface ReplanOptions {
+  /** AI rankings from "Analyze with AI"; used by replace_broll to pick next-best assets. */
+  rankingsBySegmentId?: Record<string, AiSegmentRanking>;
+  /** Media library items; resolves ranked candidateIds (paths) back to name/type. */
+  mediaItems?: MediaLibraryItem[];
+}
+
+type PlaceClipAction = Extract<EditAction, { kind: "place_clip" }>;
+
+export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent, options: ReplanOptions = {}): EditPlan {
   const actions: EditAction[] = [];
-  const visualPlacements = plan.actions.filter((action) => action.kind === "place_clip");
+  const rationale: AgentDeliberation[] = [];
+  const placeClips = plan.actions.filter((action): action is PlaceClipAction => action.kind === "place_clip");
+  const visualClips = placeClips.filter((action) => action.mediaPath);
 
   intent.ops.forEach((op) => {
-    if (op.kind === "punch_in") {
-      visualPlacements
-        .filter((action) => action.kind === "place_clip")
-        .slice(0, 6)
-        .forEach((action) => {
-          actions.push({
-            kind: "punch_in",
-            placementId: action.placementId,
-            scalePct: typeof op.value === "number" ? op.value : 112,
-            durationSec: Math.min(1.2, Math.max(0.35, action.endSec - action.startSec)),
-          });
+    if (op.kind === "tighten") {
+      const minSilenceSec = typeof op.value === "number" ? op.value : 0.2;
+      const existingSpans = plan.actions
+        .filter((action): action is Extract<EditAction, { kind: "cut_silence" }> => action.kind === "cut_silence")
+        .flatMap((action) => action.spans);
+      const tightened = existingSpans.filter((span) => span.durationSec >= minSilenceSec);
+      if (tightened.length > 0) {
+        actions.push({ kind: "cut_silence", spans: tightened, audioTrackIndex: 0 });
+        rationale.push({
+          agent: "chat-router",
+          claim: `Tightening pacing: re-cutting ${tightened.length} silence gap(s) of ${minSilenceSec}s or longer.`,
+          evidence: tightened.slice(0, 5).map((span) => `${span.startSec.toFixed(1)}s (${span.durationSec.toFixed(2)}s gap)`),
+          confidence: 0.8,
         });
+      } else {
+        rationale.push({
+          agent: "chat-router",
+          claim:
+            "No silence analysis is in this plan yet, so there is nothing to tighten. Run Autopilot (or the silence preview) first and I can cut the gaps.",
+          evidence: ["tighten requested", "0 silence spans available"],
+          confidence: 0.4,
+        });
+      }
+    }
+
+    if (op.kind === "punch_in") {
+      visualClips.slice(0, 6).forEach((action) => {
+        actions.push({
+          kind: "punch_in",
+          placementId: action.placementId,
+          scalePct: typeof op.value === "number" ? op.value : 112,
+          durationSec: Math.min(1.2, Math.max(0.35, action.endSec - action.startSec)),
+        });
+      });
+      rationale.push({
+        agent: "chat-router",
+        claim: `Added punch-in zooms on ${Math.min(6, visualClips.length)} clip(s) to add emphasis.`,
+        evidence: visualClips.slice(0, 6).map((action) => action.placementId),
+        confidence: visualClips.length > 0 ? 0.78 : 0.4,
+      });
+    }
+
+    if (op.kind === "captions") {
+      const placements = placeClips
+        .map((action) => action.placement)
+        .filter((placement): placement is TimelinePlacement => Boolean(placement && placement.text));
+      if (placements.length > 0) {
+        actions.push(buildCaptionRunAction(placements));
+        rationale.push({
+          agent: "chat-router",
+          claim: `Built a word-timed caption run covering ${placements.length} placement(s).`,
+          evidence: [`${placements.length} placements with transcript text`],
+          confidence: 0.82,
+        });
+      } else {
+        rationale.push({
+          agent: "chat-router",
+          claim: "No placements with transcript text are in the plan yet, so captions have nothing to time against. Run Autopilot first.",
+          evidence: ["captions requested", "0 text placements"],
+          confidence: 0.4,
+        });
+      }
     }
 
     if (op.kind === "audio_polish") {
       actions.push({ kind: "normalize_loudness", trackIndex: 0, targetLufs: -14 });
       actions.push({ kind: "duck_under_voice", musicTrackIndex: 1, voiceTrackIndex: 0, duckDb: -9 });
+      rationale.push({
+        agent: "chat-router",
+        claim: "Queued audio polish: normalize the voice track to -14 LUFS and duck music -9 dB under speech.",
+        evidence: ["normalize_loudness", "duck_under_voice"],
+        confidence: 0.8,
+      });
     }
 
     if (op.kind === "transitions") {
-      visualPlacements
-        .filter((action) => action.kind === "place_clip")
-        .slice(1, 10)
-        .forEach((action) => {
-          actions.push({
-            kind: "add_transition",
-            placementId: action.placementId,
-            style: "cross_dissolve",
-            durationSec: 0.25,
-          });
+      const targets = visualClips.slice(1, 10);
+      targets.forEach((action) => {
+        actions.push({
+          kind: "add_transition",
+          placementId: action.placementId,
+          style: "cross_dissolve",
+          durationSec: 0.25,
         });
+      });
+      rationale.push({
+        agent: "chat-router",
+        claim: `Added ${targets.length} cross-dissolve transition(s) between visual clips.`,
+        evidence: targets.map((action) => action.placementId),
+        confidence: targets.length > 0 ? 0.76 : 0.4,
+      });
+    }
+
+    if (op.kind === "color_match") {
+      const reference = visualClips[0]?.mediaPath ?? null;
+      if (reference && visualClips.length > 1) {
+        const targets = visualClips.slice(1, 13);
+        targets.forEach((action) => {
+          actions.push({ kind: "color_match", placementId: action.placementId, referencePath: reference });
+        });
+        rationale.push({
+          agent: "chat-router",
+          claim: `Matching the color of ${targets.length} clip(s) to the opening clip's look.`,
+          evidence: [`reference: ${reference}`],
+          confidence: 0.74,
+        });
+      } else {
+        rationale.push({
+          agent: "chat-router",
+          claim: "Color match needs at least two visual clips in the plan — run Autopilot or place B-roll first.",
+          evidence: [`visual clips available: ${visualClips.length}`],
+          confidence: 0.4,
+        });
+      }
+    }
+
+    if (op.kind === "replace_broll") {
+      const replacements = buildBrollReplacements(visualClips, options);
+      if (replacements.actions.length > 0) {
+        actions.push(...replacements.actions);
+        rationale.push({
+          agent: "chat-router",
+          claim: `Swapped ${replacements.actions.length} weak B-roll clip(s) for the next-best AI-ranked asset.`,
+          evidence: replacements.evidence,
+          confidence: 0.72,
+        });
+      } else {
+        rationale.push({
+          agent: "chat-router",
+          claim:
+            replacements.evidence.length > 0
+              ? "The weak clips have no alternative ranked assets to swap in. Run \"Analyze with AI\" to rank your media library first."
+              : "No weak B-roll found to replace — every visual clip is above the confidence bar.",
+          evidence: replacements.evidence,
+          confidence: 0.4,
+        });
+      }
     }
   });
 
@@ -244,6 +361,7 @@ export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent): EditPl
     actions: [...plan.actions, ...actions],
     rationale: [
       ...plan.rationale,
+      ...rationale,
       {
         agent: "chat-router",
         claim: `Converted "${intent.rawText}" into ${actions.length} preview actions.`,
@@ -252,4 +370,67 @@ export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent): EditPl
       },
     ],
   };
+}
+
+function buildBrollReplacements(
+  visualClips: PlaceClipAction[],
+  options: ReplanOptions,
+): { actions: EditAction[]; evidence: string[] } {
+  const evidence: string[] = [];
+  const actions: EditAction[] = [];
+
+  const weak = visualClips
+    .filter((action) => action.placement && (action.placement.lowConfidence || action.placement.aiConfidence < 0.55))
+    .sort((a, b) => (a.placement?.aiConfidence ?? 0) - (b.placement?.aiConfidence ?? 0))
+    .slice(0, 6);
+
+  if (weak.length === 0) {
+    return { actions, evidence };
+  }
+
+  const mediaByPath = new Map(
+    (options.mediaItems ?? []).map((item) => [normalizeMediaPath(item.path), item] as const),
+  );
+
+  for (const action of weak) {
+    const placement = action.placement;
+    if (!placement) continue;
+    evidence.push(`${placement.id} (confidence ${Math.round(placement.aiConfidence * 100)}%)`);
+
+    const ranking = options.rankingsBySegmentId?.[placement.segmentId];
+    if (!ranking) continue;
+
+    const currentPath = normalizeMediaPath(placement.mediaPath ?? "");
+    const nextBest = [...ranking.rankedAssets]
+      .sort((a, b) => b.score - a.score)
+      .find((ranked) => normalizeMediaPath(ranked.candidateId) !== currentPath);
+    if (!nextBest) continue;
+
+    const media = mediaByPath.get(normalizeMediaPath(nextBest.candidateId));
+    const newPath = media?.path ?? nextBest.candidateId;
+    actions.push({
+      kind: "place_clip",
+      placementId: placement.id,
+      track: action.track,
+      startSec: action.startSec,
+      endSec: action.endSec,
+      mediaPath: newPath,
+      placement: {
+        ...placement,
+        mediaPath: newPath,
+        mediaName: media?.name ?? newPath.split(/[\\/]/).pop() ?? newPath,
+        mediaType: media?.type ?? placement.mediaType,
+        aiConfidence: nextBest.score,
+        aiRationale: nextBest.rationale || placement.aiRationale,
+        lowConfidence: false,
+        strategy: "ai",
+      },
+    });
+  }
+
+  return { actions, evidence };
+}
+
+function normalizeMediaPath(path: string): string {
+  return path.replace(/\\/g, "/").toLowerCase();
 }

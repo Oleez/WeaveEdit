@@ -1,5 +1,5 @@
 import { ChatEditIntent, EditPlan } from "@/lib/edit-core/types";
-import { replanFromIntent } from "@/lib/edit-core/autopilot";
+import { ReplanOptions, replanFromIntent } from "@/lib/edit-core/autopilot";
 import { AgentContext, callOllamaAgent } from "./shared";
 
 const VALID_OPS = new Set([
@@ -92,7 +92,8 @@ export async function routeChatToPlan(
   plan: EditPlan,
   rawText: string,
   agentContext?: AgentContext,
+  replanOptions?: ReplanOptions,
 ): Promise<EditPlan> {
   const intent = await parseChatIntentWithLlm(rawText, agentContext);
-  return replanFromIntent(plan, intent);
+  return replanFromIntent(plan, intent, replanOptions);
 }

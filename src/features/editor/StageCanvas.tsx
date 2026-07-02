@@ -7,6 +7,11 @@ interface StageCanvasProps {
   placement: TimelinePlacement | null;
   playheadSec: number;
   durationSec: number;
+  playing: boolean;
+  onTogglePlay: () => void;
+  onSkipBack: () => void;
+  onSkipForward: () => void;
+  onScrub: (sec: number) => void;
 }
 
 function toMediaSrc(path: string | null | undefined): string | null {
@@ -21,12 +26,26 @@ function toMediaSrc(path: string | null | undefined): string | null {
   return /^[A-Za-z]:\//.test(normalized) ? `file:///${normalized}` : `file://${normalized}`;
 }
 
-export function StageCanvas({ placement, playheadSec, durationSec }: StageCanvasProps) {
+export function StageCanvas({
+  placement,
+  playheadSec,
+  durationSec,
+  playing,
+  onTogglePlay,
+  onSkipBack,
+  onSkipForward,
+  onScrub,
+}: StageCanvasProps) {
   const mediaSrc = placement?.mediaType === "image" ? toMediaSrc(placement.mediaPath) : null;
   const isVideo = placement?.mediaType === "video";
 
   return (
     <section className="flex min-h-[360px] flex-col bg-neutral-950">
+      <div className="border-b border-white/10 px-4 py-1.5">
+        <p className="text-[11px] text-white/40">
+          <span className="font-medium text-white/60">Preview</span> — what the moment under the playhead will look like
+        </p>
+      </div>
       <div className="relative flex flex-1 items-center justify-center overflow-hidden">
         {mediaSrc ? (
           <img
@@ -60,24 +79,54 @@ export function StageCanvas({ placement, playheadSec, durationSec }: StageCanvas
         </div>
       </div>
       <div className="border-t border-white/10 bg-black/70 px-4 py-3">
-        <div className="mb-3 h-1.5 overflow-hidden rounded-full bg-white/10">
-          <div
-            className="h-full rounded-full bg-primary"
+        <button
+          type="button"
+          aria-label="Scrub preview position"
+          className="mb-3 block h-1.5 w-full cursor-pointer overflow-hidden rounded-full bg-white/10"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+            onScrub(ratio * durationSec);
+          }}
+        >
+          <span
+            className="block h-full rounded-full bg-primary"
             style={{ width: `${durationSec > 0 ? Math.min(100, (playheadSec / durationSec) * 100) : 0}%` }}
           />
-        </div>
+        </button>
         <div className="flex items-center justify-between gap-3 text-xs text-white/60">
           <div className="flex items-center gap-1">
-            <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-white">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-white"
+              aria-label="Jump to previous clip"
+              title="Jump to previous clip"
+              onClick={onSkipBack}
+            >
               <SkipBack className="h-4 w-4" />
             </Button>
-            <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-white">
-              <Play className="h-4 w-4" />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-white"
+              aria-label={playing ? "Pause preview" : "Play preview"}
+              title={playing ? "Pause preview" : "Play preview"}
+              onClick={onTogglePlay}
+            >
+              {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
             </Button>
-            <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-white">
-              <Pause className="h-4 w-4" />
-            </Button>
-            <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-white">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-white"
+              aria-label="Jump to next clip"
+              title="Jump to next clip"
+              onClick={onSkipForward}
+            >
               <SkipForward className="h-4 w-4" />
             </Button>
           </div>
