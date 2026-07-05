@@ -1,5 +1,6 @@
 import { Bot, Download, Loader2, Settings2, Sparkles, Undo2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PANEL_VERSION } from "@/lib/version";
 
 interface AutopilotBarProps {
   providerLabel: string;
@@ -38,9 +39,15 @@ export function AutopilotBar({
         <div className="flex items-center gap-2 text-sm font-semibold">
           <Bot className="h-4 w-4 text-primary" />
           Weave Edit
+          <span
+            className="rounded border border-border/60 px-1 py-0.5 font-mono text-[10px] font-normal text-muted-foreground"
+            title="Panel build version — if this doesn't match the latest install, restart Premiere Pro"
+          >
+            v{PANEL_VERSION}
+          </span>
         </div>
         <StatusChip value={providerLabel} title="The AI model doing the editing work" />
-        <StatusChip value={sequenceLabel} title="The Premiere sequence this panel is connected to" />
+        <StatusChip value={sequenceLabel} title="Active Premiere timeline tab — updates automatically when you switch sequence tabs" />
         <StatusChip value={rangeLabel} title="The part of the timeline edits will be placed into" />
         {busy && busyStage ? (
           <span className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-xs text-primary">

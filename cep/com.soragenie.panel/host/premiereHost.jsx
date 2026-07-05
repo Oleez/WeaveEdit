@@ -132,6 +132,56 @@ var weaveEdit = (function () {
     };
   }
 
+  function resolveActiveSequence() {
+    if (!app || !app.project) {
+      return null;
+    }
+
+    try {
+      var active = app.project.activeSequence;
+      if (active) {
+        return active;
+      }
+    } catch (error) {
+      // Fall through — some Premiere builds throw when no timeline tab is frontmost.
+    }
+
+    return null;
+  }
+
+  function getSequenceIdentity(sequence) {
+    if (!sequence) {
+      return { id: null, name: "" };
+    }
+
+    var id = "";
+    var name = "";
+    try {
+      name = sequence.name || "";
+    } catch (error) {
+      name = "";
+    }
+    try {
+      id = sequence.sequenceID || "";
+    } catch (error) {
+      id = "";
+    }
+    if (!id) {
+      try {
+        if (sequence.projectItem && sequence.projectItem.nodeId) {
+          id = String(sequence.projectItem.nodeId);
+        }
+      } catch (error2) {
+        id = "";
+      }
+    }
+    if (!id && name) {
+      id = "name:" + name;
+    }
+
+    return { id: id || null, name: name };
+  }
+
   function getProjectIdentity() {
     if (!app || !app.project) {
       return { id: null, path: null };
@@ -169,6 +219,7 @@ var weaveEdit = (function () {
         projectPath: identity.path,
         projectName: "",
         sequenceName: "",
+        sequenceId: null,
         videoTracks: [],
       frameRate: 30,
         range: {
@@ -181,7 +232,7 @@ var weaveEdit = (function () {
       });
     }
 
-    var sequence = app.project.activeSequence;
+    var sequence = resolveActiveSequence();
     if (!sequence) {
       return stringify({
         ok: false,
@@ -190,6 +241,7 @@ var weaveEdit = (function () {
         projectPath: identity.path,
         projectName: app.project.name || "",
         sequenceName: "",
+        sequenceId: null,
         videoTracks: [],
         frameRate: 30,
         range: {
@@ -198,10 +250,11 @@ var weaveEdit = (function () {
           sequenceEndSec: 0,
           hasMeaningfulInOut: false
         },
-        message: "Open or activate a sequence first."
+        message: "Click a sequence tab in the Premiere timeline — Weave follows whichever tab is active."
       });
     }
 
+    var sequenceIdentity = getSequenceIdentity(sequence);
     var range = getRangeStatus(sequence);
     var videoTracks = [];
     for (var index = 0; index < sequence.videoTracks.numTracks; index += 1) {
@@ -218,7 +271,8 @@ var weaveEdit = (function () {
       projectId: identity.id,
       projectPath: identity.path,
       projectName: app.project.name || "",
-      sequenceName: sequence.name || "",
+      sequenceName: sequenceIdentity.name,
+      sequenceId: sequenceIdentity.id,
       videoTracks: videoTracks,
       range: range,
       frameRate: getSequenceFrameRate(sequence)
@@ -227,7 +281,7 @@ var weaveEdit = (function () {
 
   function getPlayheadPosition() {
     try {
-      var sequence = app && app.project ? app.project.activeSequence : null;
+      var sequence = resolveActiveSequence();
       if (!sequence) {
         return "0";
       }
@@ -251,11 +305,10 @@ var weaveEdit = (function () {
   }
 
   function getTranscriptSegments() {
-    if (!app || !app.project || !app.project.activeSequence) {
+    var sequence = resolveActiveSequence();
+    if (!sequence) {
       return stringify([]);
     }
-
-    var sequence = app.project.activeSequence;
     var markers = sequence.markers;
     var segments = [];
 
@@ -299,11 +352,10 @@ var weaveEdit = (function () {
   }
 
   function getAudioClips() {
-    if (!app || !app.project || !app.project.activeSequence) {
+    var sequence = resolveActiveSequence();
+    if (!sequence) {
       return stringify([]);
     }
-
-    var sequence = app.project.activeSequence;
     var clips = [];
 
     for (var trackIndex = 0; trackIndex < sequence.audioTracks.numTracks; trackIndex += 1) {
@@ -461,9 +513,9 @@ var weaveEdit = (function () {
       return fail("Premiere project is not available.");
     }
 
-    var sequence = app.project.activeSequence;
+    var sequence = resolveActiveSequence();
     if (!sequence) {
-      return fail("Open or activate a sequence first.");
+      return fail("Click a sequence tab in the Premiere timeline first.");
     }
 
     var targetTrackIndex = Number(job.targetVideoTrackIndex || 0);
@@ -615,7 +667,8 @@ var weaveEdit = (function () {
   }
 
   function applySilenceCleanup(job) {
-    if (!app || !app.project || !app.project.activeSequence) {
+    var sequence = resolveActiveSequence();
+    if (!sequence) {
       return stringify({
         ok: false,
         message: "Open or activate a sequence first.",
@@ -624,7 +677,6 @@ var weaveEdit = (function () {
       });
     }
 
-    var sequence = app.project.activeSequence;
     var markers = sequence.markers;
     var details = [];
     var markerCount = 0;
@@ -671,7 +723,7 @@ var weaveEdit = (function () {
   function applyShortsMarkersFromFile(filePath) {
     try {
       var job = readBridgeJob(filePath) || {};
-      var sequence = app && app.project ? app.project.activeSequence : null;
+      var sequence = resolveActiveSequence();
       if (!sequence) {
         return bridgeFail(new Error("Open or activate a sequence first."));
       }
@@ -805,10 +857,10 @@ var weaveEdit = (function () {
   }
 
   function getAudioTrackClips(trackIndex) {
-    if (!app || !app.project || !app.project.activeSequence) {
+    var sequence = resolveActiveSequence();
+    if (!sequence) {
       return [];
     }
-    var sequence = app.project.activeSequence;
     if (!sequence.audioTracks || trackIndex < 0 || trackIndex >= sequence.audioTracks.numTracks) {
       return [];
     }
@@ -839,10 +891,10 @@ var weaveEdit = (function () {
   function applyAudioPolishFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      if (!app || !app.project || !app.project.activeSequence) {
+      var sequence = resolveActiveSequence();
+    if (!sequence) {
         return bridgeFail(new Error("Open or activate a sequence first."));
       }
-      var sequence = app.project.activeSequence;
       var details = [];
       var appliedCount = 0;
       var fallbackCount = 0;
@@ -1014,10 +1066,10 @@ var weaveEdit = (function () {
   function applyCaptionsFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      if (!app || !app.project || !app.project.activeSequence) {
+      var sequence = resolveActiveSequence();
+    if (!sequence) {
         return bridgeFail(new Error("Open or activate a sequence first."));
       }
-      var sequence = app.project.activeSequence;
       var details = [];
       var imported = 0;
       var placed = 0;
@@ -1066,10 +1118,10 @@ var weaveEdit = (function () {
   function applyColorMatchFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      if (!app || !app.project || !app.project.activeSequence) {
+      var sequence = resolveActiveSequence();
+    if (!sequence) {
         return bridgeFail(new Error("Open or activate a sequence first."));
       }
-      var sequence = app.project.activeSequence;
       var details = [];
       var applied = 0;
       var fallback = 0;
@@ -1122,10 +1174,10 @@ var weaveEdit = (function () {
   function applyTransitionsFromFile(filePath) {
     try {
       var actions = readBridgeJob(filePath) || [];
-      if (!app || !app.project || !app.project.activeSequence) {
+      var sequence = resolveActiveSequence();
+    if (!sequence) {
         return bridgeFail(new Error("Open or activate a sequence first."));
       }
-      var sequence = app.project.activeSequence;
       var details = [];
       var applied = 0;
       var fallback = 0;
@@ -1188,10 +1240,10 @@ var weaveEdit = (function () {
   function applyExportFromFile(filePath) {
     try {
       var action = readBridgeJob(filePath) || {};
-      if (!app || !app.project || !app.project.activeSequence) {
+      var sequence = resolveActiveSequence();
+    if (!sequence) {
         return bridgeFail(new Error("Open or activate a sequence first."));
       }
-      var sequence = app.project.activeSequence;
       var preset = String(action.preset || "match_source");
       var projectFolder = app.project.path ? Folder(File(app.project.path).parent.fsName) : Folder.desktop;
       var outputPath = projectFolder.fsName + "/" + (sequence.name || "weave-export") + "-" + preset + ".mp4";

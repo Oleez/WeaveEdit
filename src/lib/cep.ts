@@ -27,6 +27,8 @@ export interface PremiereStatus {
   projectPath: string | null;
   projectName: string;
   sequenceName: string;
+  /** Stable Premiere sequence id — used to detect timeline tab switches. */
+  sequenceId: string | null;
   videoTracks: PremiereTrackStatus[];
   range: PremiereRangeStatus;
   frameRate: number;
@@ -368,6 +370,7 @@ export async function getPremiereStatus(): Promise<PremiereStatus> {
       projectPath: null,
       projectName: "",
       sequenceName: "",
+      sequenceId: null,
       videoTracks: [],
       frameRate: 30,
       range: {

@@ -448,6 +448,7 @@ const Index = () => {
   const [selectedShortIds, setSelectedShortIds] = useState<Set<string>>(() => new Set());
   const [shortScopedRange, setShortScopedRange] = useState<{ startSec: number; endSec: number; shortId: string } | null>(null);
   const previousProjectIdRef = useRef<string | null | undefined>(undefined);
+  const previousSequenceIdRef = useRef<string | null | undefined>(undefined);
   const settingsHydratingRef = useRef(false);
 
   const dynamicEditorSettings = useMemo<DynamicEditorSettings>(
@@ -501,10 +502,23 @@ const Index = () => {
         setBusyMessage("Checking Premiere sequence");
       }
 
+      const signature = (status: PremiereStatus) =>
+        [
+          status.projectId,
+          status.sequenceId,
+          status.sequenceName,
+          status.ok,
+          status.frameRate,
+          status.range.inSec,
+          status.range.outSec,
+          status.range.sequenceEndSec,
+          status.videoTracks.length,
+        ].join("|");
+
       try {
         const nextStatus = await getPremiereStatus();
         setHostStatus((current) =>
-          current && JSON.stringify(current) === JSON.stringify(nextStatus) ? current : nextStatus,
+          current && signature(current) === signature(nextStatus) ? current : nextStatus,
         );
 
         if (nextStatus.ok && targetVideoTrack > nextStatus.videoTracks.length) {
@@ -519,6 +533,7 @@ const Index = () => {
           projectPath: null,
           projectName: "",
           sequenceName: "",
+          sequenceId: null,
           videoTracks: [],
           frameRate: 30,
           range: {
@@ -529,9 +544,12 @@ const Index = () => {
           },
           message: String(error),
         };
-        if (!options?.silent) {
-          setHostStatus(failed);
-        }
+        setHostStatus((current) => {
+          if (options?.silent && current) {
+            return current;
+          }
+          return failed;
+        });
         return null;
       } finally {
         if (!options?.silent) {
@@ -651,6 +669,7 @@ const Index = () => {
     applyProjectSettings(loadProjectSettings(projectId));
     if (previousProjectIdRef.current !== projectId) {
       resetTransientEditorState();
+      previousSequenceIdRef.current = undefined;
       setCreatorProfileVersion((version) => version + 1);
     }
     previousProjectIdRef.current = projectId;
@@ -1406,7 +1425,11 @@ const Index = () => {
       }
 
       setScriptText(formatMarkerTranscript(segments));
-      setScriptSourceName(`Premiere markers (${segments.length})`);
+      setScriptSourceName(
+        hostStatus?.sequenceName
+          ? `Premiere markers (${segments.length}) · ${hostStatus.sequenceName}`
+          : `Premiere markers (${segments.length})`,
+      );
       setTranscriptSourceMode("premiere-markers");
       setResult(null);
     } catch (error) {
@@ -2197,22 +2220,67 @@ const Index = () => {
     setHasAppliedToPremiere(false);
   }, [hostStatus?.projectId]);
 
-  // Auto-sync with Premiere: connect on panel load, then keep following whichever
-  // sequence tab / project the user has active (no manual "check status" needed).
-  const hostSyncBusy = autopilot.busy || executionBusy || studioChat.busy;
+  // Auto-sync with Premiere: poll every second and refresh on focus so the panel
+  // always follows whichever sequence tab is active in the timeline.
   useEffect(() => {
-    if (hostSyncBusy) {
-      return;
-    }
-    void refreshPremiereStatus({ silent: true });
+    const refresh = () => {
+      void refreshPremiereStatus({ silent: true });
+    };
+
+    refresh();
+
     if (!isCepEnvironment()) {
       return;
     }
-    const handle = window.setInterval(() => {
-      void refreshPremiereStatus({ silent: true });
-    }, 3000);
-    return () => window.clearInterval(handle);
-  }, [refreshPremiereStatus, hostSyncBusy]);
+
+    const interval = window.setInterval(refresh, 1000);
+    const onFocus = () => refresh();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        refresh();
+      }
+    };
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refreshPremiereStatus]);
+
+  // When the user switches Premiere sequence tabs, reset the preview and reload
+  // markers for the newly active sequence (if using Premiere markers as transcript).
+  useEffect(() => {
+    if (!hostStatus?.ok || !hostStatus.sequenceId) {
+      return;
+    }
+
+    const sequenceId = hostStatus.sequenceId;
+    if (previousSequenceIdRef.current === sequenceId) {
+      return;
+    }
+
+    const hadPreviousSequence =
+      previousSequenceIdRef.current !== null && previousSequenceIdRef.current !== undefined;
+    previousSequenceIdRef.current = sequenceId;
+
+    if (!hadPreviousSequence) {
+      return;
+    }
+
+    resetTransientEditorState();
+    editorStore.setPreviewPlan(null);
+    setHasAppliedToPremiere(false);
+    studioChat.reset();
+
+    if (transcriptSourceMode === "premiere-markers") {
+      void loadPremiereMarkers();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostStatus?.sequenceId, hostStatus?.ok, hostStatus?.sequenceName]);
   const editorRangeLabel = appendAtTrackEnd
     ? "Append mode"
     : hasMeaningfulInOut

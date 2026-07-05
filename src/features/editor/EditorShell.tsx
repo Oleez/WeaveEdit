@@ -137,7 +137,7 @@ export function EditorShell({
     <main className="dark min-h-screen bg-background text-foreground">
       <AutopilotBar
         providerLabel={providerLabel}
-        sequenceLabel={hostStatus?.sequenceName || "No active sequence"}
+        sequenceLabel={resolveSequenceLabel(hostStatus)}
         rangeLabel={rangeLabel}
         busy={busy}
         busyStage={busyStage}
@@ -227,4 +227,17 @@ function RightTabButton({ active, onClick, label }: { active: boolean; onClick: 
       {label}
     </button>
   );
+}
+
+function resolveSequenceLabel(hostStatus: PremiereStatus | null): string {
+  if (!hostStatus) {
+    return "Syncing sequence…";
+  }
+  if (hostStatus.ok && hostStatus.sequenceName) {
+    return hostStatus.sequenceName;
+  }
+  if (hostStatus.sequenceName) {
+    return hostStatus.sequenceName;
+  }
+  return hostStatus.message || "Click a sequence tab in Premiere";
 }
