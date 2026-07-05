@@ -52,7 +52,7 @@ export function AutopilotBar({
       <div className="flex flex-wrap items-center gap-3">
         <label
           className="flex cursor-pointer select-none items-center gap-2 text-xs text-muted-foreground"
-          title="Skip review — Autopilot result goes straight to Premiere"
+          title="Skip review — the finished edit goes straight to your Premiere timeline"
         >
           <input
             type="checkbox"
@@ -71,7 +71,7 @@ export function AutopilotBar({
         <LabeledButton subtitle="One click: silence cut → B-roll → captions → audio">
           <Button type="button" onClick={onAutopilot} disabled={busy} className="gap-2">
             <Sparkles className="h-4 w-4" />
-            {busy ? "Building edit" : "Autopilot full edit"}
+            {busy ? "Weaving…" : "Weave full edit"}
           </Button>
         </LabeledButton>
         <LabeledButton subtitle="Sends the previewed plan to Premiere">

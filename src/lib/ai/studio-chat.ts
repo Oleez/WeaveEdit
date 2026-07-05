@@ -177,11 +177,11 @@ export async function runStudioChat(params: RunStudioChatParams): Promise<Studio
       if (iteration === 0 && registry.apply_edit_ops) {
         const result = await registry.apply_edit_ops({ request: userMessage });
         executed.push({ tool: "apply_edit_ops", args: { request: userMessage } });
-        activity.push(result.summary);
         if (result.deliberation?.length) {
           deliberation.push(...result.deliberation);
         }
-        finalReply = result.ok ? result.summary : "I couldn't turn that into an edit.";
+        // The summary IS the reply here; pushing it to activity too would render it twice.
+        finalReply = result.summary;
       } else {
         finalReply = finalReply || "Sorry, I couldn't understand that. Try rephrasing the edit you want.";
       }

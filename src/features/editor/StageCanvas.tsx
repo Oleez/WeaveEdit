@@ -74,7 +74,7 @@ export function StageCanvas({
             {placement?.mediaName || "No placement selected"}
           </h1>
           <p className="mt-4 text-sm leading-6 text-white/70">
-            {placement?.text || "Run Autopilot or select a timeline chip to preview the editorial beat."}
+            {placement?.text || "Press Weave full edit or click a timeline chip to preview the editorial beat."}
           </p>
         </div>
       </div>

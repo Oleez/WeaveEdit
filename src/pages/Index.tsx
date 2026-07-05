@@ -495,38 +495,52 @@ const Index = () => {
     ],
   );
 
-  const refreshPremiereStatus = useCallback(async () => {
-    setBusyMessage("Checking Premiere sequence");
-
-    try {
-      const nextStatus = await getPremiereStatus();
-      setHostStatus(nextStatus);
-
-      if (nextStatus.ok && targetVideoTrack > nextStatus.videoTracks.length) {
-        setTargetVideoTrack(Math.max(1, nextStatus.videoTracks.length));
+  const refreshPremiereStatus = useCallback(
+    async (options?: { silent?: boolean }): Promise<PremiereStatus | null> => {
+      if (!options?.silent) {
+        setBusyMessage("Checking Premiere sequence");
       }
-    } catch (error) {
-      setHostStatus({
-        ok: false,
-        connected: true,
-        projectId: null,
-        projectPath: null,
-        projectName: "",
-        sequenceName: "",
-        videoTracks: [],
-        frameRate: 30,
-        range: {
-          inSec: 0,
-          outSec: 0,
-          sequenceEndSec: 0,
-          hasMeaningfulInOut: false,
-        },
-        message: String(error),
-      });
-    } finally {
-      setBusyMessage(null);
-    }
-  }, [targetVideoTrack]);
+
+      try {
+        const nextStatus = await getPremiereStatus();
+        setHostStatus((current) =>
+          current && JSON.stringify(current) === JSON.stringify(nextStatus) ? current : nextStatus,
+        );
+
+        if (nextStatus.ok && targetVideoTrack > nextStatus.videoTracks.length) {
+          setTargetVideoTrack(Math.max(1, nextStatus.videoTracks.length));
+        }
+        return nextStatus;
+      } catch (error) {
+        const failed: PremiereStatus = {
+          ok: false,
+          connected: true,
+          projectId: null,
+          projectPath: null,
+          projectName: "",
+          sequenceName: "",
+          videoTracks: [],
+          frameRate: 30,
+          range: {
+            inSec: 0,
+            outSec: 0,
+            sequenceEndSec: 0,
+            hasMeaningfulInOut: false,
+          },
+          message: String(error),
+        };
+        if (!options?.silent) {
+          setHostStatus(failed);
+        }
+        return null;
+      } finally {
+        if (!options?.silent) {
+          setBusyMessage(null);
+        }
+      }
+    },
+    [targetVideoTrack],
+  );
 
   const applyScanResult = useCallback((scanResult: MediaScanResult) => {
     setMediaItems(scanResult.items);
@@ -2182,6 +2196,23 @@ const Index = () => {
     editorStore.setPreviewPlan(null);
     setHasAppliedToPremiere(false);
   }, [hostStatus?.projectId]);
+
+  // Auto-sync with Premiere: connect on panel load, then keep following whichever
+  // sequence tab / project the user has active (no manual "check status" needed).
+  const hostSyncBusy = autopilot.busy || executionBusy || studioChat.busy;
+  useEffect(() => {
+    if (hostSyncBusy) {
+      return;
+    }
+    void refreshPremiereStatus({ silent: true });
+    if (!isCepEnvironment()) {
+      return;
+    }
+    const handle = window.setInterval(() => {
+      void refreshPremiereStatus({ silent: true });
+    }, 3000);
+    return () => window.clearInterval(handle);
+  }, [refreshPremiereStatus, hostSyncBusy]);
   const editorRangeLabel = appendAtTrackEnd
     ? "Append mode"
     : hasMeaningfulInOut
@@ -2191,6 +2222,10 @@ const Index = () => {
         : "No In/Out";
 
   async function handleAutopilotEdit() {
+    // Re-read the host first so the run always targets the sequence tab that is
+    // active in Premiere right now, not a stale snapshot.
+    const freshStatus = (await refreshPremiereStatus({ silent: true })) ?? hostStatus;
+
     const agentContext = {
       enabled: aiMode !== "off",
       ollamaBaseUrl,
@@ -2217,7 +2252,7 @@ const Index = () => {
     if (!workingScript.trim()) {
       setExecutionResult({
         ok: false,
-        message: "Add a transcript (paste, upload, or load Premiere markers) before running Autopilot.",
+        message: "Add a transcript (paste, upload, or load Premiere markers) before running Weave full edit.",
         placedCount: 0,
         blankCount: 0,
         importedCount: 0,
@@ -2232,7 +2267,7 @@ const Index = () => {
 
     let parsedSegments: ScriptSegment[];
     try {
-      parsedSegments = parseTimestampScript(workingScript, { fps: hostStatus?.frameRate }).segments;
+      parsedSegments = parseTimestampScript(workingScript, { fps: freshStatus?.frameRate }).segments;
     } catch (error) {
       setExecutionResult({
         ok: false,
@@ -2265,7 +2300,7 @@ const Index = () => {
 
     // 3. Silence preview: opportunistic; only runs when CEP + ffmpeg are available.
     let workingSilenceSpans: SilenceSpan[] = silencePreview?.spans ?? [];
-    if (isCepEnvironment() && hostStatus?.ok) {
+    if (isCepEnvironment() && freshStatus?.ok) {
       try {
         const preview = await previewSilenceCleanup({
           targetAudioTrackIndex: Math.max(0, targetAudioTrack - 1),
@@ -2299,14 +2334,14 @@ const Index = () => {
       averageShotLengthSec,
       minClipDurationSec: minDurationSec,
       maxClipDurationSec: maxDurationSec,
-      frameRate: hostStatus?.frameRate ?? 30,
-      sequenceEndSec: hostStatus?.range.sequenceEndSec,
-      rangeStartSec: shortScopedRange?.startSec ?? (hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.inSec : null),
-      rangeEndSec: shortScopedRange?.endSec ?? (hostStatus?.range.hasMeaningfulInOut ? hostStatus.range.outSec : null),
+      frameRate: freshStatus?.frameRate ?? 30,
+      sequenceEndSec: freshStatus?.range.sequenceEndSec,
+      rangeStartSec: shortScopedRange?.startSec ?? (freshStatus?.range.hasMeaningfulInOut ? freshStatus.range.inSec : null),
+      rangeEndSec: shortScopedRange?.endSec ?? (freshStatus?.range.hasMeaningfulInOut ? freshStatus.range.outSec : null),
     });
     editorStore.setPreviewPlan(result.plan);
     editHistory.push(
-      "Autopilot full edit",
+      "Weave full edit",
       { plan: result.plan, scriptText: workingScript },
       false,
       { plan: editorStore.previewPlan, scriptText },
@@ -2346,10 +2381,36 @@ const Index = () => {
     return {
       apply_edit_ops: async (args): Promise<StudioToolResult> => {
         const request = typeof args.request === "string" && args.request.trim() ? args.request : "improve the edit";
-        const nextPlan = await routeChatToPlan(editorStore.activePlan, request, agentContext, {
+        if (editorPlacements.length === 0) {
+          return {
+            ok: false,
+            summary:
+              "There is no edit plan yet, so I have nothing to change. Press \"Weave full edit\" first (or load a transcript from Advanced), then ask me again.",
+          };
+        }
+        const beforePlan = editorStore.activePlan;
+        const nextPlan = await routeChatToPlan(beforePlan, request, agentContext, {
           rankingsBySegmentId: aiRankingsBySegmentId,
           mediaItems,
         });
+        const addedActions = nextPlan.actions.length - beforePlan.actions.length;
+        const newRationale = nextPlan.rationale.slice(beforePlan.rationale.length);
+        // Skip the trailing generic "Converted ..." summary line; keep the per-command claims.
+        const newClaims = newRationale
+          .slice(0, -1)
+          .filter((entry) => entry.agent === "chat-router")
+          .map((entry) => entry.claim);
+
+        if (addedActions === 0) {
+          return {
+            ok: false,
+            summary:
+              newClaims[0] ??
+              "I couldn't map that to a timeline edit. Try things like \"tighten the silence\", \"add punch-ins\", \"add captions\", \"add transitions\", \"polish the audio\", \"match the colors\", or \"replace weak b-roll\".",
+            deliberation: newRationale,
+          };
+        }
+
         editorStore.setPreviewPlan(nextPlan);
         editHistory.push(
           `Chat: ${request.slice(0, 60)}`,
@@ -2359,8 +2420,8 @@ const Index = () => {
         );
         return {
           ok: true,
-          summary: `Updated the edit plan (${nextPlan.actions.length} actions).`,
-          deliberation: nextPlan.rationale,
+          summary: `Added ${addedActions} change(s) to the preview. ${newClaims.join(" ")}`.trim(),
+          deliberation: newRationale,
         };
       },
       edit_script: async (args): Promise<StudioToolResult> => {
@@ -2594,12 +2655,14 @@ const Index = () => {
   }
 
   async function applyPlanToPremiere(planToApply: EditPlan) {
+    // Sync to whichever sequence tab is active right now before touching Premiere.
+    const freshStatus = (await refreshPremiereStatus({ silent: true })) ?? hostStatus;
     setExecutionBusy(true);
     try {
       const result = await runEditPlan(planToApply, {
         targetVideoTrackIndex: Math.max(0, targetVideoTrack - 1),
         appendAtTrackEnd,
-        useSequenceInOut: !appendAtTrackEnd && hasMeaningfulInOut,
+        useSequenceInOut: !appendAtTrackEnd && Boolean(freshStatus?.range.hasMeaningfulInOut),
         rangeStartSec: previewPlan?.rangeStartSec ?? null,
         rangeEndSec: previewPlan?.rangeEndSec ?? null,
         silenceSettings: {

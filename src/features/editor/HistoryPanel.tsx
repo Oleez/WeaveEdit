@@ -17,7 +17,7 @@ export function HistoryPanel({ entries, onRestoreTo }: HistoryPanelProps) {
       <div className="mt-3 flex-1 space-y-2 overflow-auto">
         {newestFirst.length === 0 ? (
           <p className="rounded-md border border-dashed border-border/70 p-3 text-xs leading-5 text-muted-foreground">
-            No edits yet. Run Autopilot or ask the chat for a change — each step will show up here.
+            No edits yet. Run Weave full edit or ask the chat for a change — each step will show up here.
           </p>
         ) : (
           newestFirst.map((entry) => (

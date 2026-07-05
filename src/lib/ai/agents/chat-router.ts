@@ -15,24 +15,34 @@ const VALID_OPS = new Set([
 export function parseChatIntent(rawText: string): ChatEditIntent {
   const text = rawText.toLowerCase();
   const ops: ChatEditIntent["ops"] = [];
+  const addOp = (op: ChatEditIntent["ops"][number]) => {
+    if (!ops.some((existing) => existing.kind === op.kind)) {
+      ops.push(op);
+    }
+  };
 
   if (/(tight|silence|faster|snappier|200ms|0\.2)/.test(text)) {
-    ops.push({ kind: "tighten", value: text.includes("200") || text.includes("0.2") ? 0.2 : 0.35 });
+    addOp({ kind: "tighten", value: text.includes("200") || text.includes("0.2") ? 0.2 : 0.35 });
   }
   if (/(punch|zoom|push in|claim|emphasis)/.test(text)) {
-    ops.push({ kind: "punch_in", value: 112 });
+    addOp({ kind: "punch_in", value: 112 });
   }
   if (/(caption|subtitle|words)/.test(text)) {
-    ops.push({ kind: "captions" });
+    addOp({ kind: "captions" });
   }
   if (/(audio|lufs|duck|music|loud)/.test(text)) {
-    ops.push({ kind: "audio_polish" });
+    addOp({ kind: "audio_polish" });
   }
   if (/(transition|dissolve|smooth)/.test(text)) {
-    ops.push({ kind: "transitions" });
+    addOp({ kind: "transitions" });
   }
   if (/(color|grade|match)/.test(text)) {
-    ops.push({ kind: "color_match" });
+    addOp({ kind: "color_match" });
+  }
+  // Vague "make it pop" style asks map to visual-interest edits instead of dead-ending.
+  if (/(effect|vfx|cinematic|dynamic|energy|pop|spice)/.test(text)) {
+    addOp({ kind: "punch_in", value: 112 });
+    addOp({ kind: "transitions" });
   }
 
   return {

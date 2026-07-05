@@ -26,7 +26,7 @@ export function useAutopilot() {
 
   async function buildFullPipelinePlan(input: FullAutopilotInput): Promise<FullAutopilotResult> {
     setBusy(true);
-    setStage("Running full autopilot pipeline");
+    setStage("Weaving your edit");
     try {
       const result = await runFullAutopilot(input);
       setDiagnostics(result.diagnostics);

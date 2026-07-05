@@ -32,7 +32,7 @@ export function GuidedFlow({
       onClick: onLoadTranscript,
     },
     {
-      title: "Autopilot builds the edit",
+      title: "Weave builds the edit",
       description: "Cuts silence, places B-roll, plans captions and audio. Nothing touches Premiere yet.",
       done: hasPreviewPlan,
       enabled: hasTranscript && !busy,

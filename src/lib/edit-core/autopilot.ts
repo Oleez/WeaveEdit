@@ -169,7 +169,7 @@ export async function runFullAutopilot(input: FullAutopilotInput): Promise<FullA
       ...basePlan.rationale,
       {
         agent: "director",
-        claim: `Autopilot pipeline assembled ${baseTimeline.placements.length} placements from ${input.segments.length} segments and ${input.mediaItems.length} media items.`,
+        claim: `Weave assembled ${baseTimeline.placements.length} placements from ${input.segments.length} segments and ${input.mediaItems.length} media items.`,
         evidence: [
           `silence spans: ${input.silenceSpans?.length ?? 0}`,
           `visual coverage: ${visualPlacements.length}`,
@@ -231,7 +231,7 @@ export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent, options
         rationale.push({
           agent: "chat-router",
           claim:
-            "No silence analysis is in this plan yet, so there is nothing to tighten. Run Autopilot (or the silence preview) first and I can cut the gaps.",
+            "No silence analysis is in this plan yet, so there is nothing to tighten. Run Weave full edit (or the silence preview) first and I can cut the gaps.",
           evidence: ["tighten requested", "0 silence spans available"],
           confidence: 0.4,
         });
@@ -270,7 +270,7 @@ export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent, options
       } else {
         rationale.push({
           agent: "chat-router",
-          claim: "No placements with transcript text are in the plan yet, so captions have nothing to time against. Run Autopilot first.",
+          claim: "No placements with transcript text are in the plan yet, so captions have nothing to time against. Run Weave full edit first.",
           evidence: ["captions requested", "0 text placements"],
           confidence: 0.4,
         });
@@ -322,7 +322,7 @@ export function replanFromIntent(plan: EditPlan, intent: ChatEditIntent, options
       } else {
         rationale.push({
           agent: "chat-router",
-          claim: "Color match needs at least two visual clips in the plan — run Autopilot or place B-roll first.",
+          claim: "Color match needs at least two visual clips in the plan — run Weave full edit or place B-roll first.",
           evidence: [`visual clips available: ${visualClips.length}`],
           confidence: 0.4,
         });

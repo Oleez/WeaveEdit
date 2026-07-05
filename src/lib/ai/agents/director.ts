@@ -8,7 +8,7 @@ export async function directEdit(
 ) {
   const fallback = {
     agent: "director" as const,
-    claim: "Autopilot assembled a full preview plan and asked specialists for bounded one-pass improvements.",
+    claim: "Weave assembled a full preview plan and asked specialists for bounded one-pass improvements.",
     evidence: [`${context.placements.length} placements`, `${plan.actions.length} starting actions`],
     confidence: context.placements.length > 0 ? 0.84 : 0.42,
   };
